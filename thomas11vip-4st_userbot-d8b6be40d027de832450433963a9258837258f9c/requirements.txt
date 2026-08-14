@@ -1,0 +1,29 @@
+# Telethon 1.44+ is required for coloured inline buttons + premium
+# custom-emoji icons (KeyboardButtonStyle: bg_primary/bg_danger/bg_success + icon).
+telethon==1.44.0
+
+# BUG FIX: pyrofork from GitHub (not PyPI).
+# PyPI pyrofork may lag behind and miss InputGroupCallSlug + other types
+# that pytgcalls 2.3+ requires. GitHub HEAD is always current.
+git+https://github.com/Mayuri-Chan/pyrofork.git
+
+tgcrypto==1.2.5
+
+# BUG FIX: pytgcalls from GitHub main branch (ntgcalls backend).
+# PyPI py-tgcalls pinned to an old version uses the legacy tgcalls backend
+# which is NOT compatible with Python 3.12 (Heroku-26 stack). GitHub main
+# uses ntgcalls — fully Python 3.12 compatible and has latest VC fixes.
+git+https://github.com/pytgcalls/pytgcalls.git
+
+yt-dlp[default,curl-cffi]>=2026.7.4
+google-genai>=0.1.0
+aiohttp>=3.9.0
+aiofiles>=23.0.0
+pillow>=10.0.0
+pycryptodome>=3.18.0
+python-dotenv>=1.0.0
+requests>=2.31.0
+
+# FFmpeg Python fallback — used if vendor/apt ffmpeg install is missing
+static-ffmpeg
+pymongo>=4.9,<5
