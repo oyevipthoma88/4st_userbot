@@ -3944,6 +3944,58 @@ def _build_extractor_args(yt_args: dict) -> dict:
     return providers
 
 
+# ── Datacenter-IP bypass: outbound proxy support (Heroku/Render/Railway) ────
+# ROOT CAUSE of "IP error" while playing music: YouTube/googlevideo blocks
+# Heroku's US datacenter IP ranges outright. Cookies + TLS impersonation help
+# with the bot-check gate, but they cannot fix a blocked source IP — only
+# routing the request through a non-datacenter IP can.
+#
+# Set ONE of these Config Vars to a residential/mobile proxy to fix it:
+#   YT_PROXY / YTDLP_PROXY / PROXY_URL
+# Examples:
+#   http://user:pass@host:port
+#   socks5://user:pass@host:port
+# Unset = current behaviour (direct connection), nothing changes.
+_YT_PROXY_URL: str = (
+    os.environ.get("YT_PROXY", "").strip()
+    or os.environ.get("YTDLP_PROXY", "").strip()
+    or os.environ.get("PROXY_URL", "").strip()
+)
+
+
+def _proxy_opts() -> dict:
+    """yt-dlp option dict carrying the configured proxy (empty when unset)."""
+    return {"proxy": _YT_PROXY_URL} if _YT_PROXY_URL else {}
+
+
+def _req_proxies() -> dict | None:
+    """`proxies=` value for requests/curl_cffi calls (None when unset)."""
+    if not _YT_PROXY_URL:
+        return None
+    return {"http": _YT_PROXY_URL, "https": _YT_PROXY_URL}
+
+
+def log_proxy_status() -> None:
+    """One-line startup log so the proxy state is obvious in Heroku logs."""
+    import logging as _logging
+    _lg = _logging.getLogger("Melody")
+    if _YT_PROXY_URL:
+        # Never log credentials — host only.
+        try:
+            host = _urlparse.urlsplit(_YT_PROXY_URL).hostname or "?"
+        except Exception:
+            host = "?"
+        _lg.info("\U0001F310 Outbound proxy ACTIVE for YouTube (%s) — datacenter IP bypassed", host)
+    elif _ON_CLOUD_HOST:
+        _lg.warning(
+            "\u26A0\uFE0F  No YT_PROXY set on a cloud host — YouTube can reject this "
+            "datacenter IP. Set YT_PROXY=http://user:pass@host:port to fix playback IP errors."
+        )
+
+
+log_proxy_status()
+
+
 def _yt_base_opts(out_tmpl: str, client: str, fmt: str) -> dict:
     """Build yt-dlp options with all stability/bypass techniques applied.
 
@@ -4064,6 +4116,8 @@ def _yt_base_opts(out_tmpl: str, client: str, fmt: str) -> dict:
         # Cookies are only useful for authenticated DASH clients (web,
         # android, ios) that can leverage the full session manifest.
         **({} if client in _YT_NO_POTOKEN_CLIENTS else _cookie_opts()),
+        # Route through the configured proxy when set (fixes datacenter IP blocks).
+        **_proxy_opts(),
     }
 
 
@@ -4227,6 +4281,7 @@ async def _yt_try_piped(video_id: str, out_tmpl: str, logger=None) -> dict | Non
                 try:
                     with requests.get(u, stream=True, timeout=90,
                                       headers={"User-Agent": random_ua()},
+                                      proxies=_req_proxies(),
                                       allow_redirects=True) as r:
                         r.raise_for_status()
                         with open(raw_path, "wb") as fh:
@@ -4411,6 +4466,7 @@ async def piped_search_download(query: str, out_tmpl: str, logger=None) -> dict 
                 try:
                     with requests.get(url, stream=True, timeout=90,
                                       headers={"User-Agent": random_ua()},
+                                      proxies=_req_proxies(),
                                       allow_redirects=True) as r:
                         r.raise_for_status()
                         with open(raw_path, "wb") as fh:
