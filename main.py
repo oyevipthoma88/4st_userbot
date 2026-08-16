@@ -8131,6 +8131,15 @@ async def _start_music_engine(user_id: int):
         me = await client.get_me()
         bot_logger("MUSIC_ENGINE", f"Pyrogram ready for {user_id}: {me.first_name} (@{me.username})")
         bot_logger("MUSIC_ENGINE", f"PyTgCalls started for {user_id}. Music commands active!")
+        # Warm the bgutil PO-token HTTP server so the very first /play does
+        # not pay the cold Deno/BotGuard startup cost (and does not fall back
+        # to un-tokened formats that YouTube answers with 403).
+        try:
+            import music_sources as _ms_warm
+            if getattr(_ms_warm, "_BGUTIL_ACTIVE", False) and not getattr(_ms_warm, "_BGUTIL_HTTP_READY", False):
+                asyncio.create_task(_ms_warm.warm_up_bgutil_server())
+        except Exception:
+            pass
     except Exception as e:
         bot_logger("MUSIC_ENGINE_ERR", f"Failed to start for {user_id}: {e}")
 
