@@ -3016,11 +3016,13 @@ def yt_clients(clients) -> list:
 # Client ladder in priority order (technique #1-10)
 # NOTE: names below are validated/remapped by yt_clients() before use.
 _YT_CLIENTS = yt_clients([
-    # Melody_music proven set (Heroku US IP par chal raha hai).
-    # ios/android/mobile clients hata diye — ab sirf yt-dlp default + tv + safari.
-    "default",         # 1 — yt-dlp ka apna best-guess client set
-    "tv",              # 2 — TV client, plain https formats, PO-token nahi chahiye
-    "web_safari",      # 3 — Safari fingerprint, cloud IP par reliable
+    # SABR-only experiment (yt-dlp #12482) ne `tv`/`default` ke https URLs
+    # strip kar diye, isliye SABR-resistant clients pehle.
+    "web_safari",      # 1 — Safari fingerprint, https formats abhi bhi aate hain
+    "web_embedded",    # 2 — embedded web player, PO-token gate halka
+    "tv_simply",       # 3 — SABR-free TV variant
+    "default",         # 4 — yt-dlp ka apna best-guess client set
+    "tv",              # 5 — last resort (SABR-affected)
 ])
 
 # Piped public API instances — open-source YouTube frontends (technique #37)
@@ -3528,22 +3530,33 @@ def _cloud_download_sync(
     # formats=missing_pot), which is the config verified working on this exact
     # Heroku USA dyno. The cookieless clients stay on as a fallback for the
     # no-cookie deployment.
+    # ROOT-CAUSE FIX (Heroku log 2026-08-16 18:03, cloud_dl [['tv']] ydl-errors:
+    #   "Some tv client https formats have been skipped as they are missing a
+    #    URL. YouTube may have enabled the SABR-only streaming experiment"):
+    # YouTube ne is IP/account ke liye `tv` (aur `default` jo tv include karta
+    # hai) ko SABR-only kar diya — https URLs hi nahi aate, isliye rung 0-byte
+    # pe marta hai. SABR-resistant clients pehle chalte hain aur SABR warning
+    # dikhte hi us client family ke baaki rungs skip ho jaate hain.
+    _SABR_FAMILY = {"tv", "default"}
+
     _COOKIE_RUNGS = [
-        # Melody_music proven rung — cookies + bgutil PO-token.
-        ("bestaudio[abr<=128]/bestaudio/best",
-         ["default", "tv", "web_safari"],                          False),
+        # SABR-resistant, cookie-capable clients pehle.
         ("bestaudio[ext=m4a]/bestaudio/best",  ["web_safari"],      False),
-        ("bestaudio/best",                     ["default"],         False),
+        ("bestaudio[abr<=128]/bestaudio/best", ["web_safari", "web"], False),
         ("bestaudio[ext=m4a]/bestaudio/best",  ["web"],             False),
+        ("bestaudio/best",                     ["web_embedded"],    False),
+        # tv/default (SABR-affected) sirf last resort.
+        ("bestaudio[abr<=128]/bestaudio/best",
+         ["web_safari", "tv", "default"],                          False),
     ]
 
     _NOCOOKIE_RUNGS = [
-        # Melody_music wala proven set — mobile (android/ios) clients hata diye.
-        ("bestaudio/best",                     ["default"],       False),
-        ("bestaudio/best",                     ["tv"],            False),
         ("bestaudio/best",                     ["web_safari"],    False),
+        ("bestaudio/best",                     ["web_embedded"],  False),
+        ("bestaudio/best",                     ["tv_simply"],     False),
+        ("bestaudio/best",                     ["default"],       False),
         ("bestaudio/best",
-         ["default", "tv", "web_safari"],                         False),
+         ["web_safari", "default", "tv"],                         False),
     ]
     if cookie:
         combos = _COOKIE_RUNGS + _NOCOOKIE_RUNGS
@@ -3552,6 +3565,7 @@ def _cloud_download_sync(
     # Last resort: SABR-affected clients (tv/default).
     combos += [
         ("bestaudio/best",                    ["tv"],                False),
+        ("bestaudio/best",                    ["tv_simply"],         False),
     ]
     # FINAL SAFETY NET — never fail with "Requested format is not available"
     # just because the selector was too strict. These rungs accept literally
@@ -3560,6 +3574,7 @@ def _cloud_download_sync(
     _ANY_FMT = ("bestaudio*[protocol^=http]/bestaudio*/bestaudio/"
                 "best[protocol^=http]/best/worst")
     combos += [
+        (_ANY_FMT, ["web_safari", "web", "web_embedded"],          False),
         (_ANY_FMT, ["default", "tv", "web_safari"],                False),
         (_ANY_FMT, ["default"],                                    False),
     ]
@@ -3576,6 +3591,7 @@ def _cloud_download_sync(
 
     _botgate_hits = 0          # how many rungs died on "Sign in to confirm…"
     _pot403_hits = 0           # web-family rungs killed by a 403 media request
+    _sabr_hits = 0             # rungs killed by the SABR-only experiment (tv/default)
     for fmt, clients, use_player_skip in combos:
         actual_fmt = fmt if _MS_FFMPEG_DIR else _NO_FFMPEG_FMT
         clients = yt_clients(clients)
@@ -3583,6 +3599,10 @@ def _cloud_download_sync(
         # so every remaining PO-token-gated web rung will fail identically —
         # skip them (but NEVER skip the cookieless clients that do work).
         if _pot403_hits >= 3 and set(clients) <= _WEB_FAMILY:
+            continue
+        # SABR-only experiment: tv/default se https URLs aate hi nahi, so once
+        # it has bitten, don't burn more time on pure tv/default rungs.
+        if _sabr_hits >= 1 and set(clients) <= _SABR_FAMILY:
             continue
         # Same idea for the anonymous bot-gate: once it has bitten twice,
         # cookieless rungs are hopeless *only if* we still have cookie-capable
@@ -3676,6 +3696,8 @@ def _cloud_download_sync(
             if ("403" in err_str and "Forbidden" in err_str
                     and set(clients) <= _WEB_FAMILY):
                 _pot403_hits += 1
+            if ("SABR" in err_str or "missing a URL" in err_str):
+                _sabr_hits += 1
 
             logger("MUSIC_DL_ERR", f"cloud_dl [{clients}]: {err_str[:200]}")
 
@@ -3688,6 +3710,9 @@ def _cloud_download_sync(
             continue
 
         if _ydl_error:
+            _joined = " ".join(_ydl_error)
+            if "SABR" in _joined or "missing a URL" in _joined:
+                _sabr_hits += 1
             logger("MUSIC_DL_ERR", f"cloud_dl [{clients}] ydl-errors: {'; '.join(_ydl_error[-3:])[:300]}")
 
         if info:
