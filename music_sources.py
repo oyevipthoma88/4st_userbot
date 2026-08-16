@@ -3228,6 +3228,39 @@ _YT_BROWSER_UA = random_ua()
 # Tier-1 clients that don't need PO tokens — skip innertube auth entirely
 _YT_NO_POTOKEN_CLIENTS = set(yt_clients(["android_vr", "tv_simply", "web_creator"]))
 
+# ── Cookie-capability map (ROOT-CAUSE FIX, Heroku log 2026-08-16) ───────
+# yt-dlp REFUSES to use InnerTube clients that don't support cookies when an
+# authenticated cookie jar is attached:
+#   WARN: Skipping client "tv_simply" since it does not support cookies
+#   WARN: Skipping client "android_vr" since it does not support cookies
+#   WARN: Skipping client "android"  since it does not support cookies
+# Our ladder attached `cookiefile` to EVERY rung, so those three rungs ended
+# up with ZERO usable clients — yt-dlp then extracted nothing and reported
+# "Requested format is not available", which is exactly the failure in the
+# log for every single song. The cookieless clients are precisely the ones
+# that still work from a datacenter IP, so cookies were killing playback.
+#
+# Fix: attach cookies ONLY to rungs whose clients all support cookies; run
+# the cookieless clients genuinely cookieless.
+_YT_NO_COOKIE_CLIENTS = {"android", "android_vr", "android_music",
+                         "android_creator", "ios", "ios_music",
+                         "ios_creator", "tv_simply"}
+try:  # prefer yt-dlp's own metadata when available
+    from yt_dlp.extractor.youtube._base import INNERTUBE_CLIENTS as _IC
+    _YT_NO_COOKIE_CLIENTS |= {
+        k for k, v in _IC.items() if not v.get("SUPPORTS_COOKIES")
+    }
+except Exception:
+    pass
+
+
+def _clients_accept_cookies(clients) -> bool:
+    """True only if every client in the rung can use a cookie jar."""
+    return bool(clients) and all(
+        c not in _YT_NO_COOKIE_CLIENTS for c in clients
+    )
+
+
 # ── bgutil PO-token provider paths ──────────────────────────────────────
 # ROOT-CAUSE FIX (Heroku log 2026-08-16: every cloud_dl rung dying with
 # "unable to download video data: HTTP Error 403: Forbidden" and
@@ -3491,6 +3524,16 @@ def _cloud_download_sync(
     combos += [
         ("bestaudio/best",                    ["tv"],                False),
     ]
+    # FINAL SAFETY NET — never fail with "Requested format is not available"
+    # just because the selector was too strict. These rungs accept literally
+    # any downloadable stream (audio-only preferred, then muxed, then worst)
+    # from the clients that are proven to still serve https URLs.
+    _ANY_FMT = ("bestaudio*[protocol^=http]/bestaudio*/bestaudio/"
+                "best[protocol^=http]/best/worst")
+    combos += [
+        (_ANY_FMT, ["web_embedded", "android_vr", "ios", "mweb"], False),
+        (_ANY_FMT, ["default"],                                   False),
+    ]
 
     # HEROKU FIX: when ffmpeg not found, override format to pre-packaged audio.
     # "bestaudio/best" can pick DASH separate streams that need FFmpegMergerPP —
@@ -3554,7 +3597,10 @@ def _cloud_download_sync(
         # BUG FIX: always inject cookies when available — even for tv_embedded/android_vr
         # with player_skip. YouTube now bot-checks these clients from cloud IPs regardless
         # of player_skip, so valid cookies are required to pass the gate.
-        if cookie:
+        # Only attach cookies to rungs whose clients actually support them —
+        # otherwise yt-dlp skips every client in the rung and the download
+        # dies with "Requested format is not available" (see note above).
+        if cookie and _clients_accept_cookies(clients):
             opts["cookiefile"] = cookie
 
         # Capture yt-dlp stderr for debug logging
