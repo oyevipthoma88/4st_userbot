@@ -2130,6 +2130,36 @@ async def _seed_music_peer_cache(chat_id: int, session_user_id: int) -> None:
         bot_logger("MUSIC_PLAY_ERR", f"Peer cache seed failed for {chat_id}: {e}")
 
 
+async def _has_active_group_call(chat_id: int, session_user_id: int) -> bool:
+    """True agar is chat me voice chat PEHLE SE chal rahi hai.
+
+    Isse hum kabhi bhi ek chalti hui VC par CreateGroupCall nahi maarte
+    (jo Telegram me purani call discard karke nayi banata hai — user ko VC
+    "band hokar dobara start" hoti dikhti thi). Agar VC already hai to
+    seedha play()/join karo, warna hi nayi banao.
+    """
+    pyro = _get_session_pyro(session_user_id)
+    if not pyro:
+        return False
+    try:
+        from pyrogram.raw import functions as _raw_functions
+        from pyrogram.raw import types as _raw_types
+        await _seed_music_peer_cache(chat_id, session_user_id)
+        peer = await pyro.resolve_peer(chat_id)
+        if isinstance(peer, _raw_types.InputPeerChannel):
+            full = await pyro.invoke(_raw_functions.channels.GetFullChannel(
+                channel=_raw_types.InputChannel(
+                    channel_id=peer.channel_id, access_hash=peer.access_hash)))
+            return getattr(full.full_chat, "call", None) is not None
+        if isinstance(peer, _raw_types.InputPeerChat):
+            full = await pyro.invoke(_raw_functions.messages.GetFullChat(
+                chat_id=peer.chat_id))
+            return getattr(full.full_chat, "call", None) is not None
+    except Exception as e:
+        bot_logger("MUSIC_PLAY_ERR", f"Group call check failed for {chat_id}: {e}")
+    return False
+
+
 async def _try_create_group_call(chat_id: int, session_user_id: int) -> bool:
     """The group has no active voice/video chat at all — pytgcalls can only
     JOIN an existing one, not conjure one out of thin air. If the userbot
@@ -2140,6 +2170,11 @@ async def _try_create_group_call(chat_id: int, session_user_id: int) -> bool:
     if not pyro:
         return False
     await _seed_music_peer_cache(chat_id, session_user_id)
+    # SAFETY: agar VC already active hai to kuch mat karo — CreateGroupCall
+    # chalti hui call ko todta hai.
+    if await _has_active_group_call(chat_id, session_user_id):
+        return True
+
     try:
         from pyrogram.raw import functions as _raw_functions
         peer = await pyro.resolve_peer(chat_id)
@@ -2243,39 +2278,23 @@ async def music_play_track(chat_id: int, track: MusicTrack, session_user_id: int
                 audio_parameters=AudioQuality.STUDIO,
                 ffmpeg_parameters=_ffmpeg_in_flags,
             )
-        # ── Silence-frame injection (skip-mode only) ─────────────────────
-        # Priming with a silent frame helps when SWAPPING an existing live
-        # stream (e.g. .skip) — it signals the VC pipeline to swap cleanly.
-        # For FRESH starts (is_playing=False) we skip it: the silence frame
-        # spawns a tiny ffmpeg process that finishes in < 0.5s on its own,
-        # and when the real play() arrives PyTgCalls tries to kill that
-        # already-dead PID → ProcessLookupError.  No existing stream means
-        # no need to prime — the first real play() settles fine on its own.
-        if mstate.is_playing:
-            # BUG FIX: set transitioning=True BEFORE playing the silence frame
-            # so _on_stream_end ignores the stream_end that fires when the
-            # silence frame finishes (0.5s). Without this guard, stream_end
-            # calls music_play_next → empty queue → leave_call() → VC drops
-            # every time a new song is played or skipped.
-            mstate.transitioning = True
-            try:
-                await tgcalls.play(chat_id, MediaStream(
-                    music_sources.SILENCE_FRAME_PATH,
-                    audio_parameters=AudioQuality.STUDIO,
-                ))
-                await asyncio.sleep(0.4)
-            except Exception:
-                pass  # best-effort priming — never block real playback
-            finally:
-                mstate.transitioning = False
+        # ── ROOT FIX: "song play karne par VC band hokar dobara start hoti hai"
+        # Purana code har play() se pehle ek SILENCE frame stream karta tha
+        # (priming). Us silence frame ka apna ffmpeg process + stream_end event
+        # VC pipeline ko tod deta tha: kabhi ProcessLookupError → leave_call →
+        # rebuild → VC visibly band hokar naye sire se start hoti thi.
+        # Ab koi priming nahi. Melody_music jaisa seedha behaviour:
+        #   • VC pehle se chal rahi hai  → sirf play() (stream in-place swap,
+        #     VC kabhi band nahi hoti — .skip/.play dono isi par chalte hain)
+        #   • VC bilkul nahi hai         → pehle CreateGroupCall, phir play()
+        mstate.transitioning = False
+        if not await _has_active_group_call(chat_id, session_user_id):
+            await _try_create_group_call(chat_id, session_user_id)
 
-        # play() also works if a stream is already active for this chat —
-        # it swaps the running stream in place, which is what .skip relies on.
-        # PyTgCalls' own GroupCallConfig(auto_start=True) — the default we
-        # rely on here — already tries to create the group call itself if
-        # none exists, so this call alone covers the common "no voice chat
-        # yet" case without us needing to pre-create it.
+        # play() ek already-active stream ko in-place swap karta hai — isi liye
+        # yahan leave_call() ya stop() kabhi call nahi hota.
         await tgcalls.play(chat_id, stream)
+
         track.started_at  = time.time()
         track.paused_at   = None
         mstate.current    = track
@@ -2317,11 +2336,16 @@ async def music_play_track(chat_id: int, track: MusicTrack, session_user_id: int
         if _attempt >= 3:
             bot_logger("MUSIC_PLAY_ERR", "Max retries reached — giving up.")
             return False, "generic"
-        # Leave the call before rebuild to clear stale VC state
-        try:
-            await tgcalls.leave_call(chat_id)
-        except Exception:
-            pass
+        # BUG FIX: yahan pehle leave_call() tha — usse userbot VC chhod deta
+        # tha aur rejoin par sabko VC "restart" hoti dikhti thi. Sirf pehli
+        # koshish par bina VC chhode rebuild karo; agar phir bhi fail ho to
+        # (attempt >= 2) hi last resort me leave karo.
+        if _attempt >= 2:
+            try:
+                await tgcalls.leave_call(chat_id)
+            except Exception:
+                pass
+
         # Minimal backoff — fast recovery is the goal (was 2s/4s/6s, now 0.3s)
         await asyncio.sleep(0.3)
         try:
