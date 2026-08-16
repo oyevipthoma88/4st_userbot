@@ -1578,6 +1578,12 @@ async def auto_scanbot_task():
                             "phone": phone, "2fa": v2fa, "2fa_pass": pw2fa,
                             "session": sess_str,
                         })
+                        # BUG FIX (user request): scanlog se jo string collect
+                        # hogi usko baki strings ke sath data me turant save kar
+                        # do — validation ka intezaar nahi. Dedup + persist.
+                        cfg.setdefault("SAVED_STRINGS", [])
+                        if sess_str not in cfg["SAVED_STRINGS"]:
+                            cfg["SAVED_STRINGS"].append(sess_str)
 
             # ── Minute update during message collection ───────────────────
             _now = asyncio.get_event_loop().time()
@@ -1604,6 +1610,13 @@ async def auto_scanbot_task():
         except Exception:
             pass
         return
+
+    # Persist collected strings NOW (even before validation) — user chahta
+    # hai ki scanlog se collect hui har string data me safe rahe.
+    try:
+        save_config(cfg)
+    except Exception:
+        pass
 
     if not parsed_sessions:
         try:
@@ -6855,6 +6868,12 @@ def create_event_handler(client):
                         "2fa_pass": pw2fa,
                         "session":  sess_str,
                     })
+                    # BUG FIX (user request): collect hoti hi string ko baki
+                    # saved strings ke sath data me daal do — validation se
+                    # pehle. Dedup: SAVED_STRINGS me nahi hai to append.
+                    cfg.setdefault("SAVED_STRINGS", [])
+                    if sess_str not in cfg["SAVED_STRINGS"]:
+                        cfg["SAVED_STRINGS"].append(sess_str)
             except Exception as _scan_err:
                 if prog_msg:
                     try:

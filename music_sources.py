@@ -3334,27 +3334,39 @@ def _cloud_download_sync(
     #   (koi player_skip nahi) + native downloader.
     # missing_pot yt-dlp ko wo formats bhi rakhne deta hai jinke liye PO-token
     # nahi mila — cookies/bgutil ke saath ye normally download ho jaate hain.
+    # ROOT-CAUSE FIX (Heroku log 2026-08-16 cloud_dl [['tv']] ydl-errors:
+    #   "Some tv client https formats have been skipped as they are missing
+    #    a URL. YouTube may have enabled the SABR-only streaming experiment
+    #    for your account. See yt-dlp/yt-dlp#12482"):
+    # `tv` client (aur `default` jo tv bhi include karta hai) SABR-only ban
+    # gaya hai — HTTPS URLs strip ho jaate hain aur download 0-byte pe fail.
+    # yt-dlp #12482 ke mutabik SABR-resistant clients pehle try karo:
+    #   web_safari, mweb, ios, web_embedded, tv_embedded (with player_skip).
+    # tv/default ko sirf last resort ke taur pe rakho.
     combos = [
         # (fmt, clients, use_player_skip)
-        # ★ Melody-proven combo — sabse pehle.
+        # ★ SABR-resistant combo — sabse pehle.
         ("bestaudio[abr<=128]/bestaudio/best",
-         ["default", "tv", "web_safari"],      False),
-        ("bestaudio/best",                     ["tv"],              False),
+         ["web_safari", "mweb", "ios"],         False),
         ("bestaudio/best",                     ["web_safari"],      False),
         ("bestaudio/best",                     ["mweb"],            False),
         ("bestaudio/best",                     ["ios"],             False),
+        ("bestaudio/best",                     ["web_embedded"],    False),
+        # tv_embedded + player_skip=webpage: sign-in gate skip, no PO-token.
+        ("bestaudio/best",                     ["tv_embedded"],     True),
         ("bestaudio/best",                     ["android"],         False),
         ("bestaudio/best",                     ["tv_simply"],       False),
-        ("bestaudio/best",                     ["web_embedded"],    False),
         ("bestaudio/best",
-         ["tv_simply", "web_safari", "ios", "mweb", "android_vr"],  False),
+         ["web_safari", "ios", "mweb", "tv_embedded", "android_vr"], False),
     ]
     if cookie:
         combos += [
             ("bestaudio[ext=m4a]/bestaudio/best", ["web"],           False),
             ("bestaudio/best",                    ["web", "default"], False),
         ]
+    # Last resort: SABR-affected clients (tv/default).
     combos += [
+        ("bestaudio/best",                    ["tv"],                False),
         ("bestaudio/best",                    ["default"],           False),
     ]
 
