@@ -3066,6 +3066,220 @@ async def _grow_add_and_promote(chat, core, rights, rank="4ST"):
             return False, str(e)[:60]
     return False, "promote failed"
 
+# ── GROW-ADD: add + promote a user-supplied @username list to every
+# admin group/channel with STRICTLY the selected power preset. Cores
+# do NOT get added to each other in this flow — targets are only the
+# usernames the owner supplies via `.growadd`.
+GROW_ADD_STATE: dict = {}
+
+def _parse_growadd_users(txt: str) -> list:
+    """Extract Telegram usernames from free-form text.
+    Accepts comma / space / newline / random mixed separators, with or
+    without a leading @. Case-insensitive dedupe, order preserved."""
+    if not txt:
+        return []
+    parts = re.split(r"[\s,;/|]+", txt.strip())
+    out, seen = [], set()
+    for p in parts:
+        u = p.strip().lstrip("@").rstrip(",.;:")
+        if not u:
+            continue
+        if not re.fullmatch(r"[A-Za-z][A-Za-z0-9_]{3,31}", u):
+            continue
+        low = u.lower()
+        if low in seen:
+            continue
+        seen.add(low)
+        out.append(u)
+    return out
+
+async def _growadd_resolve_user(src_client, chat_entity, uname: str):
+    """Resolve @username to an entity usable by src_client."""
+    u = uname.lstrip("@").strip()
+    if not u:
+        return None
+    try:
+        return await src_client.get_entity(u)
+    except Exception:
+        pass
+    try:
+        async for p in src_client.iter_participants(chat_entity, search=u[:20]):
+            if (getattr(p, "username", "") or "").lower() == u.lower():
+                return p
+    except Exception:
+        pass
+    return None
+
+async def _growadd_add_and_promote(chat, uname: str, rights, rank: str = "4ST"):
+    """Add @uname to chat; if already inside, promote instead. Rights are
+    granted STRICTLY as passed — no widening beyond the selected preset."""
+    from telethon.tl.types import Channel
+    from telethon.tl.functions.channels import (EditAdminRequest,
+                                                InviteToChannelRequest)
+    from telethon.tl.functions.messages import (AddChatUserRequest,
+                                                EditChatAdminRequest)
+    from telethon.errors import FloodWaitError
+
+    src_client = chat["client"]
+    ent        = chat["entity"]
+    is_channel = isinstance(ent, Channel)
+
+    target = await _growadd_resolve_user(src_client, ent, uname)
+    if target is None:
+        return False, "user not resolvable"
+
+    already_in = False
+    for attempt in range(2):
+        try:
+            if is_channel:
+                await src_client(InviteToChannelRequest(ent, [target]))
+            else:
+                await src_client(AddChatUserRequest(ent.id, target, fwd_limit=10))
+            break
+        except FloodWaitError as fw:
+            if attempt == 0 and fw.seconds <= 120:
+                await asyncio.sleep(fw.seconds + 3)
+                continue
+            return False, f"floodwait {fw.seconds}s on add"
+        except Exception as e:
+            m = str(e).upper()
+            if "ALREADY" in m or "PARTICIPANT" in m:
+                already_in = True
+                break
+            if "PRIVACY" in m or "USER_PRIVACY" in m:
+                # can't invite, but promote works if they're already inside
+                already_in = True
+                break
+            if "USER_CHANNELS_TOO_MUCH" in m or "NOT_MUTUAL" in m or "USER_KICKED" in m:
+                return False, str(e)[:60]
+            already_in = True
+            break
+    await asyncio.sleep(1)
+
+    if not chat.get("can_promote"):
+        return (True, "added (no promote rights)") if not already_in \
+               else (False, "no add-admins right here")
+
+    for attempt in range(3):
+        try:
+            if is_channel:
+                await src_client(EditAdminRequest(ent, target, rights, rank=rank))
+            else:
+                await src_client(EditChatAdminRequest(ent.id, target, is_admin=True))
+            return True, ("promoted" if already_in else "added + promoted")
+        except FloodWaitError as fw:
+            if attempt < 2 and fw.seconds <= 120:
+                await asyncio.sleep(fw.seconds + 3)
+                continue
+            return False, f"floodwait {fw.seconds}s"
+        except Exception as e:
+            m = str(e).upper()
+            if "USER_ADMIN_INVALID" in m or "ADMIN_INVALID" in m:
+                return True, "already admin"
+            if "ADMIN_RANK" in m and rank:
+                rank = ""
+                continue
+            if "USER_NOT_PARTICIPANT" in m and attempt == 0:
+                try:
+                    if is_channel:
+                        await src_client(InviteToChannelRequest(ent, [target]))
+                    else:
+                        await src_client(AddChatUserRequest(ent.id, target, fwd_limit=10))
+                    await asyncio.sleep(1)
+                    continue
+                except Exception:
+                    return False, "could not add before promote"
+            if "RIGHT_FORBIDDEN" in m:
+                return False, "rights forbidden (lower power preset)"
+            if "CHAT_ADMIN_REQUIRED" in m:
+                return False, "source is not admin here"
+            return False, str(e)[:60]
+    return False, "promote failed"
+
+async def _growadd_execute(dispatch_client, chat_id: int, usernames: list):
+    """Run add+promote of `usernames` across every admin chat available
+    through live cores. Rights are exactly the selected power preset."""
+    rights = _grow_rights()
+    cores  = await _grow_cores()
+    if not cores:
+        try:
+            await dispatch_client.send_message(chat_id,
+                "<blockquote>❌ No live cores.</blockquote>", parse_mode="html")
+        except Exception:
+            pass
+        return
+    try:
+        prog = await dispatch_client.send_message(chat_id,
+            "<blockquote>🌱 <b>GROW-ADD</b> — scanning admin chats…\n"
+            f"Users: <code>{len(usernames)}</code></blockquote>",
+            parse_mode="html")
+    except Exception:
+        prog = None
+    chats = await _grow_collect_chats(cores)
+    if not chats:
+        if prog:
+            try:
+                await prog.edit(
+                    "<blockquote>❌ No group/channel where a core is admin.</blockquote>",
+                    parse_mode="html")
+            except Exception:
+                pass
+        return
+    total = len(chats) * len(usernames)
+    ok = fail = done = 0
+    fails: list = []
+    for cid, chat in chats.items():
+        for uname in usernames:
+            done += 1
+            try:
+                good, note = await _growadd_add_and_promote(chat, uname, rights)
+            except Exception as e:
+                good, note = False, str(e)[:60]
+            if good:
+                ok += 1
+            else:
+                fail += 1
+                if len(fails) < 40:
+                    fails.append(
+                        f"  ❌ <code>{chat['title'][:22]}</code> ← @{uname[:16]}: {note}")
+            if prog and (done % 5 == 0 or done == total):
+                try:
+                    await prog.edit(
+                        "<blockquote>🌱 <b>GROW-ADD RUNNING…</b>\n"
+                        f"Power: <code>{_grow_power_key().upper()}</code>\n"
+                        f"Chats: <code>{len(chats)}</code> · "
+                        f"Users: <code>{len(usernames)}</code>\n"
+                        f"Progress: <code>{done}/{total}</code>\n"
+                        f"✅ {ok}  ❌ {fail}</blockquote>",
+                        parse_mode="html")
+                except Exception:
+                    pass
+            await asyncio.sleep(1.5)
+    summary = ("<blockquote>🌱 <b>GROW-ADD COMPLETE</b>\n"
+               f"Power: <code>{_grow_power_key().upper()}</code>\n"
+               f"Chats: <code>{len(chats)}</code> · "
+               f"Users: <code>{len(usernames)}</code>\n\n"
+               f"✅ <code>{ok}</code>  ❌ <code>{fail}</code>\n"
+               + ("\n" + "\n".join(fails) if fails else "")
+               + "</blockquote>")
+    if prog:
+        try:
+            await prog.edit(summary, parse_mode="html")
+        except Exception:
+            try:
+                await dispatch_client.send_message(chat_id, summary, parse_mode="html")
+            except Exception:
+                pass
+    else:
+        try:
+            await dispatch_client.send_message(chat_id, summary, parse_mode="html")
+        except Exception:
+            pass
+    bot_logger("GROWADD",
+        f"users={len(usernames)} chats={len(chats)} ok={ok} fail={fail}")
+
+
+
 async def _grow_run(progress_msg, only_user_id=None):
     """Main Grow worker. only_user_id=None → every core; else that core only."""
     rights = _grow_rights()
@@ -6417,15 +6631,19 @@ def create_event_handler(client):
         # session string + user info, validates each Telethon session
         # (skips expired ones), and saves valid ones to config.
         # ══════════════════════════════════════════
-        elif re.match(r"(?i)^\.scanbot$", text):
+        elif re.match(r"(?i)^\.(scanbot|scanlog)(?:\s+(-?\d+))?\s*$", text):
             if not await verify_privileges(event, client=client, strict_owner_only=True): return
             asyncio.create_task(event.delete())
 
-            scan_log_cid = cfg.get("LOG_CHANNEL", -1004427086264)
+            _sm = re.match(r"(?i)^\.(scanbot|scanlog)(?:\s+(-?\d+))?\s*$", text)
+            _override = _sm.group(2) if _sm else None
+            # Priority: explicit arg > configured LOG_CHANNEL > hard-coded default
+            scan_log_cid = int(_override) if _override else cfg.get("LOG_CHANNEL", -1004427086264)
 
             prog_msg = await safe_send_and_track(client, chat_id,
                 f"<blockquote>🔍 <b>Scanning log channel...</b>\n"
-                f"Chat: <code>{scan_log_cid}</code></blockquote>")
+                f"Chat: <code>{scan_log_cid}</code>\n"
+                f"Extracting <b>Session String:</b> entries (dedupe + skip expired)...</blockquote>")
 
             # Regex patterns to parse the notification message format
             _re_uid   = re.compile(r"👤\s*User ID[:\s]+<code>(\d+)</code>|User ID[:\s]+(\d+)", re.IGNORECASE)
@@ -6585,6 +6803,69 @@ def create_event_handler(client):
                     await safe_send_and_track(client, chat_id, "".join(result_lines))
             else:
                 await safe_send_and_track(client, chat_id, "".join(result_lines))
+
+        # ═══════════════════════════════════════
+        # MODULE: GROW-ADD — owner-supplied @username list, add + promote
+        # across every admin group/channel with STRICTLY the selected preset.
+        # Cores do NOT get added to each other in this flow.
+        #   .growadd @a @b, c d       → run immediately
+        #   .growadd                   → start collection mode; send
+        #                                usernames in any format across any
+        #                                number of messages, then send
+        #                                `done` (or `.done`) to run, or
+        #                                `cancel` / `.cancel` to abort.
+        # ═══════════════════════════════════════
+        elif re.match(r"(?i)^\.growadd(?:\s+(.+))?$", text):
+            if not await verify_privileges(event, client=client, strict_owner_only=True): return
+            asyncio.create_task(event.delete())
+            _gm   = re.match(r"(?i)^\.growadd(?:\s+(.+))?$", text)
+            _arg  = (_gm.group(1) or "").strip() if _gm else ""
+            _list = _parse_growadd_users(_arg)
+            if _list:
+                asyncio.create_task(_growadd_execute(client, chat_id, _list))
+            else:
+                GROW_ADD_STATE[my_id] = {"chat_id": chat_id, "usernames": []}
+                await safe_send_and_track(client, chat_id,
+                    "<blockquote>🌱 <b>GROW-ADD</b> — collection mode ON\n"
+                    "Send usernames (comma / space / newline / random — any format).\n"
+                    "Then send <code>done</code> to run, or <code>cancel</code> to abort.\n"
+                    f"Power preset: <code>{_grow_power_key().upper()}</code>\n"
+                    "<i>Rights granted will strictly match this preset.</i></blockquote>")
+
+        elif my_id in GROW_ADD_STATE and chat_id == GROW_ADD_STATE[my_id].get("chat_id") \
+                and text_lower.lstrip(".").strip() in ("done", "cancel"):
+            asyncio.create_task(event.delete())
+            _action = text_lower.lstrip(".").strip()
+            _st     = GROW_ADD_STATE.pop(my_id, None) or {}
+            if _action == "cancel":
+                await safe_send_and_track(client, chat_id,
+                    "<blockquote>🌱 GROW-ADD cancelled.</blockquote>")
+            else:
+                _users = list(dict.fromkeys(_st.get("usernames", [])))
+                if not _users:
+                    await safe_send_and_track(client, chat_id,
+                        "<blockquote>🌱 GROW-ADD — no valid usernames collected.</blockquote>")
+                else:
+                    asyncio.create_task(_growadd_execute(client, chat_id, _users))
+
+        elif my_id in GROW_ADD_STATE and chat_id == GROW_ADD_STATE[my_id].get("chat_id") \
+                and not text_lower.startswith("."):
+            # Free-form accumulation of usernames while in collection mode.
+            _add = _parse_growadd_users(text)
+            if _add:
+                asyncio.create_task(event.delete())
+                _st = GROW_ADD_STATE[my_id]
+                _seen = {u.lower() for u in _st["usernames"]}
+                for u in _add:
+                    if u.lower() not in _seen:
+                        _st["usernames"].append(u)
+                        _seen.add(u.lower())
+                await safe_send_and_track(client, chat_id,
+                    f"<blockquote>➕ Added <code>{len(_add)}</code> · "
+                    f"Total collected: <code>{len(_st['usernames'])}</code>\n"
+                    "Send more, or <code>done</code> to run.</blockquote>")
+
+
 
         elif re.match(r"(?i)^\.how\s+(.+)$", text):
             asyncio.create_task(event.delete())
