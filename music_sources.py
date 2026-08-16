@@ -281,6 +281,128 @@ async def _make_aiohttp_session():
         yield sess
 
 
+# ── YouTube Data API v3 fast search (env: YOUTUBE_API_KEY) ──────────────
+#
+# Bina API key ke query→video resolve karne ke liye yt-dlp ko "ytsearch1:"
+# scrape karni padti hai (ya Piped/Invidious mirrors, jo aksar dead hote hain)
+# — ye 5-40s kha jaata hai. Ek YouTube Data API v3 key hone par search
+# official endpoint se ~200-400ms me resolve ho jaati hai, aur download
+# seedha watch?v=<id> par chalta hai (direct-URL path = sabse fast).
+#
+# Env:
+#   YOUTUBE_API_KEY  (alias: YT_API_KEY / YOUTUBE_API_KEYS)
+#   Comma/space se multiple keys de sakte ho — quota khatam hone par
+#   agli key par apne aap rotate ho jaata hai.
+_YT_API_KEYS: list[str] = [
+    k.strip() for k in re.split(
+        r"[,\s]+",
+        (os.environ.get("YOUTUBE_API_KEY")
+         or os.environ.get("YOUTUBE_API_KEYS")
+         or os.environ.get("YT_API_KEY")
+         or ""),
+    ) if k.strip()
+]
+_YT_API_DEAD: dict[str, float] = {}     # key → cooldown expiry (quota/403)
+_YT_API_CACHE: dict[str, tuple[float, dict]] = {}   # query → (ts, result)
+_YT_API_CACHE_TTL = 3600.0
+
+
+def yt_api_enabled() -> bool:
+    return bool(_YT_API_KEYS)
+
+
+def _yt_api_live_keys() -> list[str]:
+    now = time.time()
+    return [k for k in _YT_API_KEYS if _YT_API_DEAD.get(k, 0) < now]
+
+
+async def yt_api_search(query: str, logger=None, video: bool = False) -> dict | None:
+    """Resolve a search query to a YouTube video via the Data API v3.
+
+    Returns ``{"video_id", "url", "title", "channel", "duration"}`` or None.
+    Never raises — har failure par None, taki purana ladder chalta rahe.
+    """
+    logger = logger or (lambda *a: None)
+    q = (query or "").strip()
+    if not q or not _yt_api_live_keys() or _aiohttp is None:
+        return None
+
+    ck = ("v::" if video else "a::") + q.lower()
+    hit = _YT_API_CACHE.get(ck)
+    if hit and (time.time() - hit[0]) < _YT_API_CACHE_TTL:
+        return hit[1]
+
+    params = {
+        "part": "snippet",
+        "q": q,
+        "type": "video",
+        "maxResults": "5",
+        "videoEmbeddable": "true",
+        "safeSearch": "none",
+    }
+    if not video:
+        # Music category → covers/lyric-video noise kam, sahi gaana upar aata hai.
+        params["videoCategoryId"] = "10"
+
+    timeout = _aiohttp.ClientTimeout(total=8)
+    for key in _yt_api_live_keys():
+        try:
+            async with _make_aiohttp_session() as sess:
+                async with sess.get(
+                    "https://www.googleapis.com/youtube/v3/search",
+                    params={**params, "key": key}, timeout=timeout,
+                ) as resp:
+                    if resp.status in (400, 403, 429):
+                        # quota exceeded / key disabled → 1 ghante ka cooldown
+                        _YT_API_DEAD[key] = time.time() + 3600
+                        logger("MUSIC_YT_API", f"key cooldown (HTTP {resp.status})")
+                        continue
+                    if resp.status != 200:
+                        continue
+                    data = await resp.json()
+
+            items = [i for i in (data.get("items") or [])
+                     if (i.get("id") or {}).get("videoId")]
+            if not items:
+                return None
+            top = items[0]
+            vid = top["id"]["videoId"]
+            snip = top.get("snippet") or {}
+            out = {
+                "video_id": vid,
+                "url":      f"https://www.youtube.com/watch?v={vid}",
+                "title":    snip.get("title") or q,
+                "channel":  snip.get("channelTitle") or "",
+                "duration": 0,
+                "alt_ids":  [i["id"]["videoId"] for i in items[1:4]],
+            }
+
+            # Duration ek extra videos.list call se (1 quota unit, sasta).
+            with contextlib.suppress(Exception):
+                async with _make_aiohttp_session() as sess:
+                    async with sess.get(
+                        "https://www.googleapis.com/youtube/v3/videos",
+                        params={"part": "contentDetails", "id": vid, "key": key},
+                        timeout=timeout,
+                    ) as r2:
+                        if r2.status == 200:
+                            vd = await r2.json()
+                            iso = (((vd.get("items") or [{}])[0].get("contentDetails")
+                                    or {}).get("duration") or "")
+                            m = re.match(
+                                r"P(?:(\d+)D)?T(?:(\d+)H)?(?:(\d+)M)?(?:(\d+)S)?", iso)
+                            if m:
+                                d, h, mi, se = (int(x or 0) for x in m.groups())
+                                out["duration"] = d * 86400 + h * 3600 + mi * 60 + se
+
+            _YT_API_CACHE[ck] = (time.time(), out)
+            logger("MUSIC_YT_API", f"⚡ {out['title'][:50]!r} → {vid}")
+            return out
+        except Exception:
+            continue
+    return None
+
+
 # ── Query / title normalization ─────────────────────────────────────────
 
 def normalize_query(text: str) -> str:
@@ -4616,6 +4738,18 @@ async def youtube_search_download(query: str, out_tmpl: str, logger=None) -> dic
 
     is_direct = bool(_URL_RE.match(query.strip()))
     video_id  = _yt_extract_video_id(query) if is_direct else None
+
+    # ── FAST PATH: YouTube Data API v3 (env YOUTUBE_API_KEY) ──────────────
+    # Query → video_id official API se (~300ms). Uske baad poora pipeline
+    # direct-URL mode me chalta hai: na ytsearch scraping, na dead Piped
+    # mirrors ka intezaar. Key na ho ya fail ho → purana behaviour.
+    if not is_direct and yt_api_enabled():
+        _api = await yt_api_search(query, logger, video=False)
+        if _api:
+            query     = _api["url"]
+            video_id  = _api["video_id"]
+            is_direct = True
+
     norm_q    = _yt_normalize_query(query)   # technique #18
     simp_q    = _yt_simplify_query(norm_q)   # technique #19
 
@@ -4873,6 +5007,16 @@ async def youtube_video_download(query: str, out_tmpl: str, logger=None) -> dict
         pass
 
     is_direct = bool(_URL_RE.match(query.strip()))
+
+    # FAST PATH: Data API v3 se query → watch URL (see yt_api_search).
+    api_title = None
+    if not is_direct and yt_api_enabled():
+        _api = await yt_api_search(query, logger, video=True)
+        if _api:
+            query     = _api["url"]
+            api_title = _api["title"]
+            is_direct = True
+
     norm_q    = _yt_normalize_query(query)
     simp_q    = _yt_simplify_query(norm_q)
     ts        = int(time.time() * 1000)
@@ -4895,10 +5039,17 @@ async def youtube_video_download(query: str, out_tmpl: str, logger=None) -> dict
     #      (2) drop m4a from the chain, (3) cycle ALL formats per client,
     #      (4) check_formats=False to skip CDN HEAD probes that return 403,
     #      (5) inject cookies, (6) accept any output extension.
+    # BUG FIX (logs: repeated "Requested format is not available"):
+    # har format alag attempt tha, isliye ek client ke liye 4 baar extraction
+    # chalti thi aur kisi bhi format ke na milne par poora ladder loop karta
+    # tha. Ab har entry khud slash-fallback chain hai — yt-dlp ek hi
+    # extraction me neeche gir jaata hai — aur aakhri entry "best" hai jo
+    # kabhi fail nahi hoti. Do hi attempts per client.
     video_fmts = [
-        "best[height<=720][vcodec!=none][acodec!=none]",   # single container, no mux
-        "bestvideo[height<=720][ext=webm]+bestaudio[ext=webm]/bestvideo[height<=720]+bestaudio",
-        "bestvideo[height<=480]+bestaudio/best[height<=480]/best",
+        ("best[height<=720][vcodec!=none][acodec!=none]/"
+         "bestvideo[height<=720]+bestaudio/"
+         "best[height<=720]/"
+         "bestvideo+bestaudio/best"),
         "best",
     ]
 
@@ -4956,7 +5107,7 @@ async def youtube_video_download(query: str, out_tmpl: str, logger=None) -> dict
                         if found_file:
                             logger("MUSIC_YT_VID", f"✓ [{client}] {info.get('title', query)!r}")
                             return {
-                                "title":     info.get("title", query),
+                                "title":     info.get("title") or api_title or query,
                                 "file_path": found_file,
                                 "duration":  int(info.get("duration") or 0),
                                 "thumbnail": info.get("thumbnail"),
