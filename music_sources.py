@@ -2993,7 +2993,7 @@ def _yt_supported_clients() -> set:
 _YT_SUPPORTED_CLIENTS = _yt_supported_clients()
 # tv_downgraded needs an account Data Sync ID; never send it ourselves.
 _YT_BLOCKED_CLIENTS = {"tv_downgraded"}
-_YT_FALLBACK_CLIENTS = ["tv_simply", "web_safari", "mweb"]
+_YT_FALLBACK_CLIENTS = ["default", "tv", "web_safari"]
 
 def yt_clients(clients) -> list:
     """Normalise a player_client list for the installed yt-dlp version."""
@@ -3016,21 +3016,12 @@ def yt_clients(clients) -> list:
 # Client ladder in priority order (technique #1-10)
 # NOTE: names below are validated/remapped by yt_clients() before use.
 _YT_CLIENTS = yt_clients([
-    # ── Melody_music proven order (datacenter/Heroku US IP par tested) ──
+    # Melody_music proven set (Heroku US IP par chal raha hai).
+    # ios/android/mobile clients hata diye — ab sirf yt-dlp default + tv + safari.
     "default",         # 1 — yt-dlp ka apna best-guess client set
     "tv",              # 2 — TV client, plain https formats, PO-token nahi chahiye
     "web_safari",      # 3 — Safari fingerprint, cloud IP par reliable
-    # ── Baaki fallbacks ──
-    "mweb",            # 4 — Mobile web, lightweight
-    "ios",             # 5 — iOS unique fingerprint
-    "android",         # 6 — Android client
-    "tv_simply",       # 7 — Simplified TV player
-    "web_embedded",    # 8 — Embedded player bypass
-    "web_music",       # 9 — YouTube Music (Hindi/regional)
-    "web",             # 10 — Standard web fallback
-    "web_creator",     # 11 — Creator Studio client
 ])
-
 
 # Piped public API instances — open-source YouTube frontends (technique #37)
 #
@@ -3226,7 +3217,7 @@ def random_ua() -> str:
 # Kept for any external caller expecting a fixed name — now just one pick.
 _YT_BROWSER_UA = random_ua()
 # Tier-1 clients that don't need PO tokens — skip innertube auth entirely
-_YT_NO_POTOKEN_CLIENTS = set(yt_clients(["android_vr", "tv_simply", "web_creator"]))
+_YT_NO_POTOKEN_CLIENTS: set = set()  # mobile/no-cookie client tier removed
 
 # ── Cookie-capability map (ROOT-CAUSE FIX, Heroku log 2026-08-16) ───────
 # yt-dlp REFUSES to use InnerTube clients that don't support cookies when an
@@ -3542,26 +3533,17 @@ def _cloud_download_sync(
         ("bestaudio[abr<=128]/bestaudio/best",
          ["default", "tv", "web_safari"],                          False),
         ("bestaudio[ext=m4a]/bestaudio/best",  ["web_safari"],      False),
-        ("bestaudio/best",                     ["web_embedded"],    False),
-        ("bestaudio/best",                     ["mweb"],            False),
+        ("bestaudio/best",                     ["default"],         False),
         ("bestaudio[ext=m4a]/bestaudio/best",  ["web"],             False),
-        ("bestaudio/best",                     ["web_music"],       False),
     ]
 
     _NOCOOKIE_RUNGS = [
-        # PO-token-free / cookie-free clients — only path when no cookies.
-        # Verified 2026-08-16 from a datacenter IP without cookies: `android`
-        # downloads fine while tv_simply / android_vr answer 403 or bot-gate,
-        # so try android/ios first and keep the others as backup.
-        ("bestaudio/best",                     ["android"],       False),
-        ("bestaudio/best",                     ["ios"],           False),
-        ("bestaudio/best",                     ["tv_simply"],     False),
-        ("bestaudio/best",                     ["android_vr"],    False),
-        # tv_embedded + player_skip=webpage: sign-in gate skip, no PO-token.
-        ("bestaudio/best",                     ["tv_embedded"],   True),
+        # Melody_music wala proven set — mobile (android/ios) clients hata diye.
         ("bestaudio/best",                     ["default"],       False),
+        ("bestaudio/best",                     ["tv"],            False),
+        ("bestaudio/best",                     ["web_safari"],    False),
         ("bestaudio/best",
-         ["tv_simply", "android_vr", "web_embedded", "android"],  False),
+         ["default", "tv", "web_safari"],                         False),
     ]
     if cookie:
         combos = _COOKIE_RUNGS + _NOCOOKIE_RUNGS
@@ -3578,8 +3560,7 @@ def _cloud_download_sync(
     _ANY_FMT = ("bestaudio*[protocol^=http]/bestaudio*/bestaudio/"
                 "best[protocol^=http]/best/worst")
     combos += [
-        (_ANY_FMT, ["tv_simply", "android_vr", "web_embedded"],    False),
-        (_ANY_FMT, ["web_embedded", "android_vr", "ios", "mweb"],  False),
+        (_ANY_FMT, ["default", "tv", "web_safari"],                False),
         (_ANY_FMT, ["default"],                                    False),
     ]
 
@@ -3944,58 +3925,6 @@ def _build_extractor_args(yt_args: dict) -> dict:
     return providers
 
 
-# ── Datacenter-IP bypass: outbound proxy support (Heroku/Render/Railway) ────
-# ROOT CAUSE of "IP error" while playing music: YouTube/googlevideo blocks
-# Heroku's US datacenter IP ranges outright. Cookies + TLS impersonation help
-# with the bot-check gate, but they cannot fix a blocked source IP — only
-# routing the request through a non-datacenter IP can.
-#
-# Set ONE of these Config Vars to a residential/mobile proxy to fix it:
-#   YT_PROXY / YTDLP_PROXY / PROXY_URL
-# Examples:
-#   http://user:pass@host:port
-#   socks5://user:pass@host:port
-# Unset = current behaviour (direct connection), nothing changes.
-_YT_PROXY_URL: str = (
-    os.environ.get("YT_PROXY", "").strip()
-    or os.environ.get("YTDLP_PROXY", "").strip()
-    or os.environ.get("PROXY_URL", "").strip()
-)
-
-
-def _proxy_opts() -> dict:
-    """yt-dlp option dict carrying the configured proxy (empty when unset)."""
-    return {"proxy": _YT_PROXY_URL} if _YT_PROXY_URL else {}
-
-
-def _req_proxies() -> dict | None:
-    """`proxies=` value for requests/curl_cffi calls (None when unset)."""
-    if not _YT_PROXY_URL:
-        return None
-    return {"http": _YT_PROXY_URL, "https": _YT_PROXY_URL}
-
-
-def log_proxy_status() -> None:
-    """One-line startup log so the proxy state is obvious in Heroku logs."""
-    import logging as _logging
-    _lg = _logging.getLogger("Melody")
-    if _YT_PROXY_URL:
-        # Never log credentials — host only.
-        try:
-            host = _urlparse.urlsplit(_YT_PROXY_URL).hostname or "?"
-        except Exception:
-            host = "?"
-        _lg.info("\U0001F310 Outbound proxy ACTIVE for YouTube (%s) — datacenter IP bypassed", host)
-    elif _ON_CLOUD_HOST:
-        _lg.warning(
-            "\u26A0\uFE0F  No YT_PROXY set on a cloud host — YouTube can reject this "
-            "datacenter IP. Set YT_PROXY=http://user:pass@host:port to fix playback IP errors."
-        )
-
-
-log_proxy_status()
-
-
 def _yt_base_opts(out_tmpl: str, client: str, fmt: str) -> dict:
     """Build yt-dlp options with all stability/bypass techniques applied.
 
@@ -4116,8 +4045,6 @@ def _yt_base_opts(out_tmpl: str, client: str, fmt: str) -> dict:
         # Cookies are only useful for authenticated DASH clients (web,
         # android, ios) that can leverage the full session manifest.
         **({} if client in _YT_NO_POTOKEN_CLIENTS else _cookie_opts()),
-        # Route through the configured proxy when set (fixes datacenter IP blocks).
-        **_proxy_opts(),
     }
 
 
@@ -4281,7 +4208,6 @@ async def _yt_try_piped(video_id: str, out_tmpl: str, logger=None) -> dict | Non
                 try:
                     with requests.get(u, stream=True, timeout=90,
                                       headers={"User-Agent": random_ua()},
-                                      proxies=_req_proxies(),
                                       allow_redirects=True) as r:
                         r.raise_for_status()
                         with open(raw_path, "wb") as fh:
@@ -4466,7 +4392,6 @@ async def piped_search_download(query: str, out_tmpl: str, logger=None) -> dict 
                 try:
                     with requests.get(url, stream=True, timeout=90,
                                       headers={"User-Agent": random_ua()},
-                                      proxies=_req_proxies(),
                                       allow_redirects=True) as r:
                         r.raise_for_status()
                         with open(raw_path, "wb") as fh:
@@ -4722,10 +4647,6 @@ async def youtube_search_download(query: str, out_tmpl: str, logger=None) -> dic
         "tv",                 # plain https formats, PO-token nahi chahiye
         "web_safari",         # Safari fingerprint
         "web",                # Standard web + cookies + bgutil PO-token
-        "web_music",          # YouTube Music — excellent for Hindi/regional songs
-        "android",            # Android client — high reliability with cookies
-        "ios",                # iOS client — unique CDN fingerprint
-        "mweb",               # Mobile web — lightweight, different server routing
     ])
 
     p1_clients = _cookie_preferred_clients if _YTDLP_COOKIE_FILE else _YT_CLIENTS
@@ -4802,7 +4723,7 @@ async def youtube_search_download(query: str, out_tmpl: str, logger=None) -> dic
         with open(cj_file, "w") as _f:
             _f.write("# Netscape HTTP Cookie File\n")
         # Retry Tier-1 clients with cookiefile
-        for client in yt_clients(["android_vr", "tv_simply", "web_creator"]):
+        for client in yt_clients(["default", "tv", "web_safari"]):
             p4_tmpl = out_tmpl + f"_ck_{ts}_{client}.%(ext)s"
             opts = _yt_base_opts(p4_tmpl, client, fmt_chain[0])
             opts["cookiefile"] = cj_file

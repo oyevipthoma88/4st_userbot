@@ -84,10 +84,6 @@
       "description": "MongoDB database name.",
       "required": false,
       "value": "4st_userbot"
-    },
-    "YT_PROXY": {
-      "description": "Optional. HTTP/SOCKS5 proxy used for YouTube requests (http://user:pass@host:port or socks5://...). Set this when playback fails with an IP/bot error from a datacenter IP.",
-      "required": false
     }
   },
   "buildpacks": [
