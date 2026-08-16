@@ -3498,8 +3498,26 @@ def _cloud_download_sync(
     #   ❌ tv / web                 → "Requested format is not available"
     # The old order led with the three 403 clients, so every song burned
     # ~40s of failures before reaching a client that actually works.
-    combos = [
-        # (fmt, clients, use_player_skip)
+    # ROOT-CAUSE FIX (Heroku log 2026-08-16 12:16, cookies=✅ but EVERY rung:
+    #   "Sign in to confirm you're not a bot"  on tv_simply / android_vr /
+    #   android). Those three clients CANNOT use a cookie jar (yt-dlp:
+    #   SUPPORTS_COOKIES=False), so on a datacenter IP they hit YouTube fully
+    #   anonymous → instant bot-gate. Leading the ladder with them meant the
+    #   authenticated cookie jar we DO have was never used.
+    # Fix: when cookies exist, run cookie-capable clients FIRST (they
+    # authenticate and sail past the bot-gate); the cookieless clients stay
+    # only as a no-cookie fallback. Without cookies the old order is kept,
+    # because then the cookieless clients are the ones that work.
+    _COOKIE_RUNGS = [
+        ("bestaudio[abr<=128]/bestaudio/best", ["web_embedded"], False),
+        ("bestaudio[ext=m4a]/bestaudio/best",  ["web_safari"],   False),
+        ("bestaudio/best",                     ["mweb"],         False),
+        ("bestaudio[ext=m4a]/bestaudio/best",  ["web"],          False),
+        ("bestaudio/best",                     ["web_music"],    False),
+        ("bestaudio/best",   ["web_embedded", "web_safari", "mweb", "web"], False),
+        ("bestaudio/best",                     ["tv"],           False),
+    ]
+    _NOCOOKIE_RUNGS = [
         ("bestaudio[abr<=128]/bestaudio/best", ["web_embedded"],  False),
         ("bestaudio/best",                     ["tv_simply"],     False),
         ("bestaudio/best",                     ["android_vr"],    False),
@@ -3509,17 +3527,11 @@ def _cloud_download_sync(
          ["web_embedded", "tv_simply", "android_vr", "android"],  False),
         # tv_embedded + player_skip=webpage: sign-in gate skip, no PO-token.
         ("bestaudio/best",                     ["tv_embedded"],   True),
-        # Historically-good clients, now usually 403 from cloud IPs — kept
-        # as late fallbacks because they still work from residential IPs.
         ("bestaudio/best",                     ["web_safari"],    False),
         ("bestaudio/best",                     ["mweb"],          False),
         ("bestaudio/best",                     ["ios"],           False),
     ]
-    if cookie:
-        combos += [
-            ("bestaudio[ext=m4a]/bestaudio/best", ["web"],            False),
-            ("bestaudio/best",                    ["web", "default"], False),
-        ]
+    combos = (_COOKIE_RUNGS + _NOCOOKIE_RUNGS) if cookie else _NOCOOKIE_RUNGS[:]
     # Last resort: SABR-affected clients (tv/default).
     combos += [
         ("bestaudio/best",                    ["tv"],                False),
@@ -3531,9 +3543,11 @@ def _cloud_download_sync(
     _ANY_FMT = ("bestaudio*[protocol^=http]/bestaudio*/bestaudio/"
                 "best[protocol^=http]/best/worst")
     combos += [
+        (_ANY_FMT, ["web_embedded", "web_safari", "mweb"],        False),
         (_ANY_FMT, ["web_embedded", "android_vr", "ios", "mweb"], False),
         (_ANY_FMT, ["default"],                                   False),
     ]
+
 
     # HEROKU FIX: when ffmpeg not found, override format to pre-packaged audio.
     # "bestaudio/best" can pick DASH separate streams that need FFmpegMergerPP —
@@ -3544,9 +3558,17 @@ def _cloud_download_sync(
         "/best[ext=mp4]/best[ext=webm]/best"
     )
 
+    _botgate_hits = 0          # how many rungs died on "Sign in to confirm…"
     for fmt, clients, use_player_skip in combos:
         actual_fmt = fmt if _MS_FFMPEG_DIR else _NO_FFMPEG_FMT
         clients = yt_clients(clients)
+        # Once the anonymous bot-gate has bitten twice, every remaining
+        # cookieless rung will hit exactly the same wall — skip them instead
+        # of burning ~2s each (Heroku log: 5 identical failures per song).
+        if (cookie and _botgate_hits >= 2
+                and not _clients_accept_cookies(clients)):
+            continue
+
         # formats=missing_pot: PO-token ke bina bhi formats hide na ho —
         # warna selector kuch match nahi karta ("Requested format is not
         # available") aur har client fail dikhta hai.
@@ -3626,7 +3648,10 @@ def _cloud_download_sync(
             err_str = str(exc)
             if _ydl_error:
                 err_str = _ydl_error[-1] + " | " + err_str
+            if "not a bot" in err_str or "Sign in to confirm" in err_str:
+                _botgate_hits += 1
             logger("MUSIC_DL_ERR", f"cloud_dl [{clients}]: {err_str[:200]}")
+
             # Cleanup partial files
             for ext in ("opus", "mp3", "m4a", "webm", "part", "ytdl"):
                 p = out_tmpl.replace("%(ext)s", ext)
