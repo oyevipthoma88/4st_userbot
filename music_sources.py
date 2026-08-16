@@ -3524,27 +3524,49 @@ def _cloud_download_sync(
     # skips its remaining rungs instead of aborting the useful ones.
     _WEB_FAMILY = {"web", "web_safari", "web_embedded", "web_music", "mweb"}
 
-    _PRIMARY_RUNGS = [
-        # PO-token-free / cookie-free clients first — proven on cloud IPs.
+    # ROOT-CAUSE FIX (Heroku log 2026-08-16 13:02, bgutil=✅ deno=✅ cookies=✅
+    #   but EVERY rung: cloud_dl [['tv_simply']] / [['android_vr']] →
+    #   "Sign in to confirm you're not a bot"):
+    # tv_simply / android_vr / tv_embedded CANNOT use a cookie jar, and from a
+    # datacenter IP YouTube now bot-gates them even with a PO-token provider
+    # attached. Leading the ladder with them means every single rung that can
+    # actually authenticate is reached only after ~8 wasted attempts — and the
+    # cookieless rungs can never succeed on Heroku at all.
+    # Fix: when cookies are available, lead with the Melody_music-proven
+    # cookie + bgutil configuration (player_client default/tv/web_safari with
+    # formats=missing_pot), which is the config verified working on this exact
+    # Heroku USA dyno. The cookieless clients stay on as a fallback for the
+    # no-cookie deployment.
+    _COOKIE_RUNGS = [
+        # Melody_music proven rung — cookies + bgutil PO-token.
+        ("bestaudio[abr<=128]/bestaudio/best",
+         ["default", "tv", "web_safari"],                          False),
+        ("bestaudio[ext=m4a]/bestaudio/best",  ["web_safari"],      False),
+        ("bestaudio/best",                     ["web_embedded"],    False),
+        ("bestaudio/best",                     ["mweb"],            False),
+        ("bestaudio[ext=m4a]/bestaudio/best",  ["web"],             False),
+        ("bestaudio/best",                     ["web_music"],       False),
+    ]
+
+    _NOCOOKIE_RUNGS = [
+        # PO-token-free / cookie-free clients — only path when no cookies.
+        # Verified 2026-08-16 from a datacenter IP without cookies: `android`
+        # downloads fine while tv_simply / android_vr answer 403 or bot-gate,
+        # so try android/ios first and keep the others as backup.
+        ("bestaudio/best",                     ["android"],       False),
+        ("bestaudio/best",                     ["ios"],           False),
         ("bestaudio/best",                     ["tv_simply"],     False),
         ("bestaudio/best",                     ["android_vr"],    False),
         # tv_embedded + player_skip=webpage: sign-in gate skip, no PO-token.
         ("bestaudio/best",                     ["tv_embedded"],   True),
-        ("bestaudio[abr<=128]/bestaudio/best", ["web_embedded"],  False),
-        ("bestaudio/best",                     ["android"],       False),
-        ("bestaudio/best",                     ["ios"],           False),
         ("bestaudio/best",                     ["default"],       False),
         ("bestaudio/best",
          ["tv_simply", "android_vr", "web_embedded", "android"],  False),
     ]
-    # Web family (needs cookies and/or a real PO-token) — later, not first.
-    _WEB_RUNGS = [
-        ("bestaudio[ext=m4a]/bestaudio/best",  ["web_safari"],    False),
-        ("bestaudio/best",                     ["mweb"],          False),
-        ("bestaudio[ext=m4a]/bestaudio/best",  ["web"],           False),
-        ("bestaudio/best",                     ["web_music"],     False),
-    ]
-    combos = _PRIMARY_RUNGS + _WEB_RUNGS
+    if cookie:
+        combos = _COOKIE_RUNGS + _NOCOOKIE_RUNGS
+    else:
+        combos = _NOCOOKIE_RUNGS + _COOKIE_RUNGS
     # Last resort: SABR-affected clients (tv/default).
     combos += [
         ("bestaudio/best",                    ["tv"],                False),
@@ -3579,7 +3601,7 @@ def _cloud_download_sync(
         # A 403 on the media request means this IP has no valid GVS PO-token,
         # so every remaining PO-token-gated web rung will fail identically —
         # skip them (but NEVER skip the cookieless clients that do work).
-        if _pot403_hits >= 2 and set(clients) <= _WEB_FAMILY:
+        if _pot403_hits >= 3 and set(clients) <= _WEB_FAMILY:
             continue
         # Same idea for the anonymous bot-gate: once it has bitten twice,
         # cookieless rungs are hopeless *only if* we still have cookie-capable
