@@ -1933,10 +1933,13 @@ async def search_and_download_audio(query: str):
         try:
             result = await asyncio.wait_for(
                 music_sources.youtube_search_download(query, tmpl, logger=bot_logger),
-                timeout=120.0,
+                timeout=300.0,
             )
         except asyncio.TimeoutError:
-            bot_logger("MUSIC_YT_TIMEOUT", f"YouTube timed out (120s) for: {query!r}")
+            # 120s bahut kam tha: Heroku par client-ladder + mirrors 150s+ le
+            # lete the, timeout hit hone se successful download beech me hi
+            # cancel ho jaata tha aur kuch play nahi hota tha.
+            bot_logger("MUSIC_YT_TIMEOUT", f"YouTube timed out (300s) for: {query!r}")
             return None
         if not result:
             return None
@@ -2001,7 +2004,7 @@ async def search_and_download_video(query: str):
         try:
             result = await asyncio.wait_for(
                 music_sources.youtube_video_download(query, tmpl, logger=bot_logger),
-                timeout=120.0,
+                timeout=300.0,
             )
         except asyncio.TimeoutError:
             bot_logger("MUSIC_YT_TIMEOUT", f"YouTube video timed out (120s) for: {query!r}")
@@ -2272,7 +2275,15 @@ async def music_play_track(chat_id: int, track: MusicTrack, session_user_id: int
             # for a non-existent network reconnect event, freezing the voice chat.
             # yt-dlp downloads to a local temp file on Heroku (CDN is IP-blocked),
             # so this branch is the NORMAL path on every Heroku play() call.
-            _ffmpeg_in_flags = "-probesize 32 -analyzeduration 0"
+            # ── ROOT FIX (music play nahi hota) ──────────────────────────
+            # -probesize 32 -analyzeduration 0 sabse bada culprit tha.
+            # PyTgCalls yahi ffmpeg_parameters ffprobe ko bhi deta hai
+            # (pytgcalls/ffmpeg.py check_stream). 32 bytes me koi bhi
+            # container (m4a/webm/opus/ogg) ka stream header parse nahi hota →
+            # ffprobe "could not find codec parameters" deta hai →
+            # NoAudioSourceFound / khaali exception → gaana bajta hi nahi.
+            # Local disk file hai, isliye bada probesize latency nahi badhata.
+            _ffmpeg_in_flags = "-probesize 5000000 -analyzeduration 5000000"
         if track.is_video:
             stream = MediaStream(
                 source,
