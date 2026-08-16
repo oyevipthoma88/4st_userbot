@@ -84,6 +84,7 @@ import re
 import shutil as _shutil
 import subprocess
 import sys as _sys
+import threading
 import time
 import unicodedata
 import urllib.parse as _urlparse
@@ -3227,15 +3228,129 @@ _YT_BROWSER_UA = random_ua()
 # Tier-1 clients that don't need PO tokens — skip innertube auth entirely
 _YT_NO_POTOKEN_CLIENTS = set(yt_clients(["android_vr", "tv_simply", "web_creator"]))
 
-# Cached bgutil server path (computed once, reused in every opts call)
-_BGUTIL_SERVER_HOME: str = os.path.join(
+# ── bgutil PO-token provider paths ──────────────────────────────────────
+# ROOT-CAUSE FIX (Heroku log 2026-08-16: every cloud_dl rung dying with
+# "unable to download video data: HTTP Error 403: Forbidden" and
+# "Requested format is not available"):
+#
+# The bgutil script provider was being handed the provider ROOT directory
+# as `server_home`. The plugin resolves the generator as
+# `<server_home>/src/generate_once.ts`, so it looked for
+# `vendor/bgutil-ytdlp-pot-provider/src/generate_once.ts` — a path that
+# does NOT exist (the real file lives under `.../server/src/`). The plugin
+# logged "Script path doesn't exist" and returned NO PO token, silently.
+#
+# Without a PO token, `formats: ["missing_pot"]` keeps the PO-token-gated
+# googlevideo formats visible, yt-dlp happily picks one, and YouTube
+# answers 403 on the actual media request — exactly what the log shows.
+# For clients that expose nothing else, the selector matches nothing and we
+# get "Requested format is not available" instead.
+#
+# `server_home` MUST be the `server` sub-directory.
+_BGUTIL_HOME: str = os.path.join(
     os.path.dirname(os.path.abspath(__file__)),
     "vendor", "bgutil-ytdlp-pot-provider",
 )
+_BGUTIL_SERVER_HOME: str = os.path.join(_BGUTIL_HOME, "server")
 _BGUTIL_SCRIPT: str = os.path.join(
-    _BGUTIL_SERVER_HOME, "server", "src", "generate_once.ts"
+    _BGUTIL_SERVER_HOME, "src", "generate_once.ts"
 )
 _BGUTIL_ACTIVE: bool = os.path.isfile(_BGUTIL_SCRIPT)
+
+# ── Warm bgutil HTTP provider (Melody_music proven fast path) ───────────
+# Script mode spawns a brand-new Deno + BotGuard session for EVERY token,
+# which costs seconds per track and times out under our short socket
+# timeouts. The bundled `server/src/main.ts` is the same provider running
+# as a long-lived local HTTP server with a warm session + token cache.
+# Prefer it, fall back to script mode automatically.
+_BGUTIL_HTTP_PORT: int = int(os.environ.get("BGUTIL_PORT", "4416"))
+_BGUTIL_HTTP_PROC = None
+_BGUTIL_HTTP_READY: bool = False
+_BGUTIL_HTTP_LOCK = threading.Lock()
+
+
+def ensure_bgutil_http_server() -> bool:
+    """Start the persistent bgutil PO-token HTTP server (idempotent)."""
+    global _BGUTIL_HTTP_PROC
+    with _BGUTIL_HTTP_LOCK:
+        if _BGUTIL_HTTP_READY:
+            return True
+        if _BGUTIL_HTTP_PROC is not None and _BGUTIL_HTTP_PROC.poll() is None:
+            return False  # starting — poll _bgutil_http_alive() shortly
+        main_ts = os.path.join(_BGUTIL_SERVER_HOME, "src", "main.ts")
+        deno = _find_deno()
+        if not os.path.isfile(main_ts) or not deno:
+            return False
+        cache_dir = os.path.join(_BGUTIL_SERVER_HOME, "cache")
+        node_mods = os.path.join(_BGUTIL_SERVER_HOME, "node_modules")
+        try:
+            os.makedirs(cache_dir, exist_ok=True)
+            _BGUTIL_HTTP_PROC = subprocess.Popen(
+                [
+                    deno, "run",
+                    "--allow-env", "--allow-net",
+                    f"--allow-ffi={node_mods}",
+                    f"--allow-write={cache_dir}",
+                    f"--allow-read={cache_dir},{node_mods}",
+                    main_ts, "--port", str(_BGUTIL_HTTP_PORT),
+                ],
+                cwd=_BGUTIL_SERVER_HOME,
+                env={**os.environ, "XDG_CACHE_HOME": cache_dir},
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+            return False
+        except Exception:
+            _BGUTIL_HTTP_PROC = None
+            return False
+
+
+def _bgutil_http_alive() -> bool:
+    """Best-effort /ping against the local bgutil HTTP server."""
+    global _BGUTIL_HTTP_READY
+    if _BGUTIL_HTTP_READY:
+        return True
+    try:
+        import urllib.request as _u
+        with _u.urlopen(
+            f"http://127.0.0.1:{_BGUTIL_HTTP_PORT}/ping", timeout=1.5
+        ) as r:
+            if r.status == 200:
+                _BGUTIL_HTTP_READY = True
+                return True
+    except Exception:
+        pass
+    return False
+
+
+async def warm_up_bgutil_server(timeout: float = 25.0) -> None:
+    """Start + wait for the bgutil HTTP server (call once at startup)."""
+    if not _BGUTIL_ACTIVE:
+        return
+    if not await asyncio.to_thread(ensure_bgutil_http_server) and _BGUTIL_HTTP_PROC is None:
+        return
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + timeout
+    while loop.time() < deadline:
+        if await asyncio.to_thread(_bgutil_http_alive):
+            return
+        await asyncio.sleep(0.5)
+
+
+def _bgutil_provider_args() -> dict:
+    """PO-token provider extractor_args — warm HTTP first, script fallback."""
+    if not _BGUTIL_ACTIVE:
+        return {}
+    if _bgutil_http_alive():
+        return {
+            "youtubepot-bgutilhttp": {
+                "base_url": [f"http://127.0.0.1:{_BGUTIL_HTTP_PORT}"],
+            }
+        }
+    # Kick the HTTP server off for the next track, use script mode now.
+    with contextlib.suppress(Exception):
+        ensure_bgutil_http_server()
+    return {"youtubepot-bgutilscript": {"server_home": [_BGUTIL_SERVER_HOME]}}
 
 if _BGUTIL_ACTIVE:
     import logging as _logging
@@ -3343,31 +3458,38 @@ def _cloud_download_sync(
     # yt-dlp #12482 ke mutabik SABR-resistant clients pehle try karo:
     #   web_safari, mweb, ios, web_embedded, tv_embedded (with player_skip).
     # tv/default ko sirf last resort ke taur pe rakho.
+    # LADDER ORDER — re-verified 2026-08-16 from a datacenter IP with the
+    # (now actually working) bgutil PO-token provider attached:
+    #   ✅ web_embedded, tv_simply, android_vr, android, default
+    #   ❌ web_safari / mweb / ios  → 403 Forbidden on the media request
+    #   ❌ tv / web                 → "Requested format is not available"
+    # The old order led with the three 403 clients, so every song burned
+    # ~40s of failures before reaching a client that actually works.
     combos = [
         # (fmt, clients, use_player_skip)
-        # ★ SABR-resistant combo — sabse pehle.
-        ("bestaudio[abr<=128]/bestaudio/best",
-         ["web_safari", "mweb", "ios"],         False),
-        ("bestaudio/best",                     ["web_safari"],      False),
-        ("bestaudio/best",                     ["mweb"],            False),
-        ("bestaudio/best",                     ["ios"],             False),
-        ("bestaudio/best",                     ["web_embedded"],    False),
-        # tv_embedded + player_skip=webpage: sign-in gate skip, no PO-token.
-        ("bestaudio/best",                     ["tv_embedded"],     True),
-        ("bestaudio/best",                     ["android"],         False),
-        ("bestaudio/best",                     ["tv_simply"],       False),
+        ("bestaudio[abr<=128]/bestaudio/best", ["web_embedded"],  False),
+        ("bestaudio/best",                     ["tv_simply"],     False),
+        ("bestaudio/best",                     ["android_vr"],    False),
+        ("bestaudio/best",                     ["android"],       False),
+        ("bestaudio/best",                     ["default"],       False),
         ("bestaudio/best",
-         ["web_safari", "ios", "mweb", "tv_embedded", "android_vr"], False),
+         ["web_embedded", "tv_simply", "android_vr", "android"],  False),
+        # tv_embedded + player_skip=webpage: sign-in gate skip, no PO-token.
+        ("bestaudio/best",                     ["tv_embedded"],   True),
+        # Historically-good clients, now usually 403 from cloud IPs — kept
+        # as late fallbacks because they still work from residential IPs.
+        ("bestaudio/best",                     ["web_safari"],    False),
+        ("bestaudio/best",                     ["mweb"],          False),
+        ("bestaudio/best",                     ["ios"],           False),
     ]
     if cookie:
         combos += [
-            ("bestaudio[ext=m4a]/bestaudio/best", ["web"],           False),
+            ("bestaudio[ext=m4a]/bestaudio/best", ["web"],            False),
             ("bestaudio/best",                    ["web", "default"], False),
         ]
     # Last resort: SABR-affected clients (tv/default).
     combos += [
         ("bestaudio/best",                    ["tv"],                False),
-        ("bestaudio/best",                    ["default"],           False),
     ]
 
     # HEROKU FIX: when ffmpeg not found, override format to pre-packaged audio.
@@ -3389,8 +3511,7 @@ def _cloud_download_sync(
         if use_player_skip:
             yt_ext["player_skip"] = ["webpage"]
         ext_args: dict = {"youtube": yt_ext}
-        if _BGUTIL_ACTIVE:
-            ext_args["youtubepot-bgutilscript"] = {"server_home": [_BGUTIL_SERVER_HOME]}
+        ext_args.update(_bgutil_provider_args())
 
 
         opts: dict = {
@@ -3633,7 +3754,7 @@ async def _ensure_bgutil_runtime(logger=None) -> None:
 
             # Copy to vendor/
             import shutil as _sh4
-            bgutil_home = _BGUTIL_SERVER_HOME
+            bgutil_home = _BGUTIL_HOME
             plugin_dst = os.path.join(bgutil_home, "plugin")
             server_dst = os.path.join(bgutil_home, "server")
             os.makedirs(bgutil_home, exist_ok=True)
@@ -3669,6 +3790,9 @@ async def _ensure_bgutil_runtime(logger=None) -> None:
             gen_once = os.path.join(server_dst, "src", "generate_once.ts")
             if os.path.isfile(gen_once):
                 _BGUTIL_ACTIVE = True
+                # Bring the warm HTTP provider up right away.
+                with contextlib.suppress(Exception):
+                    asyncio.create_task(warm_up_bgutil_server())
                 _info("BGUTIL", "✅ bgutil runtime install complete — PO-token provider active!")
             else:
                 _info("BGUTIL_WARN", "⚠️ bgutil: generate_once.ts missing after install")
@@ -3699,8 +3823,7 @@ def _build_extractor_args(yt_args: dict) -> dict:
     On a fresh deploy it will be missing (shows ⚠️ above); redeploy to get it.
     """
     providers: dict = {"youtube": yt_args}
-    if _BGUTIL_ACTIVE:
-        providers["youtubepot-bgutilscript"] = {"server_home": [_BGUTIL_SERVER_HOME]}
+    providers.update(_bgutil_provider_args())
     return providers
 
 
@@ -4291,6 +4414,11 @@ async def youtube_search_download(query: str, out_tmpl: str, logger=None) -> dic
             await _ensure_bgutil_runtime(logger)
         else:
             asyncio.create_task(_ensure_bgutil_runtime(logger))
+    elif _BGUTIL_ACTIVE and not _BGUTIL_HTTP_READY:
+        # Warm PO-token HTTP server up in the background (script mode is used
+        # meanwhile, so this never blocks the first song).
+        with contextlib.suppress(Exception):
+            asyncio.create_task(warm_up_bgutil_server())
 
     is_direct = bool(_URL_RE.match(query.strip()))
     video_id  = _yt_extract_video_id(query) if is_direct else None
