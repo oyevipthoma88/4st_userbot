@@ -2873,84 +2873,203 @@ def _grow_rights():
     return ChatAdminRights(**GROW_POWER_PRESETS[_grow_power_key()]["rights"])
 
 async def _grow_cores():
-    """[(client, user_id, first_name)] for every live core (primary + extras)."""
+    """[{client,id,name,username}] for every live core (primary + extras).
+
+    De-duplicated by user id, so the same account logged in twice never gets
+    counted (or promoted) twice."""
     cores = []
+    seen = set()
     for cl in [userbot] + list(extra_clients):
         try:
+            if not cl.is_connected():
+                try:
+                    await cl.connect()
+                except Exception:
+                    continue
             me = await cl.get_me()
-            cores.append((cl, me.id, me.first_name or str(me.id)))
+            if not me or me.id in seen:
+                continue
+            seen.add(me.id)
+            cores.append({
+                "client": cl,
+                "id": me.id,
+                "name": me.first_name or str(me.id),
+                "username": (getattr(me, "username", "") or "").lower(),
+            })
         except Exception:
             continue
     return cores
 
 async def _grow_collect_chats(cores):
-    """{chat_id: (source_client, title, is_creator)} for every group/channel
-    where at least one core has admin rights that allow inviting."""
+    """{chat_id: {...}} for every group/channel where at least one core can
+    invite AND/OR promote. Keeps the strongest source client per chat
+    (creator > can-promote admin > plain admin)."""
+    from telethon import utils as _tutils
     chats = {}
-    for cl, _uid, _name in cores:
+    for core in cores:
+        cl = core["client"]
         try:
             async for dlg in cl.iter_dialogs():
                 if not (dlg.is_group or dlg.is_channel):
                     continue
-                cid = dlg.id
+                ent = dlg.entity
                 try:
-                    perms = await cl.get_permissions(dlg.entity, "me")
+                    cid = _tutils.get_peer_id(ent)
+                except Exception:
+                    cid = dlg.id
+                try:
+                    perms = await cl.get_permissions(ent, "me")
                 except Exception:
                     continue
-                is_creator = bool(getattr(perms, "is_creator", False))
-                can_invite = bool(getattr(perms, "invite_users", False))
-                if not (is_creator or (getattr(perms, "is_admin", False) and can_invite)):
+                is_creator  = bool(getattr(perms, "is_creator", False))
+                is_admin    = bool(getattr(perms, "is_admin", False)) or is_creator
+                can_invite  = bool(getattr(perms, "invite_users", False)) or is_creator
+                can_promote = bool(getattr(perms, "add_admins", False)) or is_creator
+                # Without add_admins the promote call can only fail, so such a
+                # source is useless unless another core can promote there.
+                if not (is_admin and (can_invite or can_promote)):
                     continue
+                score = (4 if is_creator else 0) + (2 if can_promote else 0) + (1 if can_invite else 0)
                 prev = chats.get(cid)
-                # A creator source beats a plain-admin source for the same chat.
-                if prev and prev[2] and not is_creator:
+                if prev and prev["score"] >= score:
                     continue
-                chats[cid] = (cl, getattr(dlg.entity, "title", str(cid)), is_creator)
+                chats[cid] = {
+                    "client": cl,
+                    "owner_id": core["id"],
+                    "entity": ent,
+                    "title": getattr(ent, "title", str(cid)) or str(cid),
+                    "creator": is_creator,
+                    "can_promote": can_promote,
+                    "can_invite": can_invite,
+                    "score": score,
+                }
         except Exception as e:
             bot_logger("GROW_SCAN_ERR", str(e)[:120])
     return chats
 
-async def _grow_add_and_promote(src_client, chat_id, target_id, rights, rank="4ST"):
-    """Add `target_id` to `chat_id` then promote. Returns (ok, note)."""
+async def _grow_resolve_target(src_client, chat_entity, core):
+    """Resolve `core` into an entity THIS client can actually use.
+
+    A raw user id is useless to a client that never met that user
+    ("Cannot find any entity corresponding to ..."), which is why add+promote
+    used to fail. Try, in order: username → cached input entity → the chat's
+    own participant list."""
+    uname = core.get("username")
+    if uname:
+        try:
+            return await src_client.get_entity(uname)
+        except Exception:
+            pass
+    for getter in (src_client.get_input_entity, src_client.get_entity):
+        try:
+            return await getter(core["id"])
+        except Exception:
+            continue
+    # last resort: find them among the chat participants (they may already be in)
+    for kwargs in ({"search": (core.get("name") or "")[:12]}, {"limit": 3000}):
+        try:
+            async for u in src_client.iter_participants(chat_entity, **kwargs):
+                if u.id == core["id"]:
+                    return u
+        except Exception:
+            continue
+    return None
+
+async def _grow_add_and_promote(chat, core, rights, rank="4ST"):
+    """Add `core` to `chat` (if missing) then promote it. Returns (ok, note)."""
+    from telethon.tl.types import Channel
     from telethon.tl.functions.channels import (EditAdminRequest,
                                                 InviteToChannelRequest)
-    from telethon.tl.functions.messages import AddChatUserRequest
+    from telethon.tl.functions.messages import (AddChatUserRequest,
+                                                EditChatAdminRequest)
     from telethon.errors import FloodWaitError
-    try:
-        target = await src_client.get_entity(target_id)
-    except Exception as e:
-        return False, f"entity: {str(e)[:40]}"
-    # ── add (ignore "already participant" style failures) ──
-    try:
-        try:
-            await src_client(InviteToChannelRequest(chat_id, [target]))
-        except Exception:
-            # legacy (non-supergroup) chats use a different method
-            try:
-                await src_client(AddChatUserRequest(chat_id, target, fwd_limit=10))
-            except Exception:
-                pass
-        await asyncio.sleep(1)
-    except FloodWaitError as fw:
-        await asyncio.sleep(min(fw.seconds + 3, 120))
-    # ── promote ──
+
+    src_client = chat["client"]
+    ent        = chat["entity"]
+    is_channel = isinstance(ent, Channel)
+
+    target = await _grow_resolve_target(src_client, ent, core)
+    if target is None:
+        return False, "user not resolvable (needs @username or a shared chat)"
+
+    # ── add (a user that is already inside is NOT an error) ──
+    already_in = False
     for attempt in range(2):
         try:
-            await src_client(EditAdminRequest(chat_id, target, rights, rank=rank))
-            return True, "promoted"
+            if is_channel:
+                await src_client(InviteToChannelRequest(ent, [target]))
+            else:
+                await src_client(AddChatUserRequest(ent.id, target, fwd_limit=10))
+            break
         except FloodWaitError as fw:
             if attempt == 0 and fw.seconds <= 120:
                 await asyncio.sleep(fw.seconds + 3)
                 continue
+            return False, f"floodwait {fw.seconds}s on add"
+        except Exception as e:
+            msg = str(e).upper()
+            if "ALREADY" in msg or "PARTICIPANT" in msg and "ALREADY" in msg:
+                already_in = True
+                break
+            if "PRIVACY" in msg:
+                # privacy blocks the invite, but promoting still works if they
+                # are already inside — fall through to the promote step.
+                already_in = True
+                break
+            if "NOT_MUTUAL" in msg or "USER_CHANNELS_TOO_MUCH" in msg:
+                return False, str(e)[:60]
+            # unknown add error — they might still be a member, try promote
+            already_in = True
+            break
+    await asyncio.sleep(1)
+
+    if not chat.get("can_promote"):
+        # source can invite but cannot grant admin here
+        return (False, "no add-admins right here") if already_in \
+               else (True, "added (no promote rights here)")
+
+    # ── promote ──
+    for attempt in range(3):
+        try:
+            if is_channel:
+                await src_client(EditAdminRequest(ent, target, rights, rank=rank))
+            else:
+                await src_client(EditChatAdminRequest(ent.id, target, is_admin=True))
+            return True, "already in → promoted" if already_in else "added + promoted"
+        except FloodWaitError as fw:
+            if attempt < 2 and fw.seconds <= 120:
+                await asyncio.sleep(fw.seconds + 3)
+                continue
             return False, f"floodwait {fw.seconds}s"
         except Exception as e:
-            return False, str(e)[:50]
-    return False, "failed"
+            msg = str(e).upper()
+            if "USER_ADMIN_INVALID" in msg or "ADMIN_INVALID" in msg:
+                # already an admin, promoted by someone else — not a failure
+                return True, "already admin"
+            if "ADMIN_RANK" in msg and rank:
+                rank = ""
+                continue
+            if "USER_NOT_PARTICIPANT" in msg and attempt == 0:
+                try:
+                    if is_channel:
+                        await src_client(InviteToChannelRequest(ent, [target]))
+                    else:
+                        await src_client(AddChatUserRequest(ent.id, target, fwd_limit=10))
+                    await asyncio.sleep(1)
+                    continue
+                except Exception:
+                    return False, "could not add before promote"
+            if "RIGHT_FORBIDDEN" in msg:
+                return False, "cannot grant those rights (lower your power preset)"
+            if "CHAT_ADMIN_REQUIRED" in msg:
+                return False, "source is not admin here"
+            return False, str(e)[:60]
+    return False, "promote failed"
 
 async def _grow_run(progress_msg, only_user_id=None):
     """Main Grow worker. only_user_id=None → every core; else that core only."""
-    rights   = _grow_rights()
-    cores    = await _grow_cores()
+    rights = _grow_rights()
+    cores  = await _grow_cores()
     if not cores:
         try:
             await progress_msg.edit("<blockquote>❌ No live cores found.</blockquote>",
@@ -2958,7 +3077,7 @@ async def _grow_run(progress_msg, only_user_id=None):
         except Exception:
             pass
         return
-    targets = [c for c in cores if only_user_id is None or c[1] == only_user_id]
+    targets = [c for c in cores if only_user_id is None or c["id"] == only_user_id]
     if not targets:
         try:
             await progress_msg.edit(
@@ -2968,26 +3087,34 @@ async def _grow_run(progress_msg, only_user_id=None):
             pass
         return
     chats = await _grow_collect_chats(cores)
-    src_ids = {}   # id(client) -> own user id (computed once, not per chat)
-    for _cl, _uid, _n in cores:
-        src_ids[id(_cl)] = _uid
+    if not chats:
+        try:
+            await progress_msg.edit(
+                "<blockquote>❌ No group/channel found where a core is admin.</blockquote>",
+                parse_mode="html")
+        except Exception:
+            pass
+        return
     total = len(chats) * len(targets)
     ok = fail = skip = 0
     done = 0
     fails = []
-    for cid, (src, title, _creator) in chats.items():
-        for _tc, tid, tname in targets:
+    for cid, chat in chats.items():
+        for core in targets:
             done += 1
-            if tid == src_ids.get(id(src), await _grow_safe_id(src)):
+            if core["id"] == chat["owner_id"]:
                 skip += 1
                 continue
-            good, note = await _grow_add_and_promote(src, cid, tid, rights)
+            try:
+                good, note = await _grow_add_and_promote(chat, core, rights)
+            except Exception as e:
+                good, note = False, str(e)[:60]
             if good:
                 ok += 1
             else:
                 fail += 1
                 if len(fails) < 40:
-                    fails.append(f"  ❌ <code>{title[:24]}</code> → {tname[:14]}: {note}")
+                    fails.append(f"  ❌ <code>{chat['title'][:24]}</code> → {core['name'][:14]}: {note}")
             if done % 5 == 0 or done == total:
                 try:
                     await progress_msg.edit(
@@ -3022,6 +3149,7 @@ async def _grow_safe_id(client):
         return (await client.get_me()).id
     except Exception:
         return 0
+
 
 async def _grow_panel_render(event, sender_id):
     cores = await _grow_cores()
@@ -3762,9 +3890,9 @@ async def _asst_callback_inner(event, data, sender_id, owner_id, is_owner):
         if not is_owner:
             return
         cores = await _grow_cores()
-        rows  = [[Button.inline(f"👤 {name[:22]} ({uid})",
-                                f"grow_one:{uid}".encode())]
-                 for _cl, uid, name in cores]
+        rows  = [[Button.inline(f"👤 {c['name'][:22]} ({c['id']})",
+                                f"grow_one:{c['id']}".encode())]
+                 for c in cores]
         rows.append([Button.inline("🔙 Back", b"grow_panel")])
         await _safe_bot_edit(event, sender_id,
             "<blockquote>👤 <b>PICK A CORE</b>\n"
