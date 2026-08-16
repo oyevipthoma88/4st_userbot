@@ -3015,20 +3015,21 @@ def yt_clients(clients) -> list:
 # Client ladder in priority order (technique #1-10)
 # NOTE: names below are validated/remapped by yt_clients() before use.
 _YT_CLIENTS = yt_clients([
-    # ── Tier-1: NO PO-token required (bypass "Sign in to confirm" gate) ──
-    "android_vr",      # 1 — VR client. No PO-token, no bot-check. BEST on cloud IPs.
-    "tv_simply",       # 2 — Simplified TV player (replaces removed tv_embedded)
-    "web_creator",     # 3 — Creator Studio client.
-    # ── Tier-2: PO-token clients (may hit bot-check, still worth trying) ──
-    "android",         # 4 — Most reliable for public songs
-    "web_embedded",    # 5 — Embedded player bypass
-    "web_music",       # 6 — YouTube Music client (Hindi/regional)
-    "tv",              # 7 — TV client, different CDN stack
-    "mweb",            # 8 — Mobile web, lightweight
-    "web_safari",      # 9 — Safari fingerprint
+    # ── Melody_music proven order (datacenter/Heroku US IP par tested) ──
+    "default",         # 1 — yt-dlp ka apna best-guess client set
+    "tv",              # 2 — TV client, plain https formats, PO-token nahi chahiye
+    "web_safari",      # 3 — Safari fingerprint, cloud IP par reliable
+    # ── Baaki fallbacks ──
+    "mweb",            # 4 — Mobile web, lightweight
+    "ios",             # 5 — iOS unique fingerprint
+    "android",         # 6 — Android client
+    "tv_simply",       # 7 — Simplified TV player
+    "web_embedded",    # 8 — Embedded player bypass
+    "web_music",       # 9 — YouTube Music (Hindi/regional)
     "web",             # 10 — Standard web fallback
-    "ios",             # 11 — iOS unique fingerprint
+    "web_creator",     # 11 — Creator Studio client
 ])
+
 
 # Piped public API instances — open-source YouTube frontends (technique #37)
 #
@@ -3321,28 +3322,32 @@ def _cloud_download_sync(
     #
     # web + cookies + bgutil: full DASH manifest, best quality. Needs bgutil
     # PO-token because cloud IPs can't acquire PO-token from the webpage.
+    # ROOT-CAUSE FIX (Heroku log: cloud_dl [['android_vr']] / [['tv_simply']] /
+    # [['android']] → "Failed to extract any player response" on EVERY rung):
+    # `player_skip=["webpage"]` webpage se player response fetch hi nahi karne
+    # deta, aur ab YouTube in innertube clients ko datacenter IP par bina
+    # webpage/PO-token ke koi player response deta hi nahi. Isliye har attempt
+    # fail ho raha tha aur .play par kuch bhi nahi bajta tha.
+    #
+    # Melody_music (reference repo) wali proven config apnayi gayi hai:
+    #   player_client = ["default", "tv", "web_safari"]  + formats=missing_pot
+    #   (koi player_skip nahi) + native downloader.
+    # missing_pot yt-dlp ko wo formats bhi rakhne deta hai jinke liye PO-token
+    # nahi mila — cookies/bgutil ke saath ye normally download ho jaate hain.
     combos = [
         # (fmt, clients, use_player_skip)
-        # android_vr removed: YouTube blocks it on cloud/Heroku IPs with
-        # "Failed to extract any player response". mweb bypasses the cloud-IP
-        # bot-check more reliably.
-        ("bestaudio/best",                    ["android_vr"],        True),
-        ("bestaudio/best",                    ["tv_simply"],         True),
-        ("bestaudio/best",                    ["mweb"],              True),
-        # Verified working from a datacenter IP with no cookies — keep these
-        # as guaranteed fallbacks so playback never dies on Heroku US dynos.
-        ("bestaudio/best",                    ["android"],           True),
-        ("bestaudio/best",                    ["web_safari"],        False),
-        # BUG FIX (log: "Failed to extract any player response" on every
-        # client): YouTube keeps rotating which clients work from datacenter
-        # IPs. Widen the ladder with the remaining live ones + a combined
-        # multi-client attempt so one bad day for android_vr/tv_simply/mweb
-        # no longer kills playback entirely.
-        ("bestaudio/best",                    ["ios"],               True),
-        ("bestaudio/best",                    ["tv"],                True),
-        ("bestaudio/best",                    ["web_embedded"],      True),
+        # ★ Melody-proven combo — sabse pehle.
+        ("bestaudio[abr<=128]/bestaudio/best",
+         ["default", "tv", "web_safari"],      False),
+        ("bestaudio/best",                     ["tv"],              False),
+        ("bestaudio/best",                     ["web_safari"],      False),
+        ("bestaudio/best",                     ["mweb"],            False),
+        ("bestaudio/best",                     ["ios"],             False),
+        ("bestaudio/best",                     ["android"],         False),
+        ("bestaudio/best",                     ["tv_simply"],       False),
+        ("bestaudio/best",                     ["web_embedded"],    False),
         ("bestaudio/best",
-         ["tv_simply", "web_safari", "ios", "mweb", "android_vr"],   False),
+         ["tv_simply", "web_safari", "ios", "mweb", "android_vr"],  False),
     ]
     if cookie:
         combos += [
@@ -3365,15 +3370,16 @@ def _cloud_download_sync(
     for fmt, clients, use_player_skip in combos:
         actual_fmt = fmt if _MS_FFMPEG_DIR else _NO_FFMPEG_FMT
         clients = yt_clients(clients)
-        yt_ext: dict = {"player_client": clients}
+        # formats=missing_pot: PO-token ke bina bhi formats hide na ho —
+        # warna selector kuch match nahi karta ("Requested format is not
+        # available") aur har client fail dikhta hai.
+        yt_ext: dict = {"player_client": clients, "formats": ["missing_pot"]}
         if use_player_skip:
-            # player_skip=["webpage"] bypasses the "Sign in to confirm" gate
-            # that YouTube shows on cloud/datacenter IPs. Without this, even
-            # tv_embedded tries to load the webpage for PO-token and fails.
             yt_ext["player_skip"] = ["webpage"]
         ext_args: dict = {"youtube": yt_ext}
         if _BGUTIL_ACTIVE:
             ext_args["youtubepot-bgutilscript"] = {"server_home": [_BGUTIL_SERVER_HOME]}
+
 
         opts: dict = {
             "format":           actual_fmt,
@@ -3389,6 +3395,12 @@ def _cloud_download_sync(
             "extractor_retries": 1,
             "fragment_retries": 3,
             "concurrent_fragment_downloads": 16,
+            # Melody fix: kabhi external downloader (ffmpeg/aria2c) mat use
+            # karo — Heroku par wo non-zero exit code se marta hai aur
+            # yt-dlp use hard DownloadError bana deta hai.
+            "external_downloader": {"default": "native"},
+            "hls_prefer_native": True,
+
             "http_headers": {
                 "User-Agent": (
                     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -3692,18 +3704,16 @@ def _yt_base_opts(out_tmpl: str, client: str, fmt: str) -> dict:
     clients authenticate fully and get the complete DASH manifest including
     separate audio-only streams — 'bestaudio' works correctly.
     """
-    # Build extractor_args — skip po_token gate only when no cookies are active
-    ext_args_yt: dict = {"player_client": yt_clients([client])}
-    _cookies_active = bool(_YTDLP_COOKIE_FILE)
-    if client in _YT_NO_POTOKEN_CLIENTS:
-        # Tier-1 clients bypass PO-token entirely via player_skip — apply
-        # ALWAYS, even when cookies are active. On cloud/datacenter IPs
-        # (Heroku/Railway) YouTube blocks PO-token acquisition from the
-        # webpage regardless of cookies; player_skip skips that gate entirely.
-        # These clients receive a limited innertube manifest (no separate
-        # DASH audio), so bestaudio/best falls back to muxed streams — that
-        # is fine for voice chat since ffmpeg demuxes audio on the fly.
-        ext_args_yt["player_skip"] = ["webpage"]
+    # BUG FIX (Heroku: "Failed to extract any player response"):
+    # player_skip=["webpage"] ab har client ko tod deta hai — YouTube bina
+    # webpage ke player response hi nahi bhejta. Isliye player_skip hata diya
+    # aur Melody wala formats=missing_pot laga diya, jisse PO-token na milne
+    # par bhi formats visible rehte hain.
+    ext_args_yt: dict = {
+        "player_client": yt_clients([client]),
+        "formats": ["missing_pot"],
+    }
+
 
     return {
         "quiet": True,
@@ -4395,15 +4405,16 @@ async def youtube_search_download(query: str, out_tmpl: str, logger=None) -> dic
     # entirely and works from any IP without PO-tokens or bgutil.
     # Order: Tier-1 bypass first → DASH clients → extra bypasses.
     _cookie_preferred_clients = yt_clients([
-        "android_vr",         # ★ BEST for cloud IPs — no bot-check, no PO-token
-        "tv_simply",          # Simplified TV player — no sign-in gate
-        "web_creator",        # Creator Studio — skips sign-in gate completely
+        "default",            # ★ Melody-proven — cookies ke saath sabse reliable
+        "tv",                 # plain https formats, PO-token nahi chahiye
+        "web_safari",         # Safari fingerprint
         "web",                # Standard web + cookies + bgutil PO-token
         "web_music",          # YouTube Music — excellent for Hindi/regional songs
         "android",            # Android client — high reliability with cookies
         "ios",                # iOS client — unique CDN fingerprint
         "mweb",               # Mobile web — lightweight, different server routing
     ])
+
     p1_clients = _cookie_preferred_clients if _YTDLP_COOKIE_FILE else _YT_CLIENTS
 
     for search_target in search_targets:
