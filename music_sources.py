@@ -107,6 +107,80 @@ _MS_FFMPEG_BIN  = _ffsetup.FFMPEG_BIN  or "ffmpeg"
 _MS_FFPROBE_BIN = _ffsetup.FFPROBE_BIN or "ffprobe"
 _MS_FFMPEG_DIR  = _ffsetup.FFMPEG_DIR
 
+# ── ROOT FIX (music play nahi hota) #1 — dead-mirror cooldown ───────────────
+# Piped/Invidious public mirrors are mostly dead (502/404/401/DNS/SSL).  Har
+# .play par poori list dobara try hoti thi → 25-40s har song me barbaad, aur
+# main.py ka 120s wait_for timeout hit ho jaata tha, isliye kuch bhi nahi
+# bajta tha.  Ek baar fail hone par host 30 min ke liye skip ho jaata hai.
+_DEAD_HOSTS: dict = {}
+_DEAD_HOST_TTL = 1800.0
+
+
+def _host_dead(url: str) -> bool:
+    exp = _DEAD_HOSTS.get(url)
+    if not exp:
+        return False
+    if exp > time.time():
+        return True
+    _DEAD_HOSTS.pop(url, None)
+    return False
+
+
+def _mark_host_dead(url: str) -> None:
+    _DEAD_HOSTS[url] = time.time() + _DEAD_HOST_TTL
+
+
+def _live_hosts(hosts):
+    """Skip hosts that failed recently; never return an empty list."""
+    hosts = list(hosts or [])
+    live = [h for h in hosts if not _host_dead(h)]
+    return live if live else hosts
+
+
+# ── ROOT FIX (music play nahi hota) #2 — downloaded file resolution ────────
+# Purana code sirf `out_tmpl.replace("%(ext)s", ext)` se file dhoondta tha.
+# Agar outtmpl me koi bhi doosra yt-dlp field (%(id)s, %(title)s ...) hai, ya
+# postprocessor ne koi aur extension likhi hai, to path match hi nahi karta —
+# file disk par hone ke baavjood download "fail" maana jaata tha aur .play
+# chup-chaap kuch nahi bajata tha.  Ab yt-dlp ka apna reported filepath use
+# hota hai, phir template, phir glob.
+def _resolve_downloaded_file(info: dict | None, out_tmpl: str,
+                             exts=("opus", "mp3", "m4a", "webm", "ogg", "mp4", "aac")):
+    import glob as _glob
+
+    def _ok(path):
+        try:
+            return bool(path) and os.path.exists(path) and os.path.getsize(path) > 4096
+        except Exception:
+            return False
+
+    # 1) yt-dlp ka apna reported path (postprocessing ke baad wala bhi)
+    for req in (info or {}).get("requested_downloads") or []:
+        for key in ("filepath", "_filename", "filename"):
+            cand = req.get(key)
+            if _ok(cand):
+                return cand
+    cand = (info or {}).get("filepath") or (info or {}).get("_filename")
+    if _ok(cand):
+        return cand
+
+    # 2) Template + known extensions
+    for ext in exts:
+        cand = out_tmpl.replace("%(ext)s", ext)
+        if _ok(cand):
+            return cand
+
+    # 3) Glob — har yt-dlp field ko wildcard bana do
+    pattern = re.sub(r"%\([^)]+\)[a-zA-Z]", "*", out_tmpl)
+    matches = [m for m in _glob.glob(pattern) if _ok(m)]
+    if matches:
+        # sabse recent + playable extension ko prefer karo
+        matches.sort(key=lambda m: (os.path.splitext(m)[1].lstrip(".") in exts,
+                                    os.path.getmtime(m)))
+        return matches[-1]
+    return None
+
+
 def _ms_find_bin(name: str) -> str | None:
     if name == "ffmpeg":
         return _ffsetup.FFMPEG_BIN
@@ -2426,7 +2500,7 @@ async def zero_disk_piped_lookup(query: str, logger=None, allow_live: bool = Fal
         return None
     _timeout = _aiohttp.ClientTimeout(total=12)
     _hdrs    = {"User-Agent": random_ua()}
-    for api in await _get_piped_apis():
+    for api in _live_hosts(await _get_piped_apis()):
         try:
             video_id = title = None
             duration, thumbnail = 0, None
@@ -2478,6 +2552,7 @@ async def zero_disk_piped_lookup(query: str, logger=None, allow_live: bool = Fal
                     "duration": int(sd.get("duration") or duration),
                     "thumbnail": sd.get("thumbnailUrl") or thumbnail, "source": "piped"}
         except Exception as exc:
+            _mark_host_dead(api)
             logger("MUSIC_DL_ERR", f"zero_disk_piped [{api}]: {exc}")
             continue
     return None
@@ -2492,7 +2567,7 @@ async def zero_disk_invidious_lookup(query: str, logger=None, allow_live: bool =
     if _aiohttp is None:
         return None
     _timeout = _aiohttp.ClientTimeout(total=10)
-    for instance in _INVIDIOUS:
+    for instance in _live_hosts(_INVIDIOUS):
         try:
             _hdrs = {"User-Agent": random_ua()}
             async with _make_aiohttp_session() as sess:
@@ -2533,6 +2608,7 @@ async def zero_disk_invidious_lookup(query: str, logger=None, allow_live: bool =
                     "duration": int(vdata.get("lengthSeconds") or 0),
                     "thumbnail": None, "source": "youtube"}
         except Exception as exc:
+            _mark_host_dead(instance)
             logger("MUSIC_DL_ERR", f"zero_disk_invidious [{instance}]: {exc}")
             continue
     return None
@@ -3716,17 +3792,18 @@ def _cloud_download_sync(
             logger("MUSIC_DL_ERR", f"cloud_dl [{clients}] ydl-errors: {'; '.join(_ydl_error[-3:])[:300]}")
 
         if info:
-            for ext in ("opus", "mp3", "m4a", "webm", "ogg", "mp4"):
-                p = out_tmpl.replace("%(ext)s", ext)
-                if os.path.exists(p) and os.path.getsize(p) > 4096:
-                    logger("MUSIC_DL", f"cloud_dl ✓ [{clients}] '{(info.get('title',''))[:50]}'")
-                    return {
-                        "title":     info.get("title", url_or_query),
-                        "file_path": p,
-                        "duration":  int(info.get("duration") or 0),
-                        "thumbnail": info.get("thumbnail"),
-                        "source":    "youtube",
-                    }
+            p = _resolve_downloaded_file(info, out_tmpl)
+            if p:
+                logger("MUSIC_DL", f"cloud_dl ✓ [{clients}] '{(info.get('title',''))[:50]}'")
+                return {
+                    "title":     info.get("title", url_or_query),
+                    "file_path": p,
+                    "duration":  int(info.get("duration") or 0),
+                    "thumbnail": info.get("thumbnail"),
+                    "source":    "youtube",
+                }
+            logger("MUSIC_DL_ERR",
+                   f"cloud_dl [{clients}]: downloaded file not found for {out_tmpl}")
         else:
             logger("MUSIC_DL_ERR", f"cloud_dl [{clients}]: ydl returned no info")
 
@@ -4161,32 +4238,22 @@ async def _yt_try_download(search_target: str, out_tmpl: str, client_name: str,
     try:
         info = await asyncio.to_thread(_run)
         if info:
-            # Primary: FFmpeg-converted native Opus (jugad #7 — see _yt_base_opts).
-            # "mp3" is still checked as a compat fallback for any older/custom
-            # yt-dlp postprocessor config that hasn't switched over.
-            for primary_ext in ("opus", "mp3"):
-                primary = out_tmpl.replace("%(ext)s", primary_ext)
-                if os.path.exists(primary) and os.path.getsize(primary) > 4096:
-                    return {
-                        "title":     info.get("title", search_target),
-                        "file_path": primary,
-                        "duration":  int(info.get("duration") or 0),
-                        "thumbnail": info.get("thumbnail"),
-                        "source":    "youtube",
-                    }
-            # Fallback: raw audio format downloaded without FFmpeg postprocessing.
-            # pytgcalls can decode m4a/webm/opus natively, so these are playable
-            # even when the ffmpeg binary is absent on the host (e.g. bare Heroku).
-            for raw_ext in ("m4a", "webm", "opus", "ogg", "aac", "mp4"):
-                raw = out_tmpl.replace("%(ext)s", raw_ext)
-                if os.path.exists(raw) and os.path.getsize(raw) > 4096:
-                    return {
-                        "title":     info.get("title", search_target),
-                        "file_path": raw,
-                        "duration":  int(info.get("duration") or 0),
-                        "thumbnail": info.get("thumbnail"),
-                        "source":    "youtube",
-                    }
+            # Primary: FFmpeg-converted native Opus (jugad #7 — see _yt_base_opts),
+            # warna jo bhi raw audio (m4a/webm/ogg) disk par utra hai — pytgcalls
+            # unhe natively decode kar leta hai.  Path yt-dlp se hi lete hain,
+            # isliye custom outtmpl fields ya postprocessor ki badli hui extension
+            # se ab koi successful download discard nahi hota.
+            found = _resolve_downloaded_file(info, out_tmpl)
+            if found:
+                return {
+                    "title":     info.get("title", search_target),
+                    "file_path": found,
+                    "duration":  int(info.get("duration") or 0),
+                    "thumbnail": info.get("thumbnail"),
+                    "source":    "youtube",
+                }
+            logger("MUSIC_DL_ERR",
+                   f"yt_dl [{client_name}]: file missing after download ({out_tmpl})")
     except Exception:
         pass
 
@@ -4207,7 +4274,7 @@ async def _yt_try_piped(video_id: str, out_tmpl: str, logger=None) -> dict | Non
     # attempt therefore died with NameError instead of returning a stream.
     if not video_id or yt_dlp is None or _aiohttp is None:
         return None
-    for api in await _get_piped_apis():
+    for api in _live_hosts(await _get_piped_apis()):
         url = f"{api}/streams/{video_id}"
         try:
             async with _make_aiohttp_session() as sess:
@@ -4268,7 +4335,7 @@ async def _yt_try_invidious(video_id: str, out_tmpl: str, logger=None) -> dict |
     logger = logger or (lambda *a: None)
     if not video_id or yt_dlp is None:
         return None
-    for instance in _INVIDIOUS:
+    for instance in _live_hosts(_INVIDIOUS):
         try:
             # Use yt-dlp with invidious URL — it uses the generic extractor
             inv_url = f"{instance}/watch?v={video_id}"
@@ -4337,7 +4404,7 @@ async def piped_search_download(query: str, out_tmpl: str, logger=None) -> dict 
     _timeout = _aiohttp.ClientTimeout(total=7)
     _hdrs    = {"User-Agent": random_ua()}
 
-    for api in await _get_piped_apis():
+    for api in _live_hosts(await _get_piped_apis()):
         try:
             # ── Step 1: Search ──────────────────────────────────────────
             video_id = title = None
@@ -4356,6 +4423,7 @@ async def piped_search_download(query: str, out_tmpl: str, logger=None) -> dict 
                             if r.status != 200:
                                 # BUG FIX: log non-200 so dead Piped instances
                                 # are visible in Heroku logs (was silent before)
+                                _mark_host_dead(api)
                                 logger("MUSIC_DL_ERR", f"piped_search [{api}]: HTTP {r.status}")
                                 continue
                             data = await r.json(content_type=None)
@@ -4449,6 +4517,7 @@ async def piped_search_download(query: str, out_tmpl: str, logger=None) -> dict 
                         "source": "piped"}
 
         except Exception as exc:
+            _mark_host_dead(api)
             logger("MUSIC_DL_ERR", f"piped_search [{api}]: {exc}")
             continue
 
@@ -4466,7 +4535,7 @@ async def _yt_search_via_invidious(query: str, out_tmpl: str, logger=None) -> di
     # the event loop for 10s each; with 9 instances that's up to 90s of
     # waiting. 5s is still generous for a live instance over HTTPS.
     _timeout = _aiohttp.ClientTimeout(total=5)
-    for instance in _INVIDIOUS:
+    for instance in _live_hosts(_INVIDIOUS):
         try:
             _hdrs = {"User-Agent": random_ua()}
             async with _make_aiohttp_session() as sess:
@@ -4474,6 +4543,7 @@ async def _yt_search_via_invidious(query: str, out_tmpl: str, logger=None) -> di
                                      params={"q": query, "type": "video"},
                                      headers=_hdrs, timeout=_timeout) as r:
                     if r.status != 200:
+                        _mark_host_dead(instance)
                         logger("MUSIC_DL_ERR", f"_yt_search_via_invidious [{instance}]: HTTP {r.status}")
                         continue
                     results = await r.json(content_type=None)
@@ -4489,6 +4559,7 @@ async def _yt_search_via_invidious(query: str, out_tmpl: str, logger=None) -> di
                 result["title"] = result.get("title") or title
                 return result
         except Exception as exc:
+            _mark_host_dead(instance)
             logger("MUSIC_DL_ERR", f"_yt_search_via_invidious [{instance}]: {exc}")
             continue
     return None
@@ -4766,12 +4837,7 @@ async def youtube_search_download(query: str, out_tmpl: str, logger=None) -> dic
                 info = await asyncio.to_thread(_run_ck)
                 # BUG FIX: postprocessor outputs .opus, not .mp3 — check all
                 # possible extensions so Phase 4 never discards a good file.
-                _p4_file = None
-                for _p4_ext in ("opus", "mp3", "webm", "m4a", "ogg"):
-                    _c = p4_tmpl.replace("%(ext)s", _p4_ext)
-                    if os.path.exists(_c) and os.path.getsize(_c) > 4096:
-                        _p4_file = _c
-                        break
+                _p4_file = _resolve_downloaded_file(info, p4_tmpl)
                 if info and _p4_file:
                     logger("MUSIC_YT", f"✓ [cookie-jar phase4] [{client}] {info.get('title','')!r}")
                     try: os.remove(cj_file)
