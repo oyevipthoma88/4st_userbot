@@ -3500,38 +3500,51 @@ def _cloud_download_sync(
     # ~40s of failures before reaching a client that actually works.
     # ROOT-CAUSE FIX (Heroku log 2026-08-16 12:16, cookies=✅ but EVERY rung:
     #   "Sign in to confirm you're not a bot"  on tv_simply / android_vr /
-    #   android). Those three clients CANNOT use a cookie jar (yt-dlp:
-    #   SUPPORTS_COOKIES=False), so on a datacenter IP they hit YouTube fully
-    #   anonymous → instant bot-gate. Leading the ladder with them meant the
-    #   authenticated cookie jar we DO have was never used.
-    # Fix: when cookies exist, run cookie-capable clients FIRST (they
-    # authenticate and sail past the bot-gate); the cookieless clients stay
-    # only as a no-cookie fallback. Without cookies the old order is kept,
-    # because then the cookieless clients are the ones that work.
-    _COOKIE_RUNGS = [
-        ("bestaudio[abr<=128]/bestaudio/best", ["web_embedded"], False),
-        ("bestaudio[ext=m4a]/bestaudio/best",  ["web_safari"],   False),
-        ("bestaudio/best",                     ["mweb"],         False),
-        ("bestaudio[ext=m4a]/bestaudio/best",  ["web"],          False),
-        ("bestaudio/best",                     ["web_music"],    False),
-        ("bestaudio/best",   ["web_embedded", "web_safari", "mweb", "web"], False),
-        ("bestaudio/best",                     ["tv"],           False),
-    ]
-    _NOCOOKIE_RUNGS = [
-        ("bestaudio[abr<=128]/bestaudio/best", ["web_embedded"],  False),
+    #   android). Those three clients CANNOT use a cookie jar.
+    #
+    # ROOT-CAUSE FIX (Heroku log 2026-08-16 12:35, cookies=✅ bgutil=✅ but
+    #   cloud_dl [['mweb']]: "unable to download video data: HTTP Error 403:
+    #   Forbidden" and then NOTHING played at all):
+    # Two separate defects combined:
+    #   1. Cookie-first ordering put the whole `web` family (web_embedded,
+    #      web_safari, mweb, web, web_music) at the TOP of the ladder. On a
+    #      datacenter IP every one of those needs a valid GVS PO-token for the
+    #      media request; with `formats=["missing_pot"]` we deliberately keep
+    #      the un-tokened formats visible, yt-dlp picks one and googlevideo
+    #      answers 403 Forbidden. Guaranteed failure, ~8s burned per rung.
+    #   2. The `_botgate_hits >= 2` optimisation skipped EVERY cookieless rung
+    #      once two rungs hit the bot-gate — i.e. exactly the tv_simply /
+    #      android_vr / tv_embedded rungs that actually work on Heroku were
+    #      thrown away, so the ladder ran out of options and `.play` produced
+    #      nothing at all.
+    # Fix: one single ladder that leads with the PO-token-free clients
+    # (verified working from a datacenter IP), attaches cookies only where the
+    # client supports them, and keeps the web family as a later fallback.
+    # A 403 on the media request now marks the whole web family as gated and
+    # skips its remaining rungs instead of aborting the useful ones.
+    _WEB_FAMILY = {"web", "web_safari", "web_embedded", "web_music", "mweb"}
+
+    _PRIMARY_RUNGS = [
+        # PO-token-free / cookie-free clients first — proven on cloud IPs.
         ("bestaudio/best",                     ["tv_simply"],     False),
         ("bestaudio/best",                     ["android_vr"],    False),
-        ("bestaudio/best",                     ["android"],       False),
-        ("bestaudio/best",                     ["default"],       False),
-        ("bestaudio/best",
-         ["web_embedded", "tv_simply", "android_vr", "android"],  False),
         # tv_embedded + player_skip=webpage: sign-in gate skip, no PO-token.
         ("bestaudio/best",                     ["tv_embedded"],   True),
-        ("bestaudio/best",                     ["web_safari"],    False),
-        ("bestaudio/best",                     ["mweb"],          False),
+        ("bestaudio[abr<=128]/bestaudio/best", ["web_embedded"],  False),
+        ("bestaudio/best",                     ["android"],       False),
         ("bestaudio/best",                     ["ios"],           False),
+        ("bestaudio/best",                     ["default"],       False),
+        ("bestaudio/best",
+         ["tv_simply", "android_vr", "web_embedded", "android"],  False),
     ]
-    combos = (_COOKIE_RUNGS + _NOCOOKIE_RUNGS) if cookie else _NOCOOKIE_RUNGS[:]
+    # Web family (needs cookies and/or a real PO-token) — later, not first.
+    _WEB_RUNGS = [
+        ("bestaudio[ext=m4a]/bestaudio/best",  ["web_safari"],    False),
+        ("bestaudio/best",                     ["mweb"],          False),
+        ("bestaudio[ext=m4a]/bestaudio/best",  ["web"],           False),
+        ("bestaudio/best",                     ["web_music"],     False),
+    ]
+    combos = _PRIMARY_RUNGS + _WEB_RUNGS
     # Last resort: SABR-affected clients (tv/default).
     combos += [
         ("bestaudio/best",                    ["tv"],                False),
@@ -3543,9 +3556,9 @@ def _cloud_download_sync(
     _ANY_FMT = ("bestaudio*[protocol^=http]/bestaudio*/bestaudio/"
                 "best[protocol^=http]/best/worst")
     combos += [
-        (_ANY_FMT, ["web_embedded", "web_safari", "mweb"],        False),
-        (_ANY_FMT, ["web_embedded", "android_vr", "ios", "mweb"], False),
-        (_ANY_FMT, ["default"],                                   False),
+        (_ANY_FMT, ["tv_simply", "android_vr", "web_embedded"],    False),
+        (_ANY_FMT, ["web_embedded", "android_vr", "ios", "mweb"],  False),
+        (_ANY_FMT, ["default"],                                    False),
     ]
 
 
@@ -3559,15 +3572,22 @@ def _cloud_download_sync(
     )
 
     _botgate_hits = 0          # how many rungs died on "Sign in to confirm…"
+    _pot403_hits = 0           # web-family rungs killed by a 403 media request
     for fmt, clients, use_player_skip in combos:
         actual_fmt = fmt if _MS_FFMPEG_DIR else _NO_FFMPEG_FMT
         clients = yt_clients(clients)
-        # Once the anonymous bot-gate has bitten twice, every remaining
-        # cookieless rung will hit exactly the same wall — skip them instead
-        # of burning ~2s each (Heroku log: 5 identical failures per song).
-        if (cookie and _botgate_hits >= 2
+        # A 403 on the media request means this IP has no valid GVS PO-token,
+        # so every remaining PO-token-gated web rung will fail identically —
+        # skip them (but NEVER skip the cookieless clients that do work).
+        if _pot403_hits >= 2 and set(clients) <= _WEB_FAMILY:
+            continue
+        # Same idea for the anonymous bot-gate: once it has bitten twice,
+        # cookieless rungs are hopeless *only if* we still have cookie-capable
+        # rungs left, so just skip pure-cookieless single-client rungs.
+        if (cookie and _botgate_hits >= 3
                 and not _clients_accept_cookies(clients)):
             continue
+
 
         # formats=missing_pot: PO-token ke bina bhi formats hide na ho —
         # warna selector kuch match nahi karta ("Requested format is not
@@ -3650,6 +3670,10 @@ def _cloud_download_sync(
                 err_str = _ydl_error[-1] + " | " + err_str
             if "not a bot" in err_str or "Sign in to confirm" in err_str:
                 _botgate_hits += 1
+            if ("403" in err_str and "Forbidden" in err_str
+                    and set(clients) <= _WEB_FAMILY):
+                _pot403_hits += 1
+
             logger("MUSIC_DL_ERR", f"cloud_dl [{clients}]: {err_str[:200]}")
 
             # Cleanup partial files
