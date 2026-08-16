@@ -3238,10 +3238,16 @@ async def _growadd_add_and_promote(chat, uname: str, rights, rank: str = "4ST"):
     return False, "promote failed"
 
 
-# ── owner notifications ────────────────────────────────────────────────
+# ── owner + log-channel notifications ──────────────────────────────────
 async def _grow_notify(text: str, buttons=None):
-    """Main bot pushes every Grow log straight to the owner."""
+    """Push every Grow log to LOG_CHANNEL (if set) AND to the owner DM."""
     owner_id = cfg.get("OWNER_ID", 0)
+    log_cid  = cfg.get("LOG_CHANNEL", 0)
+    if log_cid:
+        try:
+            await asstbot.send_message(log_cid, text, parse_mode="html")
+        except Exception as _e:
+            bot_logger("GROW_LOG", f"log_channel send failed: {_e}")
     if not owner_id:
         return None
     try:
@@ -3250,7 +3256,8 @@ async def _grow_notify(text: str, buttons=None):
         try:
             return await asstbot.send_message(owner_id, text,
                                               buttons=buttons, parse_mode="html")
-        except Exception:
+        except Exception as _e:
+            bot_logger("GROW_LOG", f"owner send failed: {_e}")
             return None
 
 
@@ -3268,7 +3275,23 @@ async def _grow_scan(scope):
 
 
 async def _grow_engine_run(run_id: str, retry: bool = False):
-    """Worker: add + promote every username across every usable chat."""
+    """Public entry — wraps the real worker so ANY exception is reported
+    instead of vanishing into a background task."""
+    try:
+        await _grow_engine_run_inner(run_id, retry=retry)
+    except Exception as _e:
+        import traceback as _tb
+        bot_logger("GROW_FATAL", f"run={run_id} err={_e}\n{_tb.format_exc()[:400]}")
+        try:
+            await _grow_notify(
+                f"<blockquote>❌ <b>GROW CRASHED</b>\n<code>{str(_e)[:200]}</code></blockquote>")
+        except Exception:
+            pass
+
+
+async def _grow_engine_run_inner(run_id: str, retry: bool = False):
+    """Worker: add + promote every username across every usable chat.
+    Runs PARALLEL across cores/chats (bounded concurrency)."""
     run = GROW_RUNS.get(run_id)
     if not run:
         return
@@ -3281,6 +3304,8 @@ async def _grow_engine_run(run_id: str, retry: bool = False):
         await _grow_notify(
             f"<blockquote>🔁 <b>GROW RETRY</b> — {len(jobs)} failed job(s)…</blockquote>")
     else:
+        await _grow_notify(
+            "<blockquote>🌱 <b>GROW BOOT</b> — scanning cores &amp; chats…</blockquote>")
         cores, chats = await _grow_scan(run["scope"])
         if not cores:
             await _grow_notify("<blockquote>❌ <b>GROW</b> — no live core for this selection.</blockquote>")
@@ -3300,45 +3325,76 @@ async def _grow_engine_run(run_id: str, retry: bool = False):
             f"  Cores: <code>{len(cores)}</code> · Chats: <code>{len(chats)}</code>\n"
             f"  Users: <code>{', '.join('@'+u for u in usernames)[:180]}</code>\n"
             f"  Jobs: <code>{len(jobs)}</code>\n"
+            "  Mode: <code>PARALLEL</code>\n"
             "──────────────────────</blockquote>")
 
     run["failed"] = []
-    ok = fail = done = 0
     total    = len(jobs)
-    last_log = time.time()
+    counters = {"ok": 0, "fail": 0, "done": 0, "now": ""}
 
-    for cid, uname in jobs:
+    # Bound per-account concurrency so one core can't flood itself.
+    per_client_sem: dict = {}
+    def _sem_for(cli):
+        k = id(cli)
+        if k not in per_client_sem:
+            per_client_sem[k] = asyncio.Semaphore(3)
+        return per_client_sem[k]
+
+    async def _one(cid, uname):
         chat = chats.get(cid)
-        done += 1
         if not chat:
-            fail += 1
+            counters["done"] += 1
+            counters["fail"] += 1
             run["failed"].append((cid, uname))
-            continue
-        try:
-            good, note = await _growadd_add_and_promote(chat, uname, rights)
-        except Exception as e:
-            good, note = False, str(e)[:60]
+            return
+        async with _sem_for(chat["client"]):
+            try:
+                good, note = await _growadd_add_and_promote(chat, uname, rights)
+            except Exception as e:
+                good, note = False, str(e)[:60]
+        counters["done"] += 1
+        counters["now"]  = str(chat.get("title", ""))[:24]
         if good:
-            ok += 1
+            counters["ok"] += 1
         else:
-            fail += 1
+            counters["fail"] += 1
             run["failed"].append((cid, uname))
             run.setdefault("notes", [])
             if len(run["notes"]) < 40:
                 run["notes"].append(
                     f"  ❌ <code>{str(chat['title'])[:22]}</code> ← @{uname[:16]}: {note}")
 
-        # live log every 60 seconds
-        if time.time() - last_log >= GROW_LOG_EVERY and done < total:
-            last_log = time.time()
+    # heartbeat every 60s while workers run
+    stop_hb = asyncio.Event()
+    async def _heartbeat():
+        while not stop_hb.is_set():
+            try:
+                await asyncio.wait_for(stop_hb.wait(), timeout=GROW_LOG_EVERY)
+                return
+            except asyncio.TimeoutError:
+                pass
+            if counters["done"] >= total:
+                return
             await _grow_notify(
                 "<blockquote>🌱 <b>GROW RUNNING…</b>\n"
                 f"  Rights: <code>{run['rights'].upper()}</code>\n"
-                f"  Progress: <code>{done}/{total}</code>\n"
-                f"  ✅ <code>{ok}</code>   ❌ <code>{fail}</code>\n"
-                f"  Now: <code>{str(chat['title'])[:24]}</code></blockquote>")
-        await asyncio.sleep(1.5)
+                f"  Progress: <code>{counters['done']}/{total}</code>\n"
+                f"  ✅ <code>{counters['ok']}</code>   "
+                f"❌ <code>{counters['fail']}</code>\n"
+                f"  Now: <code>{counters['now']}</code></blockquote>")
 
+    hb_task = asyncio.create_task(_heartbeat())
+    try:
+        await asyncio.gather(*[_one(cid, u) for cid, u in jobs],
+                             return_exceptions=True)
+    finally:
+        stop_hb.set()
+        try:
+            await hb_task
+        except Exception:
+            pass
+
+    ok, fail = counters["ok"], counters["fail"]
     run["last"] = {"ok": ok, "fail": fail, "total": total}
     btns = []
     if run["failed"]:
