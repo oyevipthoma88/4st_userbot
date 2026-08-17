@@ -2867,6 +2867,28 @@ def _now_playing_text(mstate: ChatMusicState) -> str:
 
     source = track.source or "stream"
 
+    # ── Up-next queue preview (user request: playcard me next queue jitne
+    # bhi cards hai — sab dikhao). Show up to 15 upcoming tracks with
+    # position, title, duration and total pending time so users can see the
+    # whole queue at a glance without running .queue.
+    up_next_block = ""
+    if mstate.queue:
+        pending_secs = sum(int(t.duration or 0) for t in mstate.queue)
+        max_show = 15
+        rows = []
+        for i, t in enumerate(mstate.queue[:max_show], 1):
+            qt = (t.title[:38] + "…") if len(t.title) > 38 else t.title
+            rows.append(f"║  <code>{i:2}.</code>  {qt}  <code>[{t.duration_str()}]</code>")
+        if len(mstate.queue) > max_show:
+            rows.append(f"║  <i>… +{len(mstate.queue) - max_show} more</i>")
+        up_next_block = (
+            f"║\n"
+            f"║  📥  <b>Up Next</b>  ·  {len(mstate.queue)} track"
+            f"{'s' if len(mstate.queue) != 1 else ''}  ·  "
+            f"<code>{_fmt_secs(pending_secs)}</code>\n"
+            + "\n".join(rows) + "\n"
+        )
+
     return (
         f"<blockquote>╔══〔 🎵 4ST Music Player 〕══╗\n"
         f"║\n"
@@ -2876,6 +2898,7 @@ def _now_playing_text(mstate: ChatMusicState) -> str:
         f"║  <code>{dur_str}</code>\n"
         f"║\n"
         f"║  📡  <code>{source}</code>{badge_line}\n"
+        f"{up_next_block}"
         f"║\n"
         f"╚══════════════════════╝</blockquote>"
     )
@@ -5558,10 +5581,18 @@ def create_event_handler(client):
             # Old: search song (5-30s) → join VC → play          [slow]
             # New: join VC + search song at the same time → play  [fast]
             # Only pre-join when VC is not already active (would just queue).
+            # SPEEDUP: also pre-seed peer cache in parallel with the yt-dlp
+            # download so the first-play latency isn't paying for both
+            # sequentially (~1-3s shaved on cold start).
             _mstate_pre = get_music_state(chat_id)
             _vc_prejoin_task = None
             if not _mstate_pre.is_playing:
                 async def _prejoin_vc_bg():
+                    try:
+                        # peer cache + group-call creation together
+                        await _seed_music_peer_cache(chat_id, my_id)
+                    except Exception:
+                        pass
                     try:
                         await _try_create_group_call(chat_id, my_id)
                     except Exception:
@@ -5879,8 +5910,9 @@ def create_event_handler(client):
                 "<blockquote>🌐 <b>Music: open to everyone in this chat.</b>\n"
                 "<code>.play</code> · <code>.skip</code> · <code>.pause</code> · <code>.queue</code></blockquote>")
 
-        elif re.match(r"(?i)^\.(me|song\s+me)$", text):
-            # .me OR .song me — restrict music back to owner/sudo only
+        elif re.match(r"(?i)^\.(me|forme|song\s+me)$", text):
+            # .me / .forme / .song me — restrict music back to owner/sudo only.
+            # .forme is the explicit inverse of .forall (user-requested alias).
             asyncio.create_task(event.delete())
             open_chats = cfg.setdefault("MUSIC_OPEN_CHATS", [])
             if chat_id in open_chats:
@@ -7647,6 +7679,7 @@ def create_event_handler(client):
                 "song":       ".song all — Open music to everyone in chat (same as .forall)\n"
                               ".song me  — Restrict music back to owner/sudo (same as .me)",
                 "forall":     ".forall — Open music commands to all chat members. Anyone can .play, .skip, etc.",
+                "forme":      ".forme — Reverse of .forall. Restricts music back to owner/sudo only in this chat (same as .me).",
                 "me":         ".me — Restrict music back to owner/sudo only in this chat.",
                 "ghost":      ".ghost [chat_id] [text] — Send a message to a specific chat silently.",
                 "gspam":      ".gspam [count] [text] [chat_id] — Ghost spam: send text N times to a different chat.",
