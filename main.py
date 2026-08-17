@@ -101,6 +101,9 @@ import music_sources
 # GitHub-backed durable persistence — see github_store.py's module
 # docstring. No-op unless GITHUB_TOKEN + GITHUB_REPO are set.
 import github_store
+# Permanent GitHub-backed storage for the /start visual media (start pic).
+# See media_store.py — fixes "pic reset after restart" on ephemeral dynos.
+import media_store
 
 from telethon import TelegramClient, events, types, errors, Button, utils as tl_utils
 
@@ -431,6 +434,12 @@ _LOG_CHANNEL = os.environ.get("TELEGRAM_LOG_CHANNEL_ID", "0")
 _OWNER_ID    = os.environ.get("TELEGRAM_OWNER_ID", "")
 _OWNER_UNAME = os.environ.get("TELEGRAM_OWNER_USERNAME", "")
 _HELP_BUTTON = os.environ.get("TELEGRAM_HELP_LINK", "")
+# Extra public links shown on the /start UI. All optional — buttons are only
+# rendered for the ones that are actually set.
+_SUPPORT_LINK = os.environ.get("TELEGRAM_SUPPORT_LINK", "")
+_UPDATES_LINK = os.environ.get("TELEGRAM_UPDATES_LINK", "")
+# Cross-promo: link to our WordSeek cheat bot (optional).
+_WORDSEEK_LINK = os.environ.get("WORDSEEK_BOT_LINK", "")
 _GEMINI_KEY  = os.environ.get("GEMINI_API_KEY", "")
 _PYRO_SES    = os.environ.get("TELEGRAM_PYRO_SESSION", "")
 
@@ -469,6 +478,7 @@ DEFAULT_CONFIG = {
     "OWNER_USERNAME":     _OWNER_UNAME,
     "OWNER_ID":           _OWNER_UID,
     "START_MEDIA_PATH":   None,
+    "START_MEDIA_REF":    None,   # GitHub copy of the start pic (permanent)
     "CUSTOM_STARTUP_MSG": "🟢 <b>4ST PRIME CORE ACTIVE</b>\nPerformance: <code>MAX_SPEED</code>",
     "MASTER_SYNC":        False,
     "GROW_POWER":         "full",   # 🌱 Grow promote-power preset
@@ -494,7 +504,12 @@ DEFAULT_CONFIG = {
     "DM_WARNING_LIMIT":  5,
     "SAVED_STRINGS":     [],
     "USER_MAPS":         {"telethon": {}},
-    "HELP_REPORT_LINK":  "https://t.me/+X1UQ5x4szFA3NDc1",
+    # BUG FIX: TELEGRAM_HELP_LINK was read from the env but never used —
+    # the button always pointed at the hardcoded fallback.
+    "HELP_REPORT_LINK":  _HELP_BUTTON or "https://t.me/+X1UQ5x4szFA3NDc1",
+    "SUPPORT_LINK":      _SUPPORT_LINK,
+    "UPDATES_LINK":      _UPDATES_LINK,
+    "WORDSEEK_LINK":     _WORDSEEK_LINK,
     "BOT_USERS":         [],
     "BOT_GROUPS":        [],   # group/supergroup chat_ids where userbot received a command
     "AI_API_KEY":        _GEMINI_KEY,
@@ -608,6 +623,16 @@ if "USER_MAPS" not in cfg:
     cfg["USER_MAPS"] = {"telethon": {}}
 if "CUSTOM_CMDS" not in cfg:
     cfg["CUSTOM_CMDS"] = {}
+
+# ── Restore the owner's start picture from GitHub ────────────────────────────
+# The dyno filesystem is wiped on every restart, so START_MEDIA_PATH alone is
+# worthless. START_MEDIA_REF points at the copy committed to the repo; pull it
+# back down here so /start always has its banner.
+try:
+    media_store.ensure_local_media(
+        cfg, DATA_DIR, logger=lambda tag, msg: print(f"[{tag}] {msg}", flush=True))
+except Exception as _msE:
+    print(f"[MEDIA_STORE] boot restore failed: {_msE}", flush=True)
 
 # ══════════════════════════════════════════
 # AI ENGINE
@@ -1188,83 +1213,164 @@ async def auto_join_and_start(client):
 # CHANNEL REACTIONS & AUTO ENGAGEMENT
 # ══════════════════════════════════════════
 
-async def add_channel_reactions_views(client, channel_entity, n_msgs: int = 10):
-    """Add reactions + views to last n_msgs in a channel.
-    GetMessagesViewsRequest does NOT mark chat as read — completely unseen by user.
-    Premium accounts get 3 reactions (Telegram limit), normal get 1 random."""
+# Curated "good" reactions — only positive ones a real member would leave.
+GOOD_REACTIONS = ['👍', '❤️', '🔥', '🥳', '👏',
+                  '😍', '🤩', '⚡', '🏆', '💯']
+
+# How many of the newest posts get engagement the first time we touch a
+# channel. Requirement: "last ki 15 post + jo bhi new post hogi".
+REACT_BACKLOG = 15
+
+
+async def add_channel_reactions_views(client, channel_entity, n_msgs: int = REACT_BACKLOG):
+    """Add RANDOM good reactions + views to the last n_msgs of a channel.
+
+    - Premium session  -> 3 different random reactions per post (Telegram's
+      premium limit).
+    - Normal session   -> 1 random reaction per post.
+    - Each post gets its OWN random pick, so it never looks botted with the
+      exact same emoji everywhere.
+    - GetMessagesViewsRequest + SendReactionRequest do NOT send a read
+      receipt, so from the account owner's side the chat stays UNSEEN.
+    """
     try:
         me = await client.get_me()
-        is_premium = getattr(me, 'premium', False)
-        if is_premium:
-            reaction_emojis = ['👍', '🔥', '❤️']
-        else:
-            reaction_emojis = [random.choice(['👍', '❤️', '🔥', '👏', '🥰'])]
+        is_premium = bool(getattr(me, 'premium', False))
+        per_post   = 3 if is_premium else 1
+
         msg_ids = []
         async for msg in client.iter_messages(channel_entity, limit=n_msgs):
             if getattr(msg, 'id', None):
                 msg_ids.append(msg.id)
         if not msg_ids:
             return
+
+        # Bump view counts in one call — silent, no read receipt.
         try:
             await client(_GetMsgViewsReq(peer=channel_entity, id=msg_ids, increment=True))
         except Exception:
             pass
-        chosen_emoji = random.choice(['👍', '❤️', '🔥', '👏'])
+
         for mid in msg_ids:
-            emojis_to_use = reaction_emojis if is_premium else [chosen_emoji]
-            for emoji in emojis_to_use:
+            emojis = random.sample(GOOD_REACTIONS, per_post)
+            for emoji in emojis:
                 try:
                     await client(_SendReactionReq(
                         peer=channel_entity,
                         msg_id=mid,
                         reaction=[_TLReactionEmoji(emoticon=emoji)]
                     ))
-                    await asyncio.sleep(0.4)
                 except Exception:
                     pass
-            await asyncio.sleep(0.5)
+                await asyncio.sleep(random.uniform(0.4, 1.1))
+            await asyncio.sleep(random.uniform(0.8, 2.0))
     except Exception as _re:
         bot_logger("REACTIONS", f"{_re}")
 
 
-_LAST_REACTED_MSG_UB: dict = {}
+async def peek_chat_unseen(client, entity, limit: int = 20):
+    """Read a group/channel's latest messages WITHOUT marking them seen.
+
+    Telethon marks a chat read only when send_read_acknowledge() is called.
+    iter_messages() alone never does, so the bot can fully process group
+    messages while the account owner still sees the unread badge — exactly
+    the "message seen karke user ke liye unseen rakhna" behaviour.
+    Never call client.send_read_acknowledge() on these chats.
+    """
+    out = []
+    try:
+        async for msg in client.iter_messages(entity, limit=limit):
+            out.append(msg)
+    except Exception as _pe:
+        bot_logger("PEEK_UNSEEN", f"{_pe}")
+    return out
+
+
+_LAST_REACTED_MSG_UB: dict = {}   # (session_id, channel_id) -> last reacted msg id
+
+
+def _all_session_clients():
+    """Every connected Telethon session this deploy manages (primary + all
+    extra logged-in cores). Reactions run from ALL of them, staggered."""
+    out = []
+    for cl in [userbot] + list(extra_clients):
+        try:
+            if cl and cl.is_connected():
+                out.append(cl)
+        except Exception:
+            pass
+    return out
+
+
+def _engagement_targets():
+    """Auto-join links + the Must-Join channel — everything the accounts are
+    expected to be a member of."""
+    targets = list(cfg.get("AUTO_JOIN_LINKS", []))
+    mj = cfg.get("MUST_JOIN_CHANNEL", "")
+    if mj:
+        targets.append(mj)
+    cleaned = []
+    for raw in targets:
+        u = (raw or "").strip()
+        for pfx in ["https://t.me/", "http://t.me/", "t.me/"]:
+            if u.startswith(pfx):
+                u = u[len(pfx):]
+        u = u.strip("@/ ")
+        if u and "+" not in u and u not in cleaned:
+            cleaned.append(u)
+    return cleaned
+
 
 async def auto_channel_engagement_loop():
-    """Monitor all auto-join channels for new posts — react+view unseen.
-    Checks every 60s after a 5-min startup delay."""
-    await asyncio.sleep(300)
+    """Every 60s: for each joined channel and EACH logged-in session, react to
+    any new post (and, the first time, to the last 15 posts).
+
+    Staggered: a random delay before each session acts and between channels,
+    so multiple accounts never hit the same post at the same second (that is
+    what triggers FloodWait / looks automated).
+    """
+    await asyncio.sleep(300)   # let boot settle
     while True:
         try:
-            links = cfg.get("AUTO_JOIN_LINKS", [])
-            for raw_link in links:
-                link = raw_link.strip()
-                username = link
-                for pfx in ["https://t.me/", "http://t.me/", "t.me/"]:
-                    if username.startswith(pfx):
-                        username = username[len(pfx):]
-                username = username.strip("@/ ")
-                if "+" in username:
-                    continue
-                if userbot and userbot.is_connected():
+            for username in _engagement_targets():
+                for client in _all_session_clients():
                     try:
-                        entity = await userbot.get_entity(username)
+                        entity = await client.get_entity(username)
                         from telethon.tl.types import Channel as _TLChanE
                         if not (isinstance(entity, _TLChanE) and getattr(entity, 'broadcast', False)):
                             continue
-                        chan_id = entity.id
-                        latest_msg = None
-                        async for msg in userbot.iter_messages(entity, limit=1):
-                            latest_msg = msg
-                        if not latest_msg:
+
+                        try:
+                            sess_id = (await client.get_me()).id
+                        except Exception:
+                            sess_id = id(client)
+                        key = (sess_id, entity.id)
+
+                        latest_id = 0
+                        async for msg in client.iter_messages(entity, limit=1):
+                            latest_id = msg.id
+                        if not latest_id:
                             continue
-                        last_id = _LAST_REACTED_MSG_UB.get(chan_id, 0)
-                        if latest_msg.id <= last_id:
+
+                        last_id = _LAST_REACTED_MSG_UB.get(key, 0)
+                        if latest_id <= last_id:
                             continue
-                        await add_channel_reactions_views(userbot, entity, n_msgs=5)
-                        _LAST_REACTED_MSG_UB[chan_id] = latest_msg.id
+
+                        # First contact -> last 15 posts. After that only the
+                        # genuinely new ones (capped so a burst can't spam).
+                        if last_id == 0:
+                            n = REACT_BACKLOG
+                        else:
+                            n = min(REACT_BACKLOG, max(1, latest_id - last_id))
+
+                        await add_channel_reactions_views(client, entity, n_msgs=n)
+                        _LAST_REACTED_MSG_UB[key] = latest_id
                     except Exception:
                         pass
-                await asyncio.sleep(2)
+                    # stagger between sessions on the same channel
+                    await asyncio.sleep(random.uniform(4, 12))
+                # stagger between channels
+                await asyncio.sleep(random.uniform(3, 8))
         except Exception as _el:
             bot_logger("AUTO_ENGAGE", f"{_el}")
         await asyncio.sleep(60)
@@ -3593,83 +3699,123 @@ def _render_start_menu(sender_id: int, sender=None, is_owner: bool = None):
     _owner_url   = (f"https://t.me/{_owner_uname}" if _owner_uname
                     else f"tg://user?id={cfg.get('OWNER_ID', 1)}")
     _report_url  = cfg.get("HELP_REPORT_LINK") or "https://t.me/Spidyofficial"
+    _support_url = cfg.get("SUPPORT_LINK", "")
+    _updates_url = cfg.get("UPDATES_LINK", "")
     # Per-account music status — each user sees only THEIR OWN Pyrogram
-    # session state, not a shared/global one (every account plays its own
-    # music through its own session).
+    # session state, not a shared/global one.
     pyro_ok      = bool(cfg.get("PYRO_SESSIONS", {}).get(str(sender_id)))
-    music_st     = "🟢 Active" if pyro_ok else "🔴 Not Setup"
+    music_st     = "\U0001f7e2 Active" if pyro_ok else "\U0001f534 Not Setup"
+
+    def _extra_link_row():
+        """Only render link buttons whose URL is actually configured."""
+        row = []
+        if _support_url:
+            row.append(Button.url("\U0001f4ac Support", _support_url))
+        if _updates_url:
+            row.append(Button.url("\U0001f4e2 Updates", _updates_url))
+        rows = [row] if row else []
+        _ws = cfg.get("WORDSEEK_LINK", "")
+        if _ws:
+            rows.append([Button.url("\U0001f3ae WordSeek Cheat Bot", _ws)])
+        return rows
 
     if is_owner:
         about_text = (
-            "<blockquote>👑  <b>4ST MASTER CONTROL</b>\n"
-            "──────────────────────\n"
-            "  Welcome, Emperor. All systems active.\n"
-            "  ⚡ Engine: Ultra-Fast Telethon Core\n"
-            f"  🎵 Music: {music_st}\n"
-            "──────────────────────\n"
-            "  Choose an action below.</blockquote>"
+            "<blockquote><b>\U0001f451 4ST PRIME \u2014 MASTER CONTROL</b>\n"
+            "\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\n"
+            "  Welcome back, Emperor. Grid is online.\n\n"
+            "  \u26a1 <b>Engine</b>  \u00b7 Ultra-Fast Telethon Core\n"
+            f"  \U0001f3b5 <b>Music</b>   \u00b7 {music_st}\n"
+            f"  \U0001f465 <b>Cores</b>   \u00b7 <code>{len(active_user_ids)}</code> active\n"
+            "\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\n"
+            "  Full owner toolkit below \U0001f447</blockquote>"
         )
         buttons = [
-            [Button.inline("🔐 Login / Activate Core", b"login_activate")],
-            [Button.inline("🎵 Music Setup",           b"music_setup")],
-            [Button.inline("➖ Remove String", b"rm_str"),
-             Button.inline("⚡ Active Grid Cores", b"act_users")],
-            [Button.inline("🧹 Clean Duplicates", b"clean_dup"),
-             Button.inline("🧹 Clean Expired", b"clean_exp")],
-            [Button.inline("🔄 Reboot All Cores", b"reboot"),
-             Button.inline("📢 Broadcast Panel", b"broadcast_panel")],
-            [Button.inline("📸 Set Visual Media", b"set_media"),
-             Button.inline("📦 Download ZIP", b"dl_zip")],
-            [Button.inline("🔗 Manage Auto-Join Links", b"manage_autojoin"),
-             Button.inline("👥 Force Join", b"forcejoin_panel")],
-            [Button.inline("🔒 Must Join Settings", b"must_join_panel")],
-            [Button.inline("🌱 Grow — Mass Add + Promote", b"grow_panel")],
+            [Button.inline("\U0001f510 Login / Activate Core", b"login_activate")],
+            [Button.inline("\U0001f3b5 Music Setup",           b"music_setup")],
+            [Button.inline("\u2796 Remove String", b"rm_str"),
+             Button.inline("\u26a1 Active Grid Cores", b"act_users")],
+            [Button.inline("\U0001f9f9 Clean Duplicates", b"clean_dup"),
+             Button.inline("\U0001f9f9 Clean Expired", b"clean_exp")],
+            [Button.inline("\U0001f504 Reboot All Cores", b"reboot"),
+             Button.inline("\U0001f4e2 Broadcast Panel", b"broadcast_panel")],
+            [Button.inline("\U0001f4f8 Set Visual Media", b"set_media"),
+             Button.inline("\U0001f4e6 Download ZIP", b"dl_zip")],
+            [Button.inline("\U0001f517 Manage Auto-Join Links", b"manage_autojoin"),
+             Button.inline("\U0001f465 Force Join", b"forcejoin_panel")],
+            [Button.inline("\U0001f512 Must Join Settings", b"must_join_panel")],
+            [Button.inline("\U0001f4a5 Auto Reactions Info", b"react_info")],
+            [Button.inline("\U0001f331 Grow \u2014 Mass Add + Promote", b"grow_panel")],
             [Button.inline(
-                f"🔄 Master Sync: {'ON' if cfg.get('MASTER_SYNC', False) else 'OFF'}",
+                f"\U0001f504 Master Sync: {'ON' if cfg.get('MASTER_SYNC', False) else 'OFF'}",
                 b"toggle_sync")],
-            [Button.url("👑 Owner Profile", _owner_url),
-             Button.url("🆘 Help/Report",   _report_url)],
-        ]
+            [Button.inline("\U0001f4d8 Tutorial", b"tut_home"),
+             Button.inline("\u2728 Features", b"feat_home")],
+            [Button.url("\U0001f451 Owner Profile", _owner_url),
+             Button.url("\U0001f198 Help/Report",   _report_url)],
+        ] + _extra_link_row()
     elif is_active:
         about_text = (
-            "<blockquote>🛡️  <b>4ST ELITE OPERATOR</b>\n"
-            "──────────────────────\n"
-            "  Engine registered ✓  All modules unlocked.\n"
-            f"  🎵 Music: {music_st}\n"
-            "──────────────────────\n"
-            "  Manage your session below.</blockquote>"
+            "<blockquote><b>\U0001f6e1 4ST PRIME \u2014 ELITE OPERATOR</b>\n"
+            "\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\n"
+            "  Your core is registered \u2713 \u2014 all modules unlocked.\n\n"
+            f"  \U0001f3b5 <b>Music</b> \u00b7 {music_st}\n"
+            "  \u2694\ufe0f <b>Combat</b> \u00b7 raid \u00b7 spam \u00b7 ow \u00b7 tagall\n"
+            "  \U0001f6e0 <b>Tools</b>  \u00b7 admin \u00b7 AI \u00b7 auto-reply\n"
+            "\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\n"
+            "  New here? Open \U0001f4d8 <b>Tutorial</b> \u2014 sab kuch step-by-step.</blockquote>"
         )
         buttons = [
-            [Button.inline("🔐 Login / Activate Core", b"login_activate")],
-            [Button.inline("🎵 Music Setup",           b"music_setup")],
-            [Button.inline("➖ Remove My String", b"rm_str"),
-             Button.inline("🔄 Reboot My Core", b"reboot_mine")],
-            [Button.inline("⚡ Active Users", b"act_users")],
-            [Button.url("👑 Owner Profile", _owner_url),
-             Button.url("🆘 Help/Report",   _report_url)],
-        ]
+            [Button.inline("\U0001f510 Login / Activate Core", b"login_activate")],
+            [Button.inline("\U0001f3b5 Music Setup",           b"music_setup")],
+            [Button.inline("\u2796 Remove My String", b"rm_str"),
+             Button.inline("\U0001f504 Reboot My Core", b"reboot_mine")],
+            [Button.inline("\u26a1 Active Users", b"act_users")],
+            [Button.inline("\U0001f4d8 Tutorial", b"tut_home"),
+             Button.inline("\u2728 Features", b"feat_home")],
+            [Button.url("\U0001f451 Owner Profile", _owner_url),
+             Button.url("\U0001f198 Help/Report",   _report_url)],
+        ] + _extra_link_row()
     else:
         about_text = (
-            "<blockquote>⚡  <b>4ST PRIME CORE</b>\n"
-            "──────────────────────\n"
-            "  World's fastest userbot framework.\n"
-            "  45+ modules: raid · spam · admin · music\n"
-            "  ⚔️ combat · 🎵 music · 🤖 AI · 🛠️ tools\n"
-            "──────────────────────\n"
-            "  Deploy your core to unlock full power.</blockquote>"
+            "<blockquote><b>\u26a1 4ST PRIME CORE</b>\n"
+            "\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\n"
+            "  <i>The fastest all-in-one Telegram userbot.</i>\n\n"
+            "  \u2694\ufe0f <b>Combat Suite</b> \u2014 raid, spam, ow, sraid,\n"
+            "     tagall, ghost \u00b7 speed tuned per command\n"
+            "  \U0001f3b5 <b>Music Engine</b> \u2014 VC streaming, zero-disk,\n"
+            "     YouTube \u00b7 JioSaavn \u00b7 SoundCloud failover\n"
+            "  \U0001f6e1 <b>Admin Power</b> \u2014 ban, mute, promote,\n"
+            "     mass-add + auto-promote (Grow)\n"
+            "  \U0001f916 <b>AI + Tools</b> \u2014 AI replies, custom commands,\n"
+            "     name/username tracker, auto-join\n"
+            "  \U0001f4a5 <b>Auto Engagement</b> \u2014 silent views + real\n"
+            "     reactions on your channels (unseen mode)\n"
+            "  \u267e\ufe0f <b>Multi-Account</b> \u2014 unlimited cores, one panel\n"
+            "\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\n"
+            "  \U0001f449 Press \U0001f510 <b>Login</b> to deploy your core,\n"
+            "     ya pehle \U0001f4d8 <b>Tutorial</b> padh lo.</blockquote>"
         )
         buttons = [
-            [Button.inline("🔐 Login / Activate Core", b"login_activate")],
-            [Button.url("👑 OWNER", _owner_url),
-             Button.url("🆘 REPORT", _report_url)],
-        ]
+            [Button.inline("\U0001f510 Login / Activate Core", b"login_activate")],
+            [Button.inline("\U0001f4d8 Tutorial", b"tut_home"),
+             Button.inline("\u2728 Features", b"feat_home")],
+            [Button.url("\U0001f451 OWNER", _owner_url),
+             Button.url("\U0001f198 REPORT", _report_url)],
+        ] + _extra_link_row()
     return about_text, buttons
 
 
 async def _send_start_menu(event, sender_id: int, sender=None):
     """Sends the /start menu as a fresh reply (used by the /start command)."""
     about_text, buttons = _render_start_menu(sender_id, sender)
+    # Pull the banner back from GitHub if the dyno restarted and wiped disk.
     media_path = cfg.get("START_MEDIA_PATH")
+    if not (media_path and os.path.exists(str(media_path))):
+        try:
+            media_path = media_store.ensure_local_media(cfg, DATA_DIR, bot_logger)
+        except Exception:
+            media_path = None
     try:
         try:
             parsed_text, entities = asstbot.parse_mode.parse(about_text)
@@ -3692,6 +3838,82 @@ async def _send_start_menu(event, sender_id: int, sender=None):
 
 
 @asstbot.on(events.NewMessage(incoming=True))
+# ══════════════════════════════════════════
+# MUST-JOIN ENFORCEMENT (owner-configured)
+# ══════════════════════════════════════════
+# The owner sets these from  /start → 🔒 Must Join Settings.
+# Order (as shown in the panel): Channel → Group → Bot.
+# The assistant bot must be an ADMIN in the channel/group it has to verify,
+# otherwise Telegram won't let it read the member list — in that case we fail
+# OPEN (allow the user) instead of locking everyone out of the bot.
+def _mj_clean(v: str) -> str:
+    v = (v or "").strip()
+    for pfx in ["https://t.me/", "http://t.me/", "t.me/"]:
+        if v.startswith(pfx):
+            v = v[len(pfx):]
+    return v.strip("@/ ")
+
+
+def _mj_link(v: str) -> str:
+    v = (v or "").strip()
+    if v.startswith("http"):
+        return v
+    return f"https://t.me/{_mj_clean(v)}"
+
+
+async def check_must_join(user_id: int):
+    """Returns (ok, missing) where missing is a list of (label, url) the user
+    still has to join. Owner and empty settings always pass."""
+    if user_id == cfg.get("OWNER_ID", 0):
+        return True, []
+
+    missing = []
+    checks = [
+        ("📢 Join Channel", cfg.get("MUST_JOIN_CHANNEL", "")),
+        ("👥 Join Group",   cfg.get("MUST_JOIN_GC", "")),
+    ]
+    for label, target in checks:
+        target = (target or "").strip()
+        if not target:
+            continue
+        try:
+            entity = await asstbot.get_entity(_mj_clean(target) if "+" not in target else target)
+            await asstbot.get_permissions(entity, user_id)
+        except Exception as e:
+            msg = str(e).lower()
+            if "admin" in msg or "chat_admin_required" in msg or "could not find" in msg:
+                continue          # bot can't verify → fail open
+            missing.append((label, _mj_link(target)))
+
+    mj_bot = _mj_clean(cfg.get("MUST_JOIN_BOT", ""))
+    if mj_bot:
+        started = cfg.get("MJ_BOT_STARTED", [])
+        if user_id not in started:
+            missing.append((f"🤖 Start @{mj_bot}", f"https://t.me/{mj_bot}?start=1"))
+
+    return (not missing), missing
+
+
+async def send_must_join_prompt(event, missing):
+    """Locked screen shown until every requirement is satisfied."""
+    rows = [[Button.url(label, url)] for label, url in missing]
+    rows.append([Button.inline("✅ Joined — Recheck", b"mj_recheck")])
+    text = (
+        "<blockquote>🔒  <b>ACCESS LOCKED</b>\n"
+        "─────────────────────\n"
+        "  Bot use karne se pehle neeche di gayi\n"
+        "  sabhi jagah join / start karna zaroori hai.\n"
+        "  Join karne ke baad ✅ Recheck dabao.</blockquote>"
+    )
+    try:
+        await event.reply(text, buttons=rows, parse_mode='html')
+    except Exception:
+        try:
+            await asstbot.send_message(event.sender_id, text, buttons=rows, parse_mode='html')
+        except Exception:
+            pass
+
+
 async def asst_start_handler(event):
     if not event.is_private:
         return
@@ -3702,6 +3924,10 @@ async def asst_start_handler(event):
         sender    = await event.get_sender()
         sender_id = event.sender_id
         asyncio.create_task(log_to_channel("BOT_START", {"Command": "/start"}, user_obj=sender))
+        _mj_ok, _mj_missing = await check_must_join(sender_id)
+        if not _mj_ok:
+            await send_must_join_prompt(event, _mj_missing)
+            return
         if sender_id not in state.active_bot_users:
             state.active_bot_users.add(sender_id)
             cfg["BOT_USERS"] = list(state.active_bot_users)
@@ -3808,6 +4034,177 @@ async def asst_callback_handler(event):
         bot_logger("BOT_CB_ERR", f"{data}: {_err}")
 
 async def _asst_callback_inner(event, data, sender_id, owner_id, is_owner):
+    # ── MUST JOIN gate — every button except the recheck itself ──
+    if data == b"mj_recheck":
+        # A bot cannot query whether a user has DM-started ANOTHER bot, so the
+        # "start bot" requirement is trust-on-recheck: pressing recheck marks
+        # it satisfied (the user had to visit the bot to get here anyway).
+        if _mj_clean(cfg.get("MUST_JOIN_BOT", "")):
+            _started = cfg.setdefault("MJ_BOT_STARTED", [])
+            if sender_id not in _started:
+                _started.append(sender_id)
+                save_config(cfg)
+        ok, missing = await check_must_join(sender_id)
+        if ok:
+            await event.answer("✅ Verified! Opening menu…", alert=False)
+            await _send_start_menu(event, sender_id, await event.get_sender())
+        else:
+            await event.answer("❌ Abhi bhi kuch join nahi hua.", alert=True)
+        return
+    if not is_owner:
+        _ok, _missing = await check_must_join(sender_id)
+        if not _ok:
+            await event.answer("🔒 Pehle sab join karo.", alert=True)
+            await send_must_join_prompt(event, _missing)
+            return
+
+    # ── TUTORIAL / FEATURES / REACTION INFO ────────────────────────────────
+    # Text+button tutorial (no video) — everything a new user needs, so they
+    # never get stuck. Last page always offers a direct DM to the owner.
+    _owner_uname_t = cfg.get('OWNER_USERNAME', '').lstrip('@')
+    _owner_url_t   = (f"https://t.me/{_owner_uname_t}" if _owner_uname_t
+                      else f"tg://user?id={cfg.get('OWNER_ID', 1)}")
+    _report_url_t  = cfg.get("HELP_REPORT_LINK") or _owner_url_t
+
+    if data == b"tut_home":
+        await _safe_bot_edit(event, sender_id,
+            "<blockquote><b>\U0001f4d8 TUTORIAL \u2014 START HERE</b>\n"
+            "\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\n"
+            "  3 chhote steps mein bot chalu ho jayega.\n"
+            "  Koi step samajh na aaye \u2192 owner ko DM karo.\n\n"
+            "  1\ufe0f\u20e3 <b>Login</b> \u2014 apna account connect karo\n"
+            "  2\ufe0f\u20e3 <b>Commands</b> \u2014 rozmarra ke commands\n"
+            "  3\ufe0f\u20e3 <b>Music</b> \u2014 VC mein gaana bajao\n"
+            "  4\ufe0f\u20e3 <b>Problems</b> \u2014 common errors ka fix\n"
+            "\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501</blockquote>",
+            buttons=[
+                [Button.inline("1\ufe0f\u20e3 Login Guide", b"tut_login"),
+                 Button.inline("2\ufe0f\u20e3 Commands", b"tut_cmds")],
+                [Button.inline("3\ufe0f\u20e3 Music Setup", b"tut_music"),
+                 Button.inline("4\ufe0f\u20e3 Problems", b"tut_help")],
+                [Button.inline("\U0001f519 Back", b"back_start")],
+            ])
+        return
+
+    if data == b"tut_login":
+        await _safe_bot_edit(event, sender_id,
+            "<blockquote><b>1\ufe0f\u20e3 LOGIN / ACTIVATE CORE</b>\n"
+            "\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\n"
+            "  <b>Option A \u2014 Phone number (aasaan)</b>\n"
+            "  \u2022 \U0001f510 Login \u2192 \U0001f4f1 Login via Number\n"
+            "  \u2022 Number bhejo: <code>+919876543210</code>\n"
+            "  \u2022 OTP aaye to <b>spaces ke saath</b> bhejo:\n"
+            "    <code>1 2 3 4 5</code>  (Telegram OTP block karta hai)\n"
+            "  \u2022 2FA on hai to password bhejo\n\n"
+            "  <b>Option B \u2014 String session (fast)</b>\n"
+            "  \u2022 \U0001f510 Login \u2192 \u26a1 Telethon String\n"
+            "  \u2022 Apna StringSession paste kar do\n\n"
+            "  \u2705 Login hote hi core active + auto-join chalu.\n"
+            "  \U0001f512 Session encrypted store hota hai, kabhi share nahi hota.\n"
+            "\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501</blockquote>",
+            buttons=[[Button.inline("\U0001f510 Login Now", b"login_activate")],
+                     [Button.inline("\u25b6\ufe0f Next: Commands", b"tut_cmds")],
+                     [Button.inline("\U0001f519 Tutorial", b"tut_home")]])
+        return
+
+    if data == b"tut_cmds":
+        await _safe_bot_edit(event, sender_id,
+            "<blockquote><b>2\ufe0f\u20e3 DAILY COMMANDS</b>\n"
+            "\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\n"
+            "  Commands apne <b>logged-in account</b> se bhejo\n"
+            "  (bot se nahi), kisi bhi group mein.\n\n"
+            "  \u2022 <code>.alive</code> \u2014 core zinda hai ya nahi\n"
+            "  \u2022 <code>.help</code> \u2014 poori command list\n"
+            "  \u2022 <code>.play song name</code> \u2014 VC mein gaana\n"
+            "  \u2022 <code>.tagall msg</code> \u2014 sabko tag\n"
+            "  \u2022 <code>.raid @user</code> \u2014 combat module\n"
+            "  \u2022 <code>.forcejoin @channel all</code> \u2014 members add\n"
+            "  \u2022 <code>.speed cmd 0.2</code> \u2014 speed tune\n"
+            "\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501</blockquote>",
+            buttons=[[Button.inline("\u25b6\ufe0f Next: Music", b"tut_music")],
+                     [Button.inline("\U0001f519 Tutorial", b"tut_home")]])
+        return
+
+    if data == b"tut_music":
+        await _safe_bot_edit(event, sender_id,
+            "<blockquote><b>3\ufe0f\u20e3 MUSIC SETUP</b>\n"
+            "\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\n"
+            "  Music alag Pyrogram session se chalta hai.\n\n"
+            "  \u2022 \U0001f3b5 Music Setup \u2192 number ya string\n"
+            "  \u2022 Group mein VC <b>pehle start</b> karo\n"
+            "  \u2022 Account ko VC join karne ka right chahiye\n"
+            "  \u2022 Phir <code>.play song</code> / <code>.vplay video</code>\n"
+            "  \u2022 Control: \u23f8 pause \u00b7 \u25b6\ufe0f resume \u00b7 \u23ed skip \u00b7 \u23f9 stop\n"
+            "\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501</blockquote>",
+            buttons=[[Button.inline("\U0001f3b5 Music Setup", b"music_setup")],
+                     [Button.inline("\u25b6\ufe0f Next: Problems", b"tut_help")],
+                     [Button.inline("\U0001f519 Tutorial", b"tut_home")]])
+        return
+
+    if data == b"tut_help":
+        await _safe_bot_edit(event, sender_id,
+            "<blockquote><b>4\ufe0f\u20e3 PROBLEM? YAHAN FIX HAI</b>\n"
+            "\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\n"
+            "  \u274c <b>OTP invalid</b> \u2192 OTP spaces ke saath bhejo\n"
+            "     (<code>1 2 3 4 5</code>), aur turant \u2014 expire ho jata hai.\n"
+            "  \u274c <b>Session expired</b> \u2192 \u2796 Remove String,\n"
+            "     phir dobara login karo.\n"
+            "  \u274c <b>Commands kaam nahi kar rahe</b> \u2192 command\n"
+            "     apne account se bhejo, bot se nahi.\n"
+            "  \u274c <b>Music join nahi ho raha</b> \u2192 VC start karo,\n"
+            "     account ko group mein rakho.\n"
+            "  \u274c <b>Access locked</b> \u2192 must-join channel/group\n"
+            "     join karke \u2705 Recheck dabao.\n"
+            "  \u274c <b>FloodWait</b> \u2192 Telegram ka cooldown hai,\n"
+            "     bas wait karo \u2014 bot khud retry karta hai.\n\n"
+            "  Phir bhi issue? Owner ko seedha DM karo \u2193\n"
+            "\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501</blockquote>",
+            buttons=[[Button.url("\U0001f4ac DM Owner", _owner_url_t),
+                      Button.url("\U0001f198 Help/Report", _report_url_t)],
+                     [Button.inline("\U0001f519 Tutorial", b"tut_home")]])
+        return
+
+    if data == b"feat_home":
+        await _safe_bot_edit(event, sender_id,
+            "<blockquote><b>\u2728 WHY 4ST PRIME CORE</b>\n"
+            "\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\n"
+            "  \u26a1 <b>Speed</b> \u2014 har command ki speed tunable\n"
+            "  \u2694\ufe0f <b>Combat</b> \u2014 raid \u00b7 sraid \u00b7 ow \u00b7 spam \u00b7 ghost\n"
+            "  \U0001f3b5 <b>Music</b> \u2014 VC streaming, zero-disk, multi-source\n"
+            "  \U0001f6e1 <b>Admin</b> \u2014 ban \u00b7 mute \u00b7 promote \u00b7 purge\n"
+            "  \U0001f331 <b>Grow</b> \u2014 mass add + auto promote\n"
+            "  \U0001f4a5 <b>Auto Engagement</b> \u2014 last 15 + har nayi post\n"
+            "     pe real reactions, premium pe 3 reactions,\n"
+            "     views bhi \u2014 sab kuch <b>unseen</b> rehta hai\n"
+            "  \U0001f916 <b>AI</b> \u2014 smart replies, custom commands\n"
+            "  \u267e\ufe0f <b>Multi-core</b> \u2014 unlimited accounts, ek panel\n"
+            "  \u2601\ufe0f <b>Restart-proof</b> \u2014 sessions + start pic\n"
+            "     permanently saved, reboot pe kuch nahi khota\n"
+            "\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501</blockquote>",
+            buttons=[[Button.inline("\U0001f4d8 Tutorial", b"tut_home")],
+                     [Button.inline("\U0001f519 Back", b"back_start")]])
+        return
+
+    if data == b"react_info":
+        if not is_owner:
+            return
+        _tg = _engagement_targets()
+        _list = "\n".join(f"  \u2022 <code>@{t}</code>" for t in _tg) or "  <i>Koi channel set nahi</i>"
+        await _safe_bot_edit(event, sender_id,
+            f"<blockquote><b>\U0001f4a5 AUTO REACTIONS & VIEWS</b>\n"
+            f"\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\n"
+            f"  Join hote hi last <b>{REACT_BACKLOG}</b> posts pe reactions,\n"
+            f"  uske baad har <b>nayi post</b> pe automatic.\n\n"
+            f"  \u2022 Normal account \u2192 1 random good reaction\n"
+            f"  \u2022 Premium account \u2192 3 random reactions\n"
+            f"  \u2022 Views bhi badhte hain \u2014 bina seen kiye\n"
+            f"  \u2022 Sabhi logged-in cores, staggered delay ke saath\n\n"
+            f"  <b>Targets ({len(_tg)}):</b>\n{_list}\n"
+            f"\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501</blockquote>",
+            buttons=[[Button.inline("\U0001f517 Auto-Join Links", b"manage_autojoin")],
+                     [Button.inline("\U0001f519 Back", b"back_start")]])
+        return
+
     # ── MUSIC SETUP ──
     if data == b"music_setup":
         pyro_ok = bool(cfg.get("PYRO_SESSIONS", {}).get(str(sender_id)))
@@ -4674,9 +5071,26 @@ async def assistant_input_listener(event):
             msg  = await event.reply("⏳ Downloading visual media...")
             path = await event.download_media(file=DATA_DIR)
             cfg["START_MEDIA_PATH"] = path
+            # PERMANENT SAVE: commit the file to the GitHub repo so it survives
+            # dyno restarts/redeploys. The pointer lives in CONFIG (mirrored to
+            # MongoDB), the bytes live in the repo.
+            _ref = None
+            try:
+                await _premium_edit(msg, "<blockquote>☁️ <b>Saving permanently to GitHub…</b></blockquote>")
+                _ref = await asyncio.to_thread(
+                    media_store.upload_media, path, bot_logger)
+            except Exception as _mue:
+                bot_logger("MEDIA_STORE", f"upload error: {_mue}")
+            cfg["START_MEDIA_REF"] = _ref
             save_config(cfg)
             state.asst_conversation_state[sender_id] = None
-            await _premium_edit(msg, "<blockquote>✅ <b>Visual Banner locked!</b></blockquote>")
+            _perm = ("✅ Permanently saved on GitHub — restart-proof."
+                     if _ref else
+                     "⚠️ GitHub storage off (set GITHUB_TOKEN + GITHUB_REPO) — "
+                     "this pic will be lost on the next restart.")
+            await _premium_edit(
+                msg,
+                f"<blockquote>✅ <b>Visual Banner locked!</b>\n{_perm}</blockquote>")
         else:
             await _bot_reply(event, "❌ Send a valid Photo/Video!")
 
