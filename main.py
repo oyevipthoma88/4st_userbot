@@ -3860,7 +3860,6 @@ async def _send_start_menu(event, sender_id: int, sender=None):
             pass
 
 
-@asstbot.on(events.NewMessage(incoming=True))
 # ══════════════════════════════════════════
 # MUST-JOIN ENFORCEMENT (owner-configured)
 # ══════════════════════════════════════════
