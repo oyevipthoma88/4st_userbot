@@ -51,7 +51,7 @@
       "required": false
     },
     "TELEGRAM_HELP_LINK": {
-      "description": "A t.me link shown as the 'Help/Report' button (defaults to a placeholder if unset).",
+      "description": "t.me link for the 'Help/Report' button on the /start UI.",
       "required": false
     },
     "GEMINI_API_KEY": {
@@ -59,21 +59,16 @@
       "required": false
     },
     "GITHUB_TOKEN": {
-      "description": "DEPRECATED — MongoDB replaced GitHub backups. Safe to leave empty.",
-      "required": true
-    },
-    "GITHUB_REPO": {
-      "description": "DEPRECATED — MongoDB replaced GitHub backups. Safe to leave empty.",
-      "required": true
-    },
-    "GITHUB_BRANCH": {
-      "description": "DEPRECATED — MongoDB replaced GitHub backups. Safe to leave empty.",
-      "value": "main",
+      "description": "GitHub PAT with contents:write on GITHUB_REPO. Used ONLY to permanently store the /start visual media (start picture) so it survives dyno restarts. Config backups still go to MongoDB.",
       "required": false
     },
-    "GITHUB_CONFIG_PATH": {
-      "description": "DEPRECATED — MongoDB replaced GitHub backups. Safe to leave empty.",
-      "value": "data/config.json",
+    "GITHUB_REPO": {
+      "description": "owner/repo where the start picture is committed (e.g. oyevipthoma88/4st_userbot).",
+      "required": false
+    },
+    "GITHUB_BRANCH": {
+      "description": "Branch used for the start-picture commit.",
+      "value": "main",
       "required": false
     },
     "MONGO_URI": {
@@ -87,6 +82,23 @@
     },
     "YOUTUBE_API_KEY": {
       "description": "YouTube Data API v3 key — fast search for .play/.vplay (comma-separated for multiple keys). Optional.",
+      "required": false
+    },
+    "GITHUB_MEDIA_DIR": {
+      "description": "Folder inside the repo for stored media.",
+      "value": "media",
+      "required": false
+    },
+    "TELEGRAM_SUPPORT_LINK": {
+      "description": "t.me link for the 'Support' button on the /start UI (optional — button hidden if unset).",
+      "required": false
+    },
+    "TELEGRAM_UPDATES_LINK": {
+      "description": "t.me link for the 'Updates' button on the /start UI (optional — button hidden if unset).",
+      "required": false
+    },
+    "WORDSEEK_BOT_LINK": {
+      "description": "t.me link to the WordSeek cheat bot, shown as a cross-promo button on /start (optional).",
       "required": false
     }
   },
