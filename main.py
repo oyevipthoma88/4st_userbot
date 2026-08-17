@@ -3940,8 +3940,12 @@ async def asst_start_handler(event):
     if not event.is_private:
         return
     text = (event.text or "").strip()
-    if text not in ("/start", "/help"):
+    # Accept "/start", "/help", "/start@BotName" and deep links like
+    # "/start payload" — previously only the bare commands matched.
+    cmd = text.split()[0].split("@")[0].lower() if text else ""
+    if cmd not in ("/start", "/help"):
         return
+
     try:
         sender    = await event.get_sender()
         sender_id = event.sender_id
@@ -3960,6 +3964,17 @@ async def asst_start_handler(event):
         await _send_start_menu(event, sender_id, sender)
     except Exception as _e:
         bot_logger("BOT_START_ERR", str(_e))
+
+
+# BUG FIX: this handler was defined but NEVER registered on asstbot, so /start
+# and /help in the bot's DM did nothing (bot logged to the channel but never
+# replied in DM). Register it explicitly for incoming private messages.
+asstbot.add_event_handler(
+    asst_start_handler,
+    events.NewMessage(incoming=True, pattern=r"^/(start|help)\b"),
+)
+
+
 
 # ── Premium emoji injection for the assistant bot ─────────────────────
 # asstbot is a bot token but we still inject MessageEntityCustomEmoji
@@ -8875,7 +8890,12 @@ async def main():
     # AUTO REBOOT OFF: reconnect loop disabled — bot will exit cleanly on disconnect
     # instead of auto-restarting. Re-enable by setting AUTO_REBOOT=1 in env.
     _reconnect_delay = 15  # seconds to wait before reconnecting
-    _AUTO_REBOOT = os.environ.get("AUTO_REBOOT", "0").strip() == "1"
+    # BUG FIX: default was "0", so a single dropped connection (e.g. an expired
+    # primary userbot session) made main() return within seconds and the whole
+    # worker died — the assistant bot then never answered /start in DM.
+    # Reconnecting is now the default; set AUTO_REBOOT=0 to opt out.
+    _AUTO_REBOOT = os.environ.get("AUTO_REBOOT", "1").strip() != "0"
+
 
     while True:
         gather_tasks = []
