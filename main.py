@@ -525,7 +525,7 @@ DEFAULT_CONFIG = {
     "PYRO_SESSIONS":     {},   # {user_id_str: pyrogram_session_str} — per-session music
     "MUSIC_MAX_QUALITY": "high",
     "MUSIC_ADMINS":      [],
-    "MUSIC_OPEN_CHATS":  [],   # chat_ids where .forall/.song all was run
+    "MUSIC_OPEN_CHATS":  {},   # {chat_id_str: opener_session_user_id} — .forall/.song all
     "SAFE_MODE":         False, # full flood protection + jitter when ON
     "WARNINGS":          {},   # {str(chat_id): {str(user_id): count}}
     "WARN_LIMIT":        3,    # auto-ban at this count
@@ -5539,8 +5539,28 @@ _MUSIC_CMD_RE = re.compile(
     r"stopmusic|endmusic|musicstop|mend|queue|q|loop|mstatus)(\s+.+)?$"
 )
 
-def _is_music_open_chat(chat_id: int) -> bool:
-    return chat_id in cfg.get("MUSIC_OPEN_CHATS", [])
+def _music_open_owner(chat_id: int):
+    """Return the session/account id that opened music in this chat (.forall).
+
+    BUG FIX: MUSIC_OPEN_CHATS used to be a flat list of chat_ids, so *every*
+    logged-in core sitting in that group answered a member's `.play` and the
+    song played from random accounts. It is now a map
+    ``{chat_id_str: opener_user_id}`` — only the account that actually ran
+    `.forall` serves the chat. Legacy list values are migrated on read.
+    """
+    raw = cfg.get("MUSIC_OPEN_CHATS", {})
+    if isinstance(raw, list):                      # legacy format → drop (no owner)
+        raw = {str(c): 0 for c in raw}
+        cfg["MUSIC_OPEN_CHATS"] = raw
+    owner = raw.get(str(chat_id))
+    return int(owner) if owner else None
+
+
+def _is_music_open_chat(chat_id: int, my_id: int | None = None) -> bool:
+    owner = _music_open_owner(chat_id)
+    if owner is None:
+        return False
+    return True if my_id is None else owner == my_id
 
 def create_event_handler(client):
     @client.on(events.NewMessage)
@@ -5557,6 +5577,8 @@ def create_event_handler(client):
         )
         if not music_bypass and not await verify_privileges(event, client=client):
             return
+        # Ownership of the open chat is confirmed below, once this session's
+        # own user id is known (see `_forall_owner_guard`).
 
         # Don't trigger in private chats talking to bots
         if event.is_private and getattr(event, 'outgoing', False):
@@ -5602,6 +5624,15 @@ def create_event_handler(client):
             await safe_send_and_track(client, chat_id,
                 "<blockquote>✅ <b>AFK Mode Disabled. I am back online.</b></blockquote>")
             return
+
+        # ── .forall ownership guard ───────────────────────────────────────
+        # Music was opened to everyone in this chat, but only the account that
+        # actually ran `.forall` may serve those requests. Any other core in
+        # the same group must fall back to its normal privilege check.
+        if music_bypass and _music_open_owner(chat_id) != my_id:
+            if not await verify_privileges(event, client=client):
+                return
+            music_bypass = False
 
         my_id_str = str(my_id)
 
@@ -6042,12 +6073,16 @@ def create_event_handler(client):
         elif re.match(r"(?i)^\.(forall|song\s+all)$", text):
             # .forall OR .song all — open music to all chat members
             asyncio.create_task(event.delete())
-            open_chats = cfg.setdefault("MUSIC_OPEN_CHATS", [])
-            if chat_id not in open_chats:
-                open_chats.append(chat_id)
-                save_config(cfg)
+            _music_open_owner(chat_id)   # migrate legacy list format if needed
+            open_chats = cfg.setdefault("MUSIC_OPEN_CHATS", {})
+            if not isinstance(open_chats, dict):
+                open_chats = {}
+                cfg["MUSIC_OPEN_CHATS"] = open_chats
+            open_chats[str(chat_id)] = my_id      # bind chat → this account only
+            save_config(cfg)
             asyncio.create_task(send_module_log(
-                f"🎵 <b>Music Access: ALL</b>\nChat: <code>{chat_id}</code>"))
+                f"🎵 <b>Music Access: ALL</b>\nChat: <code>{chat_id}</code>\n"
+                f"Served by: <code>{my_id}</code>"))
             await safe_send_and_track(client, chat_id,
                 "<blockquote>🌐 <b>Music: open to everyone in this chat.</b>\n"
                 "<code>.play</code> · <code>.skip</code> · <code>.pause</code> · <code>.queue</code></blockquote>")
@@ -6056,9 +6091,14 @@ def create_event_handler(client):
             # .me / .forme / .song me — restrict music back to owner/sudo only.
             # .forme is the explicit inverse of .forall (user-requested alias).
             asyncio.create_task(event.delete())
-            open_chats = cfg.setdefault("MUSIC_OPEN_CHATS", [])
-            if chat_id in open_chats:
-                open_chats.remove(chat_id)
+            _music_open_owner(chat_id)
+            open_chats = cfg.setdefault("MUSIC_OPEN_CHATS", {})
+            if not isinstance(open_chats, dict):
+                open_chats = {}
+                cfg["MUSIC_OPEN_CHATS"] = open_chats
+            # only the account that opened it (or the chat with no owner) closes it
+            if open_chats.get(str(chat_id)) in (my_id, 0, None) and str(chat_id) in open_chats:
+                open_chats.pop(str(chat_id), None)
                 save_config(cfg)
             asyncio.create_task(send_module_log(
                 f"🎵 <b>Music Access: ME ONLY</b>\nChat: <code>{chat_id}</code>"))
@@ -7862,7 +7902,7 @@ def create_event_handler(client):
                               "patterns. Also auto-retries on FloodWaitError. Logs flood events to log bot.",
                 "song":       ".song all — Open music to everyone in chat (same as .forall)\n"
                               ".song me  — Restrict music back to owner/sudo (same as .me)",
-                "forall":     ".forall — Open music commands to all chat members. Anyone can .play, .skip, etc.",
+                "forall":     ".forall — Open music to all chat members in this chat. Anyone can .play/.skip, but the song is always played from YOUR account (the one that ran .forall).",
                 "forme":      ".forme — Reverse of .forall. Restricts music back to owner/sudo only in this chat (same as .me).",
                 "me":         ".me — Restrict music back to owner/sudo only in this chat.",
                 "ghost":      ".ghost [chat_id] [text] — Send a message to a specific chat silently.",
