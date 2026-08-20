@@ -344,6 +344,8 @@ ABUSE_PATH   = os.path.join(DATA_DIR, "abuse.txt")
 OW_PATH      = os.path.join(DATA_DIR, "ow.txt")
 TAGALL_PATH  = os.path.join(DATA_DIR, "tagall.txt")
 SRAID_PATH   = os.path.join(DATA_DIR, "sraid.txt")
+# .otagall — Odisha flavoured group tagall pool (separate data file)
+ODISHA_PATH  = os.path.join(DATA_DIR, "odisha_tagall.txt")
 FUN_PATH     = os.path.join(DATA_DIR, "fun.txt")
 MUSIC_CACHE  = os.path.join(DATA_DIR, "music_cache")
 os.makedirs(MUSIC_CACHE, exist_ok=True)
@@ -484,6 +486,12 @@ DEFAULT_CONFIG = {
     "GROW_POWER":         "full",   # 🌱 Grow promote-power preset
     "SUDO_LEVEL_1":       [],
     "SUDO_LEVEL_2":       [],
+    # PER-ACCOUNT SUDO — {session_user_id_str: {"1": [ids], "2": [ids]}}
+    # Har core (logged-in account) apni alag sudo list rakhta hai. Ek core ka
+    # sudo dusre core ko command NAHI kar sakta.
+    "SUDO_MAP":           {},
+    # .addowline — {session_user_id_str: {chat_id_str: [full lines]}}
+    "OW_LINES":           {},
     "DEFAULT_SPEEDS": {
         "raid": 0.1, "fuck": 0.1, "multi": 0.1, "ow": 0.1,
         "spam": 0.1, "rraid": 0.1, "tagall": 1.5, "onetag": 1.5,
@@ -595,6 +603,17 @@ def load_config():
             _owner_key = str(data.get("OWNER_ID", 0))
             if data["PYRO_SESSION"] and _owner_key not in data["PYRO_SESSIONS"]:
                 data["PYRO_SESSIONS"][_owner_key] = data["PYRO_SESSION"]
+            # ── Per-account sudo migration ───────────────────────────────
+            # Purani global SUDO_LEVEL_1/2 lists sirf OWNER ke core ki ban
+            # jaati hain; baaki accounts fresh (empty) start karte hain.
+            if not isinstance(data.get("SUDO_MAP"), dict):
+                data["SUDO_MAP"] = {}
+            _lg1 = [x for x in (data.get("SUDO_LEVEL_1") or []) if isinstance(x, int)]
+            _lg2 = [x for x in (data.get("SUDO_LEVEL_2") or []) if isinstance(x, int)]
+            if (_lg1 or _lg2) and _owner_key not in data["SUDO_MAP"]:
+                data["SUDO_MAP"][_owner_key] = {"1": _lg1, "2": _lg2}
+            if not isinstance(data.get("OW_LINES"), dict):
+                data["OW_LINES"] = {}
             return data
         except Exception:
             return dict(DEFAULT_CONFIG)
@@ -699,15 +718,15 @@ def load_words(file_path, fallbacks):
 # helpers let it address the target by name and quote the *live* clock so the
 # stream feels like a real person typing right now.
 
+# BUG FIX: OW lines me target ka naam mention hota tha — ab naam kahin nahi
+# aata, sirf .addow ke words (+ optional live time) use hote hain.
 _OW_TIME_TEMPLATES = [
-    "{name} {word}",
-    "{name} abhi {time} baj raha hai, {word}",
-    "{word} — {time} hai {name}, so ja ab",
-    "{name} sun, {time} par bhi {word}",
-    "{time} — {name} {word}",
-    "{name} {word} ({time} tak yahi chalega)",
-    "abhi {time} hua hai {name}, {word}",
-    "{word} {name}, ghadi dekh — {time}",
+    "{word}",
+    "{word}",
+    "{word}",
+    "abhi {time} baj raha hai, {word}",
+    "{word} — {time} ho gaya",
+    "{time} par bhi {word}",
 ]
 
 
@@ -723,6 +742,63 @@ def ow_live_time(cfg=None) -> str:
         offset = 5.5
     now = datetime.datetime.now(timezone.utc) + timedelta(hours=offset)
     return now.strftime("%I:%M %p").lstrip("0").lower()
+
+
+_SRAID_STOPWORDS = {
+    "the","and","for","are","you","your","hai","hain","kya","tum","tu","me","mai",
+    "main","ka","ki","ke","se","ko","na","nahi","bhi","ye","yeh","wo","woh","to",
+    "hi","ho","haan","han","ok","okay","abhi","kar","karo","kr","bro","bhai",
+}
+
+
+def _sraid_related_line(reply_text: str, lines: list) -> str:
+    """Target ke reply se RELATED sraid line chuno (word-overlap scoring)."""
+    if not lines:
+        return ""
+    words = {w for w in re.findall(r"[a-zA-Z\u0900-\u097F]+", (reply_text or "").lower())
+             if len(w) > 2 and w not in _SRAID_STOPWORDS}
+    if not words:
+        return random.choice(lines)
+    best, best_score = [], 0
+    for ln in lines:
+        lw = {w for w in re.findall(r"[a-zA-Z\u0900-\u097F]+", ln.lower()) if len(w) > 2}
+        sc = len(words & lw)
+        if sc > best_score:
+            best, best_score = [ln], sc
+        elif sc and sc == best_score:
+            best.append(ln)
+    return random.choice(best) if best else random.choice(lines)
+
+
+def session_sudo_bucket(cfg, my_id) -> dict:
+    """Per-account sudo bucket — {"1": [...], "2": [...]} for this core only."""
+    smap = cfg.setdefault("SUDO_MAP", {})
+    if not isinstance(smap, dict):
+        smap = cfg["SUDO_MAP"] = {}
+    b = smap.get(str(my_id))
+    if not isinstance(b, dict):
+        b = {"1": [], "2": []}
+        smap[str(my_id)] = b
+    b.setdefault("1", [])
+    b.setdefault("2", [])
+    return b
+
+
+def session_sudo_ids(cfg, my_id) -> list:
+    b = session_sudo_bucket(cfg, my_id)
+    return list(b.get("1", [])) + list(b.get("2", []))
+
+
+def _get_ow_lines(cfg, my_id_str, chat_id) -> list:
+    """.addowline — exact full lines the user registered for this core/chat."""
+    try:
+        store = cfg.get("OW_LINES", {}).get(str(my_id_str), {}) or {}
+    except Exception:
+        return []
+    lines = list(store.get(str(chat_id), []) or [])
+    if not lines:
+        lines = list(store.get("*", []) or [])
+    return [l for l in lines if str(l).strip()]
 
 
 def _get_ow_target_words(cfg, my_id_str, chat_id) -> list:
@@ -1935,27 +2011,28 @@ async def auto_scanbot_task():
 
 
 async def verify_privileges(event, client, strict_owner_only=False):
+    """STRICT PER-ACCOUNT ISOLATION.
+
+    Har logged-in account (core) sirf apne malik ki aur apne khud ke add kiye
+    hue sudo users ki command maanta hai. Koi bhi user kisi dusre user ke core
+    ko command nahi kar sakta — global owner bhi nahi (uska core alag hai).
+      • sender == account holder (my_id)          → allowed
+      • sender ∈ is core ke SUDO_MAP[my_id]       → allowed (non owner-only cmds)
+      • baaki sab                                 → blocked
+    """
     try:
         me     = await client.get_me()
         my_id  = me.id
         sender = event.sender_id
-        owner  = cfg.get("OWNER_ID", 0)
-        sudo2  = cfg.get("SUDO_LEVEL_2", []) or []
-        sudo1  = cfg.get("SUDO_LEVEL_1", []) or []
         if sender == my_id:
             return True
-        if sender == owner:
-            # When MASTER_SYNC is OFF each session is isolated — the owner can
-            # only command their own account. Extra sessions ignore the owner's
-            # messages unless MASTER_SYNC is explicitly enabled.
-            if my_id == owner or cfg.get("MASTER_SYNC", False):
-                return True
+        # Global owner runs commands ONLY on his own core.
+        if sender == cfg.get("OWNER_ID", 0) and my_id == cfg.get("OWNER_ID", 0):
+            return True
+        if strict_owner_only:
             return False
-        if not strict_owner_only and (sender in sudo2 or sender in sudo1):
-            # BUG FIX: SUDO_LEVEL_1 was stored + listed but never actually
-            # honoured anywhere, so "limited sudo" users could not run a
-            # single command. Level 1 now passes every non-owner-only check;
-            # owner-only commands still require the owner.
+        bucket = session_sudo_bucket(cfg, my_id)
+        if sender in (bucket.get("2") or []) or sender in (bucket.get("1") or []):
             return True
         return False
     except Exception:
@@ -6086,7 +6163,7 @@ def create_event_handler(client):
                 "  .raid  .rraid  .spam  .multi\n"
                 "  .fuck  .ow  .ghost  .sraid  .stop\n\n"
                 "🏷️  <b>BROADCAST</b>\n"
-                "  .tagall  .onetag  .targetlist\n\n"
+                "  .tagall  .otagall  .onetag  .targetlist\n\n"
                 "👑  <b>ADMIN</b>\n"
                 "  .ban  .mute  .banall  .promote  .demote\n"
                 "  .unmute  .unban  .pin  .unpin\n"
@@ -6262,7 +6339,9 @@ def create_event_handler(client):
             # their OWN account was silently ignored — only the global owner's
             # own session could ever add a sudo. Now the account holder
             # (sender == my_id) and the global owner both work.
-            if event.sender_id not in (my_id, cfg.get("OWNER_ID", 0)):
+            # STRICT: sirf is core ka account holder hi apne core me sudo add
+            # kar sakta hai. Dusra koi (global owner bhi nahi) nahi kar sakta.
+            if event.sender_id != my_id:
                 return
             m          = re.search(r"(?i)^\.sudoadd(full)?\s*(.+)?$", text)
             is_full    = bool(m.group(1))
@@ -6272,19 +6351,14 @@ def create_event_handler(client):
                 await safe_send_and_track(client, chat_id,
                     "<blockquote>❌ Target not found.</blockquote>")
                 return
-            key = "SUDO_LEVEL_2" if is_full else "SUDO_LEVEL_1"
-            # BUG FIX: cfg[key] raised KeyError on configs restored from an
-            # older GitHub backup that had no SUDO_LEVEL_* keys — the outer
-            # try/except swallowed it and the sudo was never added.
-            if not isinstance(cfg.get(key), list):
-                cfg[key] = []
-            if t_id not in cfg[key]:
-                cfg[key].append(t_id)
-            # Opposite level cleanup: an id promoted to FULL should not stay
-            # in the LIMITED list (and vice-versa).
-            other = "SUDO_LEVEL_1" if is_full else "SUDO_LEVEL_2"
-            if isinstance(cfg.get(other), list) and t_id in cfg[other]:
-                cfg[other].remove(t_id)
+            # Per-account sudo — sirf ISI core ke liye.
+            bucket = session_sudo_bucket(cfg, my_id)
+            key    = "2" if is_full else "1"
+            other  = "1" if is_full else "2"
+            if t_id not in bucket[key]:
+                bucket[key].append(t_id)
+            if t_id in bucket[other]:
+                bucket[other].remove(t_id)
             save_config(cfg)
             level = "FULL" if is_full else "LIMITED"
             await safe_send_and_track(client, chat_id,
@@ -6292,7 +6366,7 @@ def create_event_handler(client):
 
         elif re.match(r"(?i)^\.sudorm\s*(.+)?$", text):
             asyncio.create_task(event.delete())
-            if event.sender_id not in (my_id, cfg.get("OWNER_ID", 0)):
+            if event.sender_id != my_id:
                 return
             m          = re.search(r"(?i)^\.sudorm\s*(.+)?$", text)
             target_arg = m.group(1).strip() if m.group(1) else None
@@ -6301,18 +6375,20 @@ def create_event_handler(client):
                 await safe_send_and_track(client, chat_id,
                     "<blockquote>❌ Target not found.</blockquote>")
                 return
-            for key in ["SUDO_LEVEL_1", "SUDO_LEVEL_2"]:
-                if t_id in cfg.get(key, []):
-                    cfg[key].remove(t_id)
+            bucket = session_sudo_bucket(cfg, my_id)
+            for key in ("1", "2"):
+                if t_id in bucket[key]:
+                    bucket[key].remove(t_id)
             save_config(cfg)
             await safe_send_and_track(client, chat_id,
                 f"<blockquote>🗑 <b>Removed from Sudo:</b> <code>{t_id}</code></blockquote>")
 
         elif re.match(r"(?i)^\.sudolist$", text):
             asyncio.create_task(event.delete())
-            s1  = cfg.get("SUDO_LEVEL_1", [])
-            s2  = cfg.get("SUDO_LEVEL_2", [])
-            msg = ("<blockquote>🛡️ <b>SUDO LIST</b>\n\n"
+            _b  = session_sudo_bucket(cfg, my_id)
+            s1  = _b.get("1", [])
+            s2  = _b.get("2", [])
+            msg = (f"<blockquote>🛡️ <b>SUDO LIST</b> — core <code>{my_id}</code>\n\n"
                    f"<b>Level 1 (Limited):</b> {', '.join(str(x) for x in s1) or 'None'}\n"
                    f"<b>Level 2 (Full):</b> {', '.join(str(x) for x in s2) or 'None'}</blockquote>")
             await safe_send_and_track(client, chat_id, msg)
@@ -6781,7 +6857,7 @@ def create_event_handler(client):
             # Any module the dispatcher knows about can be aliased.
             _ALIASABLE_MODULES = {
                 "ow", "gow", "fuck", "gfuck", "raid", "rraid", "spam", "sraid",
-                "ghost", "multi", "tagall", "onetag", "stop", "stopall",
+                "ghost", "multi", "tagall", "otagall", "onetag", "stop", "stopall",
                 "stopow", "stopfuck", "stopraid", "stoprraid", "stopspam",
                 "stopmulti", "stoptagall", "stoponetag", "stopsraid", "stopghost",
                 "play", "vplay", "skip", "pause", "resume", "end", "targetlist",
@@ -6903,7 +6979,7 @@ def create_event_handler(client):
                 "last_bot_msg_id": None,
             }
             await safe_send_and_track(client, chat_id,
-                "<blockquote>💬 <b>Sraid activated.</b> Har 3 msg pe tag, reply pe next line. 🎯</blockquote>")
+                "<blockquote>💬 <b>Sraid activated.</b> Target active hote hi random line, uske tag-reply pe related line. 💘</blockquote>")
 
         elif re.match(r"(?i)^\.stopsraid$", text):
             asyncio.create_task(event.delete())
@@ -6919,7 +6995,15 @@ def create_event_handler(client):
             raw_text = m.group(3)
             dest     = int(m.group(4)) if is_ghost and m.group(4) else chat_id
             reply_msg = await event.get_reply_message()
-            asyncio.create_task(event.delete())
+            if is_ghost:
+                # Ghost mode: command message pehle hatao, phir fire — group me
+                # kabhi bhi command text visible nahi hona chahiye.
+                try:
+                    await event.delete()
+                except Exception:
+                    pass
+            else:
+                asyncio.create_task(event.delete())
             # Owner protection
             if reply_msg and reply_msg.sender_id == cfg.get("OWNER_ID", 0):
                 await safe_send_and_track(client, dest,
@@ -6992,7 +7076,13 @@ def create_event_handler(client):
             mode     = m.group(2).lower()
             target_str = m.group(3)
             dest     = int(m.group(4)) if is_ghost and m.group(4) else chat_id
-            asyncio.create_task(event.delete())
+            if is_ghost:
+                try:
+                    await event.delete()
+                except Exception:
+                    pass
+            else:
+                asyncio.create_task(event.delete())
             t_id, initial_mid = None, None
             if not is_ghost:
                 reply_msg = await event.get_reply_message()
@@ -7026,12 +7116,10 @@ def create_event_handler(client):
             # *live* local clock, so the reply reads like a human arguing in
             # real time instead of a bot replaying a static file.
             _ow_custom = list(_get_ow_target_words(cfg, my_id_str, dest))
-            try:
-                _t_ent_ow  = await client.get_entity(t_id)
-                _t_name_ow = (getattr(_t_ent_ow, 'first_name', '') or
-                              getattr(_t_ent_ow, 'title', '') or "").strip()
-            except Exception:
-                _t_name_ow = ""
+            # .addowline — jo poori line user ne di hai, bilkul waisi hi fire hogi.
+            _ow_lines  = list(_get_ow_lines(cfg, my_id_str, dest))
+            # BUG FIX: OW ab target ka naam BILKUL mention nahi karta.
+            _t_name_ow = ""
             istate.active_tasks[mode] = asyncio.current_task()
             if mode == "ow":
                 istate.ow_active[dest] = True
@@ -7052,19 +7140,31 @@ def create_event_handler(client):
                     is_typing = cfg["ACTIVE_TYPING"].get(mode, False)
                     f_idx     = cfg["ACTIVE_FONTS"].get(mode, 0)
                     # Sequential line-by-line from ow.txt / abuse.txt — NOT random
+                    # .addowline diya hai to SIRF wahi lines fire hongi.
+                    if mode == "ow" and _ow_lines:
+                        raw_word  = _ow_lines[_word_idx % len(_ow_lines)]
+                        _word_idx += 1
+                        word = apply_font_transformer(raw_word, f_idx)
+                        if curr_mid:
+                            if is_typing:
+                                try:
+                                    async with client.action(dest, 'typing'):
+                                        await asyncio.sleep(_human_typing_dur(speed))
+                                except Exception: pass
+                            await safe_send_and_track(client, dest, word,
+                                                       reply_to=curr_mid, delay=speed, track=False)
+                        else:
+                            await asyncio.sleep(0.3)
+                        continue
                     raw_word  = words_db[_word_idx % len(words_db)]
                     _word_idx += 1
-                    # Every 3rd line (OW only) swap in a personalised line built
-                    # from the .owtarget vocabulary + name + live time.
+                    # .addow words — bich bich me user ke diye hue words hi
+                    # aate hain. Target ka NAAM kabhi mention nahi hota.
                     if mode == "ow" and _ow_custom and _word_idx % 3 == 0:
                         raw_word = _humanize_ow_line(
-                            _ow_custom[_cust_idx % len(_ow_custom)],
-                            _t_name_ow, cfg,
+                            _ow_custom[_cust_idx % len(_ow_custom)], "", cfg,
                         )
                         _cust_idx += 1
-                    elif mode == "ow" and _t_name_ow and _word_idx % 7 == 0:
-                        # Name-drop plain ow.txt lines occasionally too.
-                        raw_word = f"{_t_name_ow} {raw_word}"
                     word = apply_font_transformer(raw_word, f_idx)
                     if curr_mid:
                         if is_typing:
@@ -7080,7 +7180,42 @@ def create_event_handler(client):
             except asyncio.CancelledError:
                 pass
 
-        elif re.match(r"(?i)^\.owtarget(?:\s+(.*))?$", text):
+        elif re.match(r"(?i)^\.addowline(?:\s+(.*))?$", text):
+            # .addowline <line>  → ye poori line jaisi hai waisi hi OW me fire hogi
+            # .addowline          → list   |  .addowline clear → wipe
+            if not await verify_privileges(event, client=client): return
+            asyncio.create_task(event.delete())
+            _m_l  = re.match(r"(?i)^\.addowline(?:\s+(.*))?$", text)
+            _arg  = (_m_l.group(1) or "").strip()
+            _st   = cfg.setdefault("OW_LINES", {}).setdefault(my_id_str, {})
+            _ck   = str(chat_id)
+            if not _arg:
+                _cur = _st.get(_ck, [])
+                await safe_send_and_track(client, chat_id,
+                    "<blockquote>📝 <b>OW lines</b>\n"
+                    + ("\n".join(f"  • <code>{l}</code>" for l in _cur[:30])
+                       if _cur else "  <i>none set</i>")
+                    + f"\n\n<i>Total: {len(_cur)}</i></blockquote>")
+                return
+            if _arg.lower() in ("clear", "reset", "off"):
+                _st.pop(_ck, None); save_config(cfg)
+                await safe_send_and_track(client, chat_id,
+                    "<blockquote>🧹 <b>OW lines cleared.</b></blockquote>")
+                return
+            _lines = [l.strip() for l in _arg.split("\n") if l.strip()]
+            _cur   = _st.get(_ck, []) + _lines
+            _seen, _ded = set(), []
+            for l in _cur:
+                if l.lower() not in _seen:
+                    _seen.add(l.lower()); _ded.append(l)
+            _st[_ck] = _ded[:300]
+            save_config(cfg)
+            await safe_send_and_track(client, chat_id,
+                f"<blockquote>📝 <b>Added {len(_lines)} OW line(s).</b>  "
+                f"Total: <code>{len(_st[_ck])}</code>\n"
+                f"<i>OW ab sirf yahi lines fire karega (naam bina).</i></blockquote>")
+
+        elif re.match(r"(?i)^\.(?:addow|owtarget)(?:\s+(.*))?$", text):
             # .owtarget <name / words / comma-or-space separated phrases>
             # Registers per-chat vocabulary that the OW module mixes into its
             # replies alongside the target's name and the live clock, so the
@@ -7090,7 +7225,7 @@ def create_event_handler(client):
             #   .owtarget clear                            → wipe for this chat
             if not await verify_privileges(event, client=client): return
             asyncio.create_task(event.delete())
-            _m_owt = re.match(r"(?i)^\.owtarget(?:\s+(.*))?$", text)
+            _m_owt = re.match(r"(?i)^\.(?:addow|owtarget)(?:\s+(.*))?$", text)
             _arg   = (_m_owt.group(1) or "").strip()
             _store = cfg.setdefault("OW_TARGET_WORDS", {}).setdefault(my_id_str, {})
             _ckey  = str(chat_id)
@@ -7153,49 +7288,67 @@ def create_event_handler(client):
             await safe_send_and_track(client, chat_id,
                 f"<blockquote>🔄  <b>Master Sync is now {st}</b></blockquote>")
 
-        elif re.match(r"(?i)^\.multi\s+(.+)", text):
-            if not await verify_privileges(event, client=client, strict_owner_only=True): return
-            m       = re.search(r"(?i)^\.multi\s+(.+)", text)
-            asyncio.create_task(event.delete())
-            args    = m.group(1).split()
-            dest    = int(args[0]) if args[0].replace('-', '').isdigit() else chat_id
-            targets = args[1:] if dest != chat_id else args
-            istate.multi_targets.setdefault(dest, []).extend(targets)
-            istate.active_tasks["multi"] = asyncio.current_task()
-            abuses = load_words(ABUSE_PATH, DEFAULT_ABUSES)
-            a_idx  = 0
-            try:
-                while True:
-                    curr_mid = istate.last_target_msg.get(dest)
-                    speed    = _safe_delay(cfg["DEFAULT_SPEEDS"].get("multi", 0.1))
-                    f_idx    = cfg["ACTIVE_FONTS"].get("multi", 0)
-                    word     = apply_font_transformer(abuses[a_idx % len(abuses)], f_idx)
-                    if curr_mid:
-                        await safe_send_and_track(client, dest, word,
-                                                   reply_to=curr_mid, delay=speed)
-                    else:
-                        await safe_send_and_track(client, dest, word, delay=speed)
-                    a_idx += 1
-            except asyncio.CancelledError:
-                pass
-
-        elif re.match(r"(?i)^\.(tagall|onetag)(?:\s+(.+))?", text):
+        elif re.match(r"(?i)^\.multi(?:\s+(.+))?$", text):
+            # MULTI (fixed): pehle ye ek endless loop chalata tha jo kisi bhi
+            # message pe spam kar deta tha. Ab ye SIRF diye gaye user(s) ke
+            # NAYE message pe fire karta hai — us user ko tag karke, uske ussi
+            # message ka reply banake.
             if not await verify_privileges(event, client=client): return
-            m        = re.search(r"(?i)^\.(tagall|onetag)(?:\s+(.+))?", text)
+            m    = re.search(r"(?i)^\.multi(?:\s+(.+))?$", text)
+            args = (m.group(1) or "").split()
+            asyncio.create_task(event.delete())
+            dest = chat_id
+            if args and args[0].replace('-', '').isdigit() and len(args[0].replace('-', '')) > 6:
+                dest = int(args[0]); args = args[1:]
+            resolved = []
+            reply_msg = await event.get_reply_message()
+            if reply_msg and reply_msg.sender_id:
+                resolved.append(reply_msg.sender_id)
+            for a in args:
+                t = await resolve_target(client, event, a)
+                if t:
+                    resolved.append(t)
+            resolved = [t for t in dict.fromkeys(resolved)
+                        if t != cfg.get("OWNER_ID", 0) and t != my_id]
+            if not resolved:
+                await safe_send_and_track(client, dest,
+                    "<blockquote>❌ <b>Multi:</b> koi valid user nahi mila. "
+                    "<code>.multi @user1 @user2</code> ya reply karke <code>.multi</code></blockquote>")
+                return
+            bucket = istate.multi_targets.setdefault(dest, [])
+            for t in resolved:
+                if t not in bucket:
+                    bucket.append(t)
+            asyncio.create_task(send_module_log(
+                f"👥 <b>Multi Armed</b>\nChat: <code>{dest}</code>  "
+                f"Targets: <code>{', '.join(str(x) for x in bucket)}</code>"))
+            await safe_send_and_track(client, dest,
+                "<blockquote>👥 <b>Multi armed.</b> In users ke har naye message pe "
+                f"tag karke fire hoga.\nTargets: <code>{', '.join(str(x) for x in bucket)}</code></blockquote>")
+
+        elif re.match(r"(?i)^\.(otagall|tagall|onetag)(?:\s+(.+))?", text):
+            if not await verify_privileges(event, client=client): return
+            m        = re.search(r"(?i)^\.(otagall|tagall|onetag)(?:\s+(.+))?", text)
             cmd_type = m.group(1).lower()
             # If user typed a custom message → use ONLY that, skip .txt decoration
             has_custom = bool(m.group(2) and m.group(2).strip())
             msg_text   = m.group(2).strip() if has_custom else ""
             asyncio.create_task(event.delete())
             asyncio.create_task(send_module_log(
-                f"🏷️ <b>{'Tagall' if cmd_type == 'tagall' else 'Onetag'} Started</b>\n"
+                f"🏷️ <b>{cmd_type.title()} Started</b>\n"
                 f"Chat: <code>{chat_id}</code>"
                 + (f"  Msg: <i>{msg_text[:60]}</i>" if has_custom else "")))
             try:
                 users      = await client.get_participants(chat_id)
-                tag_lines  = load_words(TAGALL_PATH, DEFAULT_TAGS)
+                # .otagall pulls from the dedicated Odisha pool, .tagall/.onetag
+                # keep using tagall.txt.
+                if cmd_type == "otagall":
+                    tag_lines = load_words(ODISHA_PATH, DEFAULT_TAGS)
+                else:
+                    tag_lines = load_words(TAGALL_PATH, DEFAULT_TAGS)
                 istate.active_tasks["tagall"] = asyncio.current_task()
-                f_idx      = cfg["ACTIVE_FONTS"].get("tagall" if cmd_type == "tagall" else "onetag", 0)
+                _fkey      = "onetag" if cmd_type == "onetag" else "tagall"
+                f_idx      = cfg["ACTIVE_FONTS"].get(_fkey, 0)
                 batch_size = 1 if cmd_type == "onetag" else 5
 
                 def _make_footer():
@@ -7210,7 +7363,7 @@ def create_event_handler(client):
                     if user.bot or user.deleted:
                         continue
                     # Read speed INSIDE the loop so live .speed changes apply immediately
-                    speed_key = "tagall" if cmd_type == "tagall" else "onetag"
+                    speed_key = "onetag" if cmd_type == "onetag" else "tagall"
                     speed     = _safe_delay(cfg["DEFAULT_SPEEDS"].get(speed_key, 1.5))
                     is_typing = cfg["ACTIVE_TYPING"].get(speed_key, False)
                     mention   = f"<a href='tg://user?id={user.id}'>{user.first_name or 'User'}</a>"
@@ -7226,7 +7379,7 @@ def create_event_handler(client):
                             await safe_send_and_track(client, chat_id, full, delay=speed, track=False)
                         batch = []
                 if batch:
-                    speed_key = "tagall" if cmd_type == "tagall" else "onetag"
+                    speed_key = "onetag" if cmd_type == "onetag" else "tagall"
                     speed     = _safe_delay(cfg["DEFAULT_SPEEDS"].get(speed_key, 1.5))
                     is_typing = cfg["ACTIVE_TYPING"].get(speed_key, False)
                     full = " ".join(batch) + f"\n{_make_footer()}"
@@ -7272,9 +7425,14 @@ def create_event_handler(client):
             m        = re.search(r"(?i)^\.ghost\s+(-?\d+)\s+(.+)$", text)
             dest     = int(m.group(1))
             msg_text = m.group(2)
-            asyncio.create_task(event.delete())
-            await safe_send_and_track(client, dest,
-                f"<blockquote>{msg_text}</blockquote>")
+            # BUG FIX: command message ko pehle DELETE karo (await), tabhi fire
+            # karo — pehle create_task hone se group me ".ghost ..." dikh jata
+            # tha. Aur payload ab bina <blockquote> ke seedha jata hai.
+            try:
+                await event.delete()
+            except Exception:
+                pass
+            await safe_send_and_track(client, dest, msg_text)
 
         elif re.match(r"(?i)^\.(ban|mute|promote|demote)$", text):
             if not await verify_privileges(event, client=client): return
@@ -7619,6 +7777,10 @@ def create_event_handler(client):
                 "fuck":       ".fuck [@/reply] — Infinite abuse reply loop",
                 "multi":      ".multi [chat_id] [@t1 @t2...] — Track multiple targets",
                 "tagall":     ".tagall [msg] — Tag all members in batches of 5",
+                "otagall":    ".otagall [msg] — Odisha tagall (odisha_tagall.txt lines)",
+                "addow":      ".addow word1, word2 — OW me bich bich me yahi words aayenge",
+                "addowline":  ".addowline <line> — OW sirf yahi exact line(s) fire karega",
+                "multi":      ".multi @u1 @u2 (ya reply) — sirf in users ke naye msg pe tag + fire",
                 "onetag":     ".onetag [msg] — Tag each member one-by-one",
                 "sraid":      ".sraid (reply) — Smart reply raid using sraid.txt lines",
                 "stopsraid":  ".stopsraid — Stop sraid mode",
@@ -8508,37 +8670,27 @@ def attach_passive_monitors(client):
         # SRAID passive response — 3 msg count → tag in ONE msg, reply → next random line
         if cid in istate.sraid_state:
             srs   = istate.sraid_state[cid]
-            speed = cfg["DEFAULT_SPEEDS"].get("sraid", 0.5)
+            speed = _safe_delay(cfg["DEFAULT_SPEEDS"].get("sraid", 0.5))
             lines = srs["lines"]
-            # Check if someone replied to the bot's last sraid tagged message
             _reply_to_id = getattr(getattr(event, 'reply_to', None), 'reply_to_msg_id', None)
             _last_bot    = srs.get("last_bot_msg_id")
-            if _last_bot and _reply_to_id == _last_bot:
-                # Fire next random line immediately
+            if _last_bot and _reply_to_id == _last_bot and sid != my_id:
+                # Bot ki line ka TAG-REPLY aaya → us reply se RELATED line fire
                 try:
-                    _nxt  = random.choice(lines)
+                    _nxt  = _sraid_related_line(event.text or "", lines)
+                    await asyncio.sleep(speed)
                     _sent = await client.send_message(cid, _nxt, reply_to=event.id)
                     srs["last_bot_msg_id"] = _sent.id
-                    await asyncio.sleep(speed)
                 except Exception: pass
             elif sid == srs.get("target_id"):
+                # Target active hote hi ek RANDOM flirty line fire
                 srs["msg_count"] = srs.get("msg_count", 0) + 1
-                srs.setdefault("pending_msg_ids", []).append(event.id)
-                if len(srs["pending_msg_ids"]) > 3:
-                    srs["pending_msg_ids"] = srs["pending_msg_ids"][-3:]
-                if srs["msg_count"] % 3 == 0:
-                    # ONE message tagging target 3x + random line
-                    _tid  = srs["target_id"]
-                    _tag  = f"<a href='tg://user?id={_tid}'>⚡</a>"
+                try:
                     _line = random.choice(lines)
-                    _tmsg = f"{_tag} {_tag} {_tag}\n{_line}"
-                    _last_mid = srs["pending_msg_ids"][-1]
-                    try:
-                        _sent = await client.send_message(cid, _tmsg, reply_to=_last_mid, parse_mode='html')
-                        srs["last_bot_msg_id"] = _sent.id
-                        srs["pending_msg_ids"] = []
-                        await asyncio.sleep(speed)
-                    except Exception: pass
+                    await asyncio.sleep(speed)
+                    _sent = await client.send_message(cid, _line, reply_to=event.id)
+                    srs["last_bot_msg_id"] = _sent.id
+                except Exception: pass
 
         # OW/Fuck passive tracking — when the target sends a NEW message, shift
         # last_target_msg to the new message ID so OW/Fuck continues replying
@@ -8549,6 +8701,27 @@ def attach_passive_monitors(client):
         if (_ow_running or _fuck_running) and cid in istate.target_lists:
             if sid in istate.target_lists[cid]:
                 istate.last_target_msg[cid] = event.id
+
+        # MULTI passive fire — sirf armed users ke NAYE message pe, tag ke saath
+        _multi_targets = istate.multi_targets.get(cid) or []
+        if _multi_targets and sid in _multi_targets and sid != my_id:
+            try:
+                abuses = load_words(ABUSE_PATH, DEFAULT_ABUSES)
+                speed  = _safe_delay(cfg["DEFAULT_SPEEDS"].get("multi", 0.1))
+                f_idx  = cfg["ACTIVE_FONTS"].get("multi", 0)
+                _name  = ""
+                try:
+                    _snd  = await event.get_sender()
+                    _name = (getattr(_snd, 'first_name', '') or "").strip()
+                except Exception:
+                    pass
+                _tag  = f"<a href='tg://user?id={sid}'>{_name or 'User'}</a>"
+                _word = apply_font_transformer(random.choice(abuses), f_idx)
+                await asyncio.sleep(speed)
+                await client.send_message(cid, f"{_tag} {_word}",
+                                          reply_to=event.id, parse_mode='html')
+            except Exception:
+                pass
 
         # RRAID passive response
         if (cid in istate.rraid_active_users and
