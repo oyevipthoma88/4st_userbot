@@ -38,16 +38,13 @@ REQUIRED_FIELDS = [
     ("TELEGRAM_PRIMARY_SESSION","Telethon session string (userbot)",            "", True),
 ]
 
+# Termux me GitHub backup ki zaroorat nahi (data local hi rehta hai),
+# isliye GITHUB_* values bilkul nahi poochhi jaatin.
 OPTIONAL_FIELDS = [
-    ("TELEGRAM_OWNER_ID",       "Your numeric user ID",                         "", False),
-    ("TELEGRAM_OWNER_USERNAME", "Your username (without @)",                    "", False),
-    ("TELEGRAM_LOG_CHANNEL_ID", "Log channel ID (-100...)",                     "", False),
-    ("TELEGRAM_HELP_LINK",      "Support link",                                 "", False),
-    ("GEMINI_API_KEY",          "Gemini API key (AI features)",                 "", False),
-    ("GITHUB_TOKEN",            "GitHub PAT for data backup",                   "", False),
-    ("GITHUB_REPO",             "GitHub backup repo (user/repo)",               "", False),
-    ("GITHUB_BRANCH",           "GitHub backup branch",                     "main", False),
-    ("GITHUB_DATA_PATH",        "GitHub backup file path",     "data/config.json", False),
+    ("TELEGRAM_OWNER_ID",       "Your numeric user ID",   "", False),
+    ("TELEGRAM_OWNER_USERNAME", "Your username (no @)",   "", False),
+    ("TELEGRAM_LOG_CHANNEL_ID", "Log channel ID (-100…)", "", False),
+    ("GEMINI_API_KEY",          "Gemini API key (AI)",    "", False),
 ]
 
 
