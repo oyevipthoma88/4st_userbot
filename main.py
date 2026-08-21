@@ -14,6 +14,17 @@ from datetime import timedelta, timezone
 import warnings
 warnings.filterwarnings("ignore", category=FutureWarning, module="google")
 
+# ── Termux (Android) support ────────────────────────────────────────────────
+# On Termux: first run asks for every env value interactively and writes .env;
+# the music / voice-chat engine (pyrogram + pytgcalls) is skipped completely
+# because its native deps cannot be built there.
+import termux_env as _termux_env
+IS_TERMUX = _termux_env.bootstrap()
+MUSIC_ENABLED = not IS_TERMUX
+if IS_TERMUX:
+    print("[TERMUX] Termux mode ON — music / voice-chat features disabled.")
+# ─────────────────────────────────────────────────────────────────────────────
+
 # ── ffmpeg / ffprobe resolution ─────────────────────────────────────────────
 # FIX ("Postprocessing: ffprobe and ffmpeg not found"): detection used to
 # accept ffmpeg and ffprobe found in *different* places, then pass
@@ -27,7 +38,10 @@ from ffmpeg_setup import (
 )
 import ffmpeg_setup as _ffsetup
 
-_ensure_ffmpeg()
+try:
+    _ensure_ffmpeg()
+except Exception as _ff_err:  # Termux / restricted env
+    print(f"[WARN] ffmpeg setup skipped: {_ff_err}")
 _FFMPEG_BIN  = _ffsetup.FFMPEG_BIN
 _FFPROBE_BIN = _ffsetup.FFPROBE_BIN
 _FFMPEG_DIR  = _ffsetup.FFMPEG_DIR
@@ -62,6 +76,8 @@ pyro_apps: dict = {}         # {user_id_int: PyroClient}
 pytgcalls_apps: dict = {}    # {user_id_int: PyTgCalls}
 
 try:
+    if IS_TERMUX:
+        raise ImportError("Termux mode: music engine disabled")
     from pyrogram import Client as PyroClient
     from pyrogram.errors import (
         SessionPasswordNeeded, PhoneCodeInvalid, PhoneCodeExpired,
@@ -73,6 +89,8 @@ except ImportError:
     pass
 
 try:
+    if IS_TERMUX:
+        raise ImportError("Termux mode: music engine disabled")
     from pytgcalls import PyTgCalls
     from pytgcalls import filters as pytgcalls_filters
     from pytgcalls.types import MediaStream, AudioQuality, VideoQuality
@@ -8966,8 +8984,8 @@ async def main():
         save_config(cfg)
         bot_logger("BOOT", "Migrated name/username history from config → data/tracks/")
     bot_logger("BOOT", f"yt-dlp:    {'✅' if YTDLP_AVAILABLE    else '❌ (pip install yt-dlp)'}")
-    bot_logger("BOOT", f"Pyrogram:  {'✅' if PYRO_AVAILABLE     else '❌ (pip install pyrogram tgcrypto)'}")
-    bot_logger("BOOT", f"PyTgCalls: {'✅' if PYTGCALLS_AVAILABLE else '❌ (pip install py-tgcalls)'}")
+    bot_logger("BOOT", f"Pyrogram:  {'✅' if PYRO_AVAILABLE     else ('⏭️ skipped (Termux mode)' if IS_TERMUX else '❌ (pip install pyrogram tgcrypto)')}")
+    bot_logger("BOOT", f"PyTgCalls: {'✅' if PYTGCALLS_AVAILABLE else ('⏭️ skipped (Termux mode)' if IS_TERMUX else '❌ (pip install py-tgcalls)')}")
     asyncio.create_task(background_cleanup_task())
 
     # Start assistant bot
