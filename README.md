@@ -88,7 +88,7 @@ See [`plugins/README.md`](plugins/README.md) for full docs and the API reference
 
 ### Deploy to Heroku
 
-[![Deploy](https://www.herokucdn.com/deploy/button.svg)](https://heroku.com/deploy?template=https://github.com/thomas82822/4st_userbot)
+[![Deploy to Heroku](https://www.herokucdn.com/deploy/button.svg)](https://heroku.com/deploy?template=https://github.com/oyevipthoma88/4st_userbot)
 
 ### Environment Variables
 
