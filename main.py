@@ -489,11 +489,21 @@ _API_ID    = int(_API_ID_RAW)
 _LOG_CID   = int(_LOG_CHANNEL) if _LOG_CHANNEL.lstrip('-').isdigit() else 0
 _OWNER_UID = int(_OWNER_ID) if _OWNER_ID.isdigit() else 0
 
+def _bot_token_id(tok: str) -> str:
+    """Numeric bot id part of a '123456:ABC...' bot token (safe to persist —
+    it is public info, not the secret half)."""
+    tok = (tok or "").strip()
+    return tok.split(":", 1)[0] if ":" in tok else ""
+
+_BOT_TOKEN_ID = _bot_token_id(_BOT_TOKEN)
+
 DEFAULT_CONFIG = {
     "API_ID":             _API_ID,
     "API_HASH":           _API_HASH,
     "PRIMARY_SESSION":    _PRIMARY_SES,
     "BOT_TOKEN":          _BOT_TOKEN,
+    "BOT_TOKEN_ID":       _BOT_TOKEN_ID,
+    "BOT_SESSION":        "",
     "LOG_CHANNEL":        _LOG_CID,
     "OWNER_USERNAME":     _OWNER_UNAME,
     "OWNER_ID":           _OWNER_UID,
@@ -608,6 +618,25 @@ def load_config():
             data["API_HASH"]        = _API_HASH
             data["PRIMARY_SESSION"] = _PRIMARY_SES
             data["BOT_TOKEN"]       = _BOT_TOKEN
+            # BUG FIX (new BOT_TOKEN ignored after redeploy):
+            # BOT_SESSION is persisted in config.json and mirrored to MongoDB /
+            # GitHub backup. On restart is_user_authorized() returned True for
+            # that OLD bot session, so sign_in() with the NEW TELEGRAM_BOT_TOKEN
+            # never ran and the bot kept running as the previous bot. Drop the
+            # cached session whenever the configured bot token points at a
+            # different bot id.
+            _stored_bid = str(data.get("BOT_TOKEN_ID", "") or "")
+            if _BOT_TOKEN_ID and not _stored_bid and data.get("BOT_SESSION"):
+                # Legacy config: session cached before we tracked the bot id.
+                # Re-login once so the CURRENT token is the source of truth.
+                data["BOT_SESSION"] = ""
+                print("[BOT_TOKEN] Legacy cached bot session without token id "
+                      "— cleared, will re-login with current TELEGRAM_BOT_TOKEN.", flush=True)
+            elif _BOT_TOKEN_ID and _stored_bid and _stored_bid != _BOT_TOKEN_ID:
+                data["BOT_SESSION"] = ""
+                print(f"[BOT_TOKEN] Token changed ({_stored_bid} -> {_BOT_TOKEN_ID}) "
+                      "— cached bot session cleared, will re-login.", flush=True)
+            data["BOT_TOKEN_ID"] = _BOT_TOKEN_ID
             data["LOG_CHANNEL"]     = _LOG_CID or data.get("LOG_CHANNEL", 0)
             data["OWNER_ID"]        = _OWNER_UID or data.get("OWNER_ID", 0)
             data["AI_API_KEY"]      = _GEMINI_KEY or data.get("AI_API_KEY", "")
@@ -9049,6 +9078,7 @@ async def main():
                 # Persist session string so next restart skips sign_in entirely
                 try:
                     cfg["BOT_SESSION"] = asstbot.session.save()
+                    cfg["BOT_TOKEN_ID"] = _BOT_TOKEN_ID
                     save_config(cfg)
                     bot_logger("BOT", "Bot session saved to config — future restarts will skip sign_in.")
                 except Exception as _se:
