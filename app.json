@@ -10,11 +10,11 @@
     "telethon",
     "pytgcalls"
   ],
-  "stack": "heroku-22",
+  "stack": "heroku-26",
   "formation": {
     "worker": {
       "quantity": 1,
-      "size": "standard-2"
+      "size": "standard-2x"
     }
   },
   "env": {
