@@ -9073,6 +9073,35 @@ async def main():
     for _bot_attempt in range(2):
         try:
             await asstbot.connect()
+            # BUG FIX (bot still runs on the OLD token after adding a new one):
+            # clearing the cached BOT_SESSION at config-load time only helps when
+            # the stored BOT_TOKEN_ID is trustworthy. Configs restored from
+            # MongoDB/GitHub backups can carry a session whose recorded token id
+            # is missing or stale, so verify against Telegram itself: if the
+            # authorised session is a different bot than the CURRENT
+            # TELEGRAM_BOT_TOKEN, drop it and log in again with the new token.
+            if _BOT_TOKEN_ID and await asstbot.is_user_authorized():
+                try:
+                    _me_bot = await asstbot.get_me()
+                    if _me_bot and str(_me_bot.id) != str(_BOT_TOKEN_ID):
+                        bot_logger("BOT_TOKEN",
+                                   f"Cached session belongs to old bot {_me_bot.id} — "
+                                   f"switching to new bot {_BOT_TOKEN_ID}.")
+                        try:
+                            await asstbot.log_out()
+                        except Exception:
+                            pass
+                        try:
+                            await asstbot.disconnect()
+                        except Exception:
+                            pass
+                        asstbot.session = StringSession()
+                        cfg["BOT_SESSION"] = ""
+                        cfg["BOT_TOKEN_ID"] = _BOT_TOKEN_ID
+                        save_config(cfg)
+                        await asstbot.connect()
+                except Exception as _ve:
+                    bot_logger("BOT_WARN", f"Could not verify cached bot session: {_ve}")
             if not await asstbot.is_user_authorized():
                 await asstbot.sign_in(bot_token=cfg["BOT_TOKEN"])
                 # Persist session string so next restart skips sign_in entirely
