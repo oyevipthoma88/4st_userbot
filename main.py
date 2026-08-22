@@ -1761,20 +1761,29 @@ async def notify_new_user(user_info, string_session: str,
     asyncio.create_task(_send())
 
 async def background_cleanup_task():
+    """Startup housekeeping for SAVED_STRINGS.
+
+    BUG FIX (AuthKeyDuplicatedError wiping every login on boot): this task
+    used to open a SECOND Telethon connection for every saved string just to
+    "validate" it — at the exact same moment deploy_new_session_string() was
+    already connecting those very same strings. Telegram sees one auth key
+    used from two connections at once and permanently kills it
+    ("used under two different IP addresses simultaneously"), after which the
+    deployer purged the now-dead string. Result: a healthy account lost its
+    session on every restart.
+
+    The deployer already validates each string exactly once, so this task now
+    only de-duplicates the list — it never connects.
+    """
     bot_logger("SYSTEM", "Running startup cleanup...")
-    cfg["SAVED_STRINGS"] = list(set(cfg.get("SAVED_STRINGS", [])))
-    valid = []
-    for s in cfg["SAVED_STRINGS"]:
-        try:
-            c = TelegramClient(StringSession(s), cfg["API_ID"], cfg["API_HASH"])
-            await c.connect()
-            if await c.is_user_authorized():
-                valid.append(s)
-            await c.disconnect()
-        except Exception:
-            pass
-    cfg["SAVED_STRINGS"] = valid
-    save_config(cfg)
+    _seen, _uniq = set(), []
+    for s in cfg.get("SAVED_STRINGS", []):
+        if s and s not in _seen:
+            _seen.add(s)
+            _uniq.append(s)
+    if _uniq != cfg.get("SAVED_STRINGS", []):
+        cfg["SAVED_STRINGS"] = _uniq
+        save_config(cfg)
 
 async def auto_scanbot_task():
     """
@@ -8879,15 +8888,26 @@ async def deploy_new_session_string(session_str: str, is_startup: bool = False,
         # Only genuinely dead sessions are purged now; everything else is
         # kept and simply retried on the next boot.
         _msg  = str(e).lower()
+        # BUG FIX: AuthKeyDuplicatedError is NOT a dead session — it means the
+        # same string was connected twice at once (two dynos, or a local copy
+        # of data/config.json running elsewhere). Purging on it deleted good
+        # logins. Keep the string and retry on the next boot instead.
+        _dup = ("two different ip" in _msg or "duplicat" in _msg or
+                isinstance(e, getattr(errors, "AuthKeyDuplicatedError", ())))
         _dead_types = tuple([ValueError] + [
             _t for _t in (getattr(errors, _n, None) for _n in (
-                "AuthKeyError", "AuthKeyUnregisteredError", "AuthKeyDuplicatedError",
+                "AuthKeyError", "AuthKeyUnregisteredError",
                 "SessionRevokedError", "SessionExpiredError", "UserDeactivatedError",
                 "UserDeactivatedBanError"))
             if isinstance(_t, type)])
-        _dead = isinstance(e, _dead_types) or any(
+        _dead = (not _dup) and (isinstance(e, _dead_types) or any(
             k in _msg for k in ("expired", "invalid", "unauthorized",
-                                "auth_key", "revoked", "deactivated"))
+                                "auth_key", "revoked", "deactivated")))
+        if _dup:
+            bot_logger("DEPLOY_DUPLICATE",
+                       "Session is in use elsewhere (same string running on "
+                       "another host/dyno) — keeping it, skipping this deploy.")
+            return
         if not _dead:
             bot_logger("DEPLOY_RETRY_LATER",
                        f"Keeping session (transient error): {e}")
@@ -8939,6 +8959,31 @@ async def _start_music_engine(user_id: int):
             pass
     except Exception as e:
         bot_logger("MUSIC_ENGINE_ERR", f"Failed to start for {user_id}: {e}")
+        # BUG FIX: a revoked/unregistered Pyrogram string used to stay in
+        # PYRO_SESSIONS forever, so every restart re-tried it and music was
+        # silently dead. Drop it so the user is asked to re-login via
+        # bot /start -> Music Setup. Transient errors are kept.
+        _m = str(e).lower()
+        if any(k in _m for k in ("auth_key_unregistered", "auth key",
+                                 "session_revoked", "user_deactivated",
+                                 "session expired", "not registered")):
+            try:
+                _ps = cfg.get("PYRO_SESSIONS", {})
+                if str(user_id) in _ps:
+                    _ps.pop(str(user_id), None)
+                    if cfg.get("PYRO_SESSION") and str(user_id) == str(cfg.get("OWNER_ID")):
+                        cfg["PYRO_SESSION"] = ""
+                    save_config(cfg)
+                    bot_logger("MUSIC_ENGINE",
+                               f"Removed dead music session for {user_id} — "
+                               "re-login via bot /start -> Music Setup.")
+            except Exception:
+                pass
+            try:
+                pyro_apps.pop(user_id, None)
+                pytgcalls_apps.pop(user_id, None)
+            except Exception:
+                pass
 
 # ══════════════════════════════════════════
 # MAIN ENGINE ENTRY
