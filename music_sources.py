@@ -202,7 +202,14 @@ def _ms_find_bin(name: str) -> str | None:
 #   4. Copy the full file content → set as YTDLP_COOKIES env var
 #
 # Leave YTDLP_COOKIES unset to keep the current no-cookie behavior.
-_YTDLP_COOKIES_ENV = os.environ.get("YTDLP_COOKIES", "").strip()
+# Env aliases: YTDLP_COOKIES (this bot) and YT_COOKIES (Melody_music naming).
+# Value may be plain Netscape text, a browser-extension JSON array, or base64
+# of either — all four shapes are accepted.
+_YTDLP_COOKIES_ENV = (
+    os.environ.get("YTDLP_COOKIES", "").strip()
+    or os.environ.get("YT_COOKIES", "").strip()
+    or os.environ.get("COOKIES", "").strip()
+)
 
 # ROOT-CAUSE FIX (log 2026-08-23: every cloud_dl rung, including web_safari
 # +cookies, dies with "Sign in to confirm you're not a bot"):
@@ -240,11 +247,66 @@ def _normalize_cookie_text(raw: str) -> str:
     return "\n".join(lines_out) + "\n"
 
 
+def _cookies_json_to_netscape(raw: str) -> str:
+    """Convert a browser-extension JSON cookie array to Netscape text."""
+    try:
+        import json as _json
+        data = _json.loads(raw)
+    except Exception:
+        return ""
+    if not isinstance(data, list):
+        return ""
+    out = ["# Netscape HTTP Cookie File", ""]
+    for c in data:
+        if not isinstance(c, dict) or not c.get("name"):
+            continue
+        domain = str(c.get("domain") or "")
+        if not domain:
+            continue
+        flag = "TRUE" if domain.startswith(".") else "FALSE"
+        path = str(c.get("path") or "/")
+        secure = "TRUE" if c.get("secure") else "FALSE"
+        exp = c.get("expirationDate") or c.get("expires") or 0
+        try:
+            exp = str(int(float(exp)))
+        except Exception:
+            exp = "0"
+        out.append("\t".join([domain, flag, path, secure, exp,
+                              str(c["name"]), str(c.get("value", ""))]))
+    return ("\n".join(out) + "\n") if len(out) > 2 else ""
+
+
+def _decode_cookie_env(raw: str) -> str:
+    """Accept Netscape text, JSON array, or base64 of either."""
+    raw = (raw or "").strip()
+    if not raw:
+        return ""
+    if raw.lstrip().startswith("["):
+        got = _cookies_json_to_netscape(raw)
+        if got:
+            return got
+    got = _normalize_cookie_text(raw)
+    if got:
+        return got
+    # base64 (Heroku-friendly single-line paste)
+    try:
+        import base64 as _b64
+        decoded = _b64.b64decode(raw + "=" * (-len(raw) % 4), validate=False)
+        text = decoded.decode("utf-8", "strict")
+    except Exception:
+        return ""
+    if text.lstrip().startswith("["):
+        got = _cookies_json_to_netscape(text)
+        if got:
+            return got
+    return _normalize_cookie_text(text)
+
+
 def _init_yt_cookies():
     global _YTDLP_COOKIE_TEXT
     if not _YTDLP_COOKIES_ENV:
         return
-    _YTDLP_COOKIE_TEXT = _normalize_cookie_text(_YTDLP_COOKIES_ENV)
+    _YTDLP_COOKIE_TEXT = _decode_cookie_env(_YTDLP_COOKIES_ENV)
 
 
 _init_yt_cookies()
@@ -320,6 +382,32 @@ try:
     import yt_dlp
 except ImportError:
     yt_dlp = None
+
+# ── Residential/rotating proxy support (YT_PROXY) ────────────────────────────
+# Heroku/cloud IPs are permanently flagged by YouTube ("Sign in to confirm
+# you're not a bot") on EVERY InnerTube client — android, web_safari, tv,
+# default, web_embedded, tv_simply all fail from the same datacenter IP even
+# with a valid PO-token. The only two real cures are (a) logged-in cookies and
+# (b) routing yt-dlp through a non-datacenter proxy. Melody_music exposes both;
+# this bot only had cookies, so we add YT_PROXY here and apply it to EVERY
+# yt-dlp instance (no matter which of the ~15 call sites builds the opts dict).
+_YT_PROXY = (
+    os.environ.get("YT_PROXY", "").strip()
+    or os.environ.get("YTDLP_PROXY", "").strip()
+    or os.environ.get("HTTP_PROXY_YT", "").strip()
+)
+
+if yt_dlp is not None and _YT_PROXY:
+    _OrigYoutubeDL = yt_dlp.YoutubeDL
+
+    class _ProxiedYoutubeDL(_OrigYoutubeDL):  # type: ignore[misc]
+        def __init__(self, params=None, *a, **kw):
+            params = dict(params or {})
+            if not params.get("proxy"):
+                params["proxy"] = _YT_PROXY
+            super().__init__(params, *a, **kw)
+
+    yt_dlp.YoutubeDL = _ProxiedYoutubeDL  # type: ignore[assignment]
 
 try:
     import aiohttp as _aiohttp
@@ -5001,8 +5089,18 @@ async def youtube_search_download(query: str, out_tmpl: str, logger=None) -> dic
             f"☁️ Cloud host — Musicbot jugad | "
             f"bgutil={'✅' if _BGUTIL_ACTIVE else '❌'} | "
             f"deno={'✅ ' + str(_deno)[:40] if _deno else '❌ not found'} | "
-            f"cookies={'✅' if _YTDLP_COOKIE_FILE else '❌'}"
+            f"cookies={'✅' if _YTDLP_COOKIE_FILE else '❌'} | "
+            f"proxy={'✅' if _YT_PROXY else '❌'}"
         ))
+        if not _YTDLP_COOKIE_FILE and not _YT_PROXY:
+            logger("MUSIC_YT", (
+                "⚠️ No YTDLP_COOKIES and no YT_PROXY set — this dyno's IP is "
+                "bot-gated by YouTube on every client. Set YTDLP_COOKIES "
+                "(cookies.txt from a logged-in YouTube account; plain text, "
+                "JSON or base64) and/or YT_PROXY (e.g. "
+                "http://user:pass@host:port) in Heroku Config Vars, then "
+                "restart the worker."
+            ))
         _ph_tmpl = out_tmpl + f"_phcloud_{ts}.%(ext)s"
         try:
             result = await asyncio.get_event_loop().run_in_executor(
