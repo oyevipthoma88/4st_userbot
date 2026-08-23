@@ -59,35 +59,58 @@ fi
 # Heroku's Python buildpack does not provide one, so install the portable
 # Deno binary alongside ffmpeg. This is optional at build time: yt-dlp will
 # still use a system Deno if the host already has one.
-DENO_DIR="$BUILD_DIR/vendor/deno/bin"
+# ── Deno ────────────────────────────────────────────────────────────────
+# ROOT-CAUSE FIX (Heroku log 2026-08-23: every yt-dlp client rung died with
+# "Sign in to confirm you're not a bot"): Deno was fetched from a SINGLE
+# GitHub URL with no retries. GitHub's release endpoint intermittently
+# answers 503/drops the connection; when that happens the slug ships without
+# a JS runtime, bgutil cannot mint a PO-token, and YouTube bot-gates every
+# request from the dyno IP. Now: Deno's own CDN first, GitHub as fallback,
+# retries on any error, and a slug-persistent module cache.
+export DENO_DIR="$BUILD_DIR/vendor/deno_cache"
+export DENO_NO_UPDATE_CHECK=1
+mkdir -p "$DENO_DIR"
+
+DENO_BIN_DIR="$BUILD_DIR/vendor/deno/bin"
+DENO_DIR_BIN="$DENO_BIN_DIR"
 DENO_TMP="$BUILD_DIR/vendor/deno_tmp"
-mkdir -p "$DENO_DIR" "$DENO_TMP"
+mkdir -p "$DENO_BIN_DIR" "$DENO_TMP"
+
+DENO_VERSION="$(curl -fsSL --retry 3 --retry-all-errors https://dl.deno.land/release-latest.txt 2>/dev/null | tr -d '\r\n')"
+[ -n "$DENO_VERSION" ] || DENO_VERSION="v2.9.5"
 
 if command -v deno >/dev/null 2>&1; then
   echo "       Deno already available: $(command -v deno)"
 else
-  echo "-----> Installing Deno for yt-dlp YouTube challenge solving"
-  DENO_URL="https://github.com/denoland/deno/releases/latest/download/deno-x86_64-unknown-linux-gnu.zip"
-  if curl -fsSL --retry 3 --retry-delay 3 "$DENO_URL" -o "$DENO_TMP/deno.zip" \
-    && python - "$DENO_TMP/deno.zip" "$DENO_DIR" <<'PY'
-import sys
-import zipfile
-
-with zipfile.ZipFile(sys.argv[1]) as archive:
-    archive.extract("deno", sys.argv[2])
-PY
-  then
-    chmod +x "$DENO_DIR/deno"
-    echo "       Deno installed at $DENO_DIR/deno ✅"
-  else
-    echo "       ⚠️ Deno download failed; yt-dlp will try the host runtime"
+  echo "-----> Installing Deno $DENO_VERSION for yt-dlp YouTube challenge solving"
+  DENO_OK=0
+  for DENO_URL in \
+    "https://dl.deno.land/release/${DENO_VERSION}/deno-x86_64-unknown-linux-gnu.zip" \
+    "https://github.com/denoland/deno/releases/download/${DENO_VERSION}/deno-x86_64-unknown-linux-gnu.zip" \
+    "https://github.com/denoland/deno/releases/latest/download/deno-x86_64-unknown-linux-gnu.zip"
+  do
+    echo "       trying $DENO_URL"
+    if curl -fsSL --retry 5 --retry-delay 3 --retry-all-errors --connect-timeout 20 --max-time 300 \
+         "$DENO_URL" -o "$DENO_TMP/deno.zip" \
+      && python -c 'import sys,zipfile;zipfile.ZipFile(sys.argv[1]).extract("deno", sys.argv[2])' \
+           "$DENO_TMP/deno.zip" "$DENO_BIN_DIR"
+    then
+      chmod +x "$DENO_BIN_DIR/deno"
+      echo "       Deno installed at $DENO_BIN_DIR/deno ✅"
+      DENO_OK=1
+      break
+    fi
+    rm -f "$DENO_TMP/deno.zip"
+  done
+  if [ "$DENO_OK" != "1" ]; then
+    echo "       ⚠️ Deno download failed on all mirrors; music_sources.ensure_deno_runtime() retries at runtime"
   fi
 fi
 
 rm -rf "$DENO_TMP"
 
-if [ -x "$DENO_DIR/deno" ]; then
-  "$DENO_DIR/deno" --version | head -3
+if [ -x "$DENO_BIN_DIR/deno" ]; then
+  "$DENO_BIN_DIR/deno" --version | head -3
 elif command -v deno >/dev/null 2>&1; then
   deno --version | head -3
 fi
@@ -109,7 +132,7 @@ rm -rf "$BGUTIL_HOME" "$BGUTIL_TMP"
 mkdir -p "$BGUTIL_HOME" "$BGUTIL_TMP"
 echo "-----> Installing bgutil yt-dlp PO-token provider v${BGUTIL_VERSION}"
 
-if curl -fsSL --retry 3 --retry-delay 3 "$BGUTIL_URL" -o "$BGUTIL_ZIP" \
+if curl -fsSL --retry 6 --retry-delay 4 --retry-all-errors --connect-timeout 20 --max-time 300 "$BGUTIL_URL" -o "$BGUTIL_ZIP" \
   && python - "$BGUTIL_ZIP" "$BGUTIL_TMP/extracted" <<'PY'
 import os
 import sys
@@ -131,8 +154,8 @@ then
 
   # Deno resolves the provider's npm: dependencies from package.json and
   # installs the native canvas permission required by bgutils-js.
-  if [ -x "$DENO_DIR/deno" ]; then
-    BGUTIL_DENO="$DENO_DIR/deno"
+  if [ -x "$DENO_BIN_DIR/deno" ]; then
+    BGUTIL_DENO="$DENO_BIN_DIR/deno"
   else
     BGUTIL_DENO="$(command -v deno || true)"
   fi

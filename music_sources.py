@@ -3583,7 +3583,8 @@ def ensure_bgutil_http_server() -> bool:
         if _BGUTIL_HTTP_PROC is not None and _BGUTIL_HTTP_PROC.poll() is None:
             return False  # starting — poll _bgutil_http_alive() shortly
         main_ts = os.path.join(_BGUTIL_SERVER_HOME, "src", "main.ts")
-        deno = _find_deno()
+        _ensure_deno_cache_env()
+        deno = _find_deno() or ensure_deno_runtime()
         if not os.path.isfile(main_ts) or not deno:
             return False
         cache_dir = os.path.join(_BGUTIL_SERVER_HOME, "cache")
@@ -3670,16 +3671,125 @@ else:
     )
 
 
+# ── Deno runtime (build-time vendor + RUNTIME self-heal) ────────────────
+# ROOT-CAUSE FIX (Heroku log 2026-08-23: EVERY cloud_dl rung — web_safari,
+# web, web_embedded, tv, tv_simply, default — dies with
+#   "Sign in to confirm you're not a bot"
+# within ~1.5s, i.e. before any media request):
+# bgutil could not mint a Proof-of-Origin token, so YouTube treated the
+# datacenter IP as an unauthenticated bot on every client. bgutil cannot run
+# without Deno, and Deno was ONLY installed at build time from a single
+# GitHub URL with no mirrors — one 503 from GitHub during the build leaves
+# the dyno permanently without a JS runtime and bricks playback until the
+# next redeploy.
+# Fix (same approach as the Melody_music repo, where it resolved this exact
+# failure): keep the build-time vendoring, but also self-heal at runtime by
+# downloading Deno into /tmp from multiple mirrors, and point Deno's module
+# cache at a writable directory.
+_DENO_RUNTIME_DIR = "/tmp/deno_runtime"
+_DENO_LOCK = threading.Lock()
+_DENO_MIRRORS = (
+    "https://dl.deno.land/release/{ver}/deno-x86_64-unknown-linux-gnu.zip",
+    "https://github.com/denoland/deno/releases/download/{ver}"
+    "/deno-x86_64-unknown-linux-gnu.zip",
+    "https://github.com/denoland/deno/releases/latest/download"
+    "/deno-x86_64-unknown-linux-gnu.zip",
+)
+
+
+def _ensure_deno_cache_env() -> None:
+    """Deno needs a writable module/npm cache; $HOME may be read-only."""
+    cache = os.environ.get("DENO_DIR")
+    if not cache or not os.access(os.path.dirname(cache) or "/", os.W_OK):
+        cache = "/tmp/deno_cache"
+        os.environ["DENO_DIR"] = cache
+    os.environ.setdefault("DENO_NO_UPDATE_CHECK", "1")
+    with contextlib.suppress(Exception):
+        os.makedirs(cache, exist_ok=True)
+
+
+_ensure_deno_cache_env()
+
+
 def _find_deno() -> str | None:
-    """Find Deno binary — check vendor path (post_compile) then system PATH."""
+    """Find Deno binary — vendor path, /tmp runtime install, then PATH."""
     _vendor_deno = os.path.join(
         os.path.dirname(os.path.abspath(__file__)),
         "vendor", "deno", "bin", "deno",
     )
     if os.path.isfile(_vendor_deno) and os.access(_vendor_deno, os.X_OK):
         return _vendor_deno
+    _tmp_deno = os.path.join(_DENO_RUNTIME_DIR, "deno")
+    if os.path.isfile(_tmp_deno) and os.access(_tmp_deno, os.X_OK):
+        return _tmp_deno
     import shutil as _sh2
     return _sh2.which("deno")
+
+
+def ensure_deno_runtime(logger=None) -> str | None:
+    """Download Deno into /tmp when the build-time vendoring failed.
+
+    Blocking — always call via asyncio.to_thread(). Returns the binary path
+    or None when every mirror failed.
+    """
+    import logging as _log_d
+    _log = _log_d.getLogger("music_sources")
+    _info = logger or (lambda tag, msg: _log.info("[%s] %s", tag, msg))
+
+    found = _find_deno()
+    if found:
+        return found
+
+    with _DENO_LOCK:
+        found = _find_deno()
+        if found:
+            return found
+
+        _ensure_deno_cache_env()
+
+        import urllib.request as _ureq
+        import zipfile as _zf
+
+        version = "v2.9.5"
+        with contextlib.suppress(Exception):
+            with _ureq.urlopen(
+                "https://dl.deno.land/release-latest.txt", timeout=8
+            ) as _r:
+                _v = _r.read().decode().strip()
+                if _v.startswith("v"):
+                    version = _v
+
+        os.makedirs(_DENO_RUNTIME_DIR, exist_ok=True)
+        target = os.path.join(_DENO_RUNTIME_DIR, "deno")
+        archive = os.path.join(_DENO_RUNTIME_DIR, "deno.zip")
+
+        for mirror in _DENO_MIRRORS:
+            url = mirror.format(ver=version)
+            try:
+                _info("DENO", f"⬇️ Installing Deno at runtime from {url}")
+                with _ureq.urlopen(url, timeout=120) as resp, \
+                        open(archive, "wb") as fh:
+                    fh.write(resp.read())
+                if os.path.getsize(archive) < 1_000_000:
+                    raise RuntimeError("archive too small")
+                with _zf.ZipFile(archive) as zf:
+                    zf.extract("deno", _DENO_RUNTIME_DIR)
+                os.chmod(target, 0o755)
+                with contextlib.suppress(Exception):
+                    os.unlink(archive)
+                _info("DENO", f"✅ Deno {version} installed at {target}")
+                return target
+            except Exception as exc:
+                _info("DENO_WARN", f"⚠️ Deno mirror failed ({url}): {exc}")
+                with contextlib.suppress(Exception):
+                    os.unlink(archive)
+
+        _info(
+            "DENO_ERR",
+            "❌ Deno install failed on all mirrors — bgutil cannot mint a "
+            "PO-token, so YouTube will keep bot-gating this IP.",
+        )
+        return None
 
 
 def _get_js_runtime_opts() -> dict:
@@ -4177,17 +4287,19 @@ async def _ensure_bgutil_runtime(logger=None) -> None:
             if plugin_dst not in _sys_top.path:
                 _sys_top.path.insert(0, plugin_dst)
 
-            # Find Deno
-            deno = _find_deno()
+            # Find Deno (self-heal at runtime when the build hook failed)
+            deno = await asyncio.to_thread(ensure_deno_runtime, logger)
             if not deno:
                 _info("BGUTIL_WARN", "⚠️ Deno not found — bgutil downloaded but provider inactive. Songs will still play via direct cookie path.")
                 return
 
             # deno install
             def _deno_install():
+                _ensure_deno_cache_env()
                 return subprocess.run(
                     [deno, "install", "--allow-scripts=npm:canvas", "--frozen"],
-                    cwd=server_dst, capture_output=True, timeout=120,
+                    cwd=server_dst, capture_output=True, timeout=180,
+                    env={**os.environ},
                 )
             res = await asyncio.to_thread(_deno_install)
             if res.returncode != 0:
@@ -4817,6 +4929,10 @@ async def youtube_search_download(query: str, out_tmpl: str, logger=None) -> dic
         else:
             asyncio.create_task(_ensure_bgutil_runtime(logger))
     elif _BGUTIL_ACTIVE and not _BGUTIL_HTTP_READY:
+        # bgutil is vendored but useless without a JS runtime — make sure
+        # Deno exists before the warm HTTP provider is started.
+        with contextlib.suppress(Exception):
+            await asyncio.to_thread(ensure_deno_runtime, logger)
         # Warm PO-token HTTP server up in the background (script mode is used
         # meanwhile, so this never blocks the first song).
         with contextlib.suppress(Exception):
