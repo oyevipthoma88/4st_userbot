@@ -3295,6 +3295,20 @@ def yt_clients(clients) -> list:
 # Client ladder in priority order (technique #1-10)
 # NOTE: names below are validated/remapped by yt_clients() before use.
 _YT_CLIENTS = yt_clients([
+    # ROOT-CAUSE FIX (Heroku log 2026-08-23: "ERROR: [youtube] <id>: No video
+    # formats found!" for EVERY song, Piped/Invidious mirrors all 4xx/5xx):
+    # verified live from a datacenter IP with no cookies and no PO token —
+    #   android                      -> muxed https format 18 downloads fine
+    #   mweb / web_music             -> formats listed, media request 403s
+    #   default / tv / tv_simply /
+    #   android_vr                   -> "Sign in to confirm you're not a bot"
+    #   web_safari / ios             -> zero formats  => "No video formats found!"
+    # So the ANDROID InnerTube client is the only rung that actually plays on
+    # a cloud dyno right now; it must lead the ladder. It does NOT support a
+    # cookie jar (yt-dlp skips it when `cookiefile` is attached — that is why
+    # the cookie path also died with "No video formats found!"), so cookies
+    # are withheld for it by _clients_accept_cookies() below.
+    "android",         # 0 — ★ PO-token-free, cookie-free, proven working
     # SABR-only experiment (yt-dlp #12482) ne `tv`/`default` ke https URLs
     # strip kar diye, isliye SABR-resistant clients pehle.
     "web_safari",      # 1 — Safari fingerprint, https formats abhi bhi aate hain
@@ -3931,6 +3945,14 @@ def _cloud_download_sync(
     # dikhte hi us client family ke baaki rungs skip ho jaate hain.
     _SABR_FAMILY = {"tv", "default"}
 
+    # ★ Rung 0 — the only combination verified to actually deliver bytes from a
+    # datacenter IP today (no cookies, no PO token). `best` is required in the
+    # selector because the android client only advertises the muxed format 18;
+    # _audio_pp() extracts the audio track afterwards.
+    _ANDROID_RUNGS = [
+        ("bestaudio/best[acodec!=none]/best", ["android"], False),
+    ]
+
     _COOKIE_RUNGS = [
         # SABR-resistant, cookie-capable clients pehle.
         ("bestaudio[ext=m4a]/bestaudio/best",  ["web_safari"],      False),
@@ -3951,9 +3973,9 @@ def _cloud_download_sync(
          ["web_safari", "default", "tv"],                         False),
     ]
     if cookie:
-        combos = _COOKIE_RUNGS + _NOCOOKIE_RUNGS
+        combos = _ANDROID_RUNGS + _COOKIE_RUNGS + _NOCOOKIE_RUNGS
     else:
-        combos = _NOCOOKIE_RUNGS + _COOKIE_RUNGS
+        combos = _ANDROID_RUNGS + _NOCOOKIE_RUNGS + _COOKIE_RUNGS
     # Last resort: SABR-affected clients (tv/default).
     combos += [
         ("bestaudio/best",                    ["tv"],                False),
@@ -3966,6 +3988,7 @@ def _cloud_download_sync(
     _ANY_FMT = ("bestaudio*[protocol^=http]/bestaudio*/bestaudio/"
                 "best[protocol^=http]/best/worst")
     combos += [
+        (_ANY_FMT, ["android"],                                    False),
         (_ANY_FMT, ["web_safari", "web", "web_embedded"],          False),
         (_ANY_FMT, ["default", "tv", "web_safari"],                False),
         (_ANY_FMT, ["default"],                                    False),
@@ -4000,6 +4023,7 @@ def _cloud_download_sync(
         # cookieless rungs are hopeless *only if* we still have cookie-capable
         # rungs left, so just skip pure-cookieless single-client rungs.
         if (cookie and _botgate_hits >= 3
+                and "android" not in clients
                 and not _clients_accept_cookies(clients)):
             continue
 
@@ -4466,7 +4490,12 @@ def _yt_base_opts(out_tmpl: str, client: str, fmt: str) -> dict:
         # formats found!" even when the cookie-free path would succeed.
         # Cookies are only useful for authenticated DASH clients (web,
         # android, ios) that can leverage the full session manifest.
-        **({} if client in _YT_NO_POTOKEN_CLIENTS else _cookie_opts()),
+        # ROOT-CAUSE FIX: _YT_NO_POTOKEN_CLIENTS is an empty set, so a cookie
+        # jar was attached to EVERY client — including android/ios/tv_simply,
+        # which yt-dlp then skips entirely ("does not support cookies"),
+        # leaving zero clients and the exact "No video formats found!" error
+        # from the log. Ask the real cookie-capability map instead.
+        **({} if not _clients_accept_cookies([client]) else _cookie_opts()),
     }
 
 
@@ -5075,6 +5104,10 @@ async def youtube_search_download(query: str, out_tmpl: str, logger=None) -> dic
     # entirely and works from any IP without PO-tokens or bgutil.
     # Order: Tier-1 bypass first → DASH clients → extra bypasses.
     _cookie_preferred_clients = yt_clients([
+        # android runs cookie-free (see _YT_CLIENTS note) and is currently the
+        # only client YouTube still serves media to from a cloud IP, so it
+        # leads even when a cookie jar is configured.
+        "android",            # ★ PO-token-free + cookie-free, proven working
         "default",            # ★ Melody-proven — cookies ke saath sabse reliable
         "tv",                 # plain https formats, PO-token nahi chahiye
         "web_safari",         # Safari fingerprint
@@ -5305,8 +5338,15 @@ async def youtube_video_download(query: str, out_tmpl: str, logger=None) -> dict
                     "external_downloader_args": {"ffmpeg_i": [
                         "-reconnect", "1", "-reconnect_streamed", "1", "-reconnect_delay_max", "5",
                     ]},
-                    "extractor_args": {"youtube": {"player_client": yt_clients([client])}},
-                    **_cookie_opts(),               # BUG FIX: inject cookies
+                    # missing_pot: PO-token na mile to bhi formats hide na ho.
+                    "extractor_args": {"youtube": {
+                        "player_client": yt_clients([client]),
+                        "formats": ["missing_pot"],
+                    }},
+                    # Cookies only for clients that support them — attaching a
+                    # cookie jar to android/ios/tv_simply makes yt-dlp skip the
+                    # client and report "No video formats found!".
+                    **(_cookie_opts() if _clients_accept_cookies([client]) else {}),
                 }
 
                 def _run(o=opts, st=search_target):
