@@ -5192,6 +5192,37 @@ async def youtube_search_download(query: str, out_tmpl: str, logger=None) -> dic
     except Exception:
         pass
 
+    # ─── Phase 5: Non-YouTube last-resort audio fallback ────────────────
+    # Heroku/cloud dyno IPs are now hard-blocked by YouTube: every innertube
+    # client returns "No video formats found!", Piped mirrors answer 403/502
+    # and public Invidious instances are dead. Rather than returning nothing
+    # (silent VC), fall back to the free full-length audio sources that do NOT
+    # care about the dyno IP. Set MUSIC_FALLBACK_SOURCES=0 to disable.
+    if os.getenv("MUSIC_FALLBACK_SOURCES", "1").strip().lower() not in ("0", "false", "no"):
+        fb_query = norm_q if not is_direct else query
+        fallbacks = (
+            ("jiosaavn",   lambda t: jiosaavn_search_download(fb_query, t, logger)),
+            ("audiomack",  lambda t: audiomack_search_download(fb_query, t, logger)),
+            ("soundcloud", lambda t: soundcloud_search_download(fb_query, t, {}, logger)),
+            ("gaana",      lambda t: gaana_search_download(fb_query, t, logger)),
+            ("deezer",     lambda t: deezer_preview_search_download(fb_query, t, logger)),
+            ("itunes",     lambda t: itunes_preview_search_download(fb_query, t, logger)),
+        )
+        for name, runner in fallbacks:
+            fb_tmpl = out_tmpl + f"_fb_{ts}_{name}.%(ext)s"
+            try:
+                result = await asyncio.wait_for(runner(fb_tmpl), timeout=45.0)
+            except asyncio.TimeoutError:
+                logger("MUSIC_DL_ERR", f"{name} fallback timed out")
+                continue
+            except Exception as _fb_exc:
+                logger("MUSIC_DL_ERR", f"{name} fallback: {_fb_exc}")
+                continue
+            if result and result.get("file_path"):
+                result.setdefault("source", name)
+                logger("MUSIC_YT", f"✅ [fallback/{name}] {result.get('title')!r}")
+                return result
+
     logger("MUSIC_YT_FAIL", f"All jugad failed for: {query!r}")
     return None
 
