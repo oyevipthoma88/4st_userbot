@@ -352,14 +352,38 @@ async def yt_api_search(query: str, logger=None, video: bool = False) -> dict | 
                     "https://www.googleapis.com/youtube/v3/search",
                     params={**params, "key": key}, timeout=timeout,
                 ) as resp:
-                    if resp.status in (400, 403, 429):
-                        # quota exceeded / key disabled → 1 ghante ka cooldown
-                        _YT_API_DEAD[key] = time.time() + 3600
-                        logger("MUSIC_YT_API", f"key cooldown (HTTP {resp.status})")
+                    if resp.status == 200:
+                        data = await resp.json()
+                    else:
+                        body = ""
+                        with contextlib.suppress(Exception):
+                            body = (await resp.text())[:300]
+                        low = body.lower()
+                        # Retire the key ONLY when Google actually says it is
+                        # dead (quotaExceeded / keyInvalid / API key not valid
+                        # / accessNotConfigured). Transient HTTP 400s (bad
+                        # param, region block, hiccup) must NOT nuke the key
+                        # — Melody bot ka same fix; warna ek transient 400
+                        # saari keys 1 ghante ke liye cooldown me daal deta
+                        # tha aur music bajna hi band ho jaata tha.
+                        fatal = (
+                            "quota" in low
+                            or "keyinvalid" in low
+                            or "api key not valid" in low
+                            or "accessnotconfigured" in low
+                            or "api_key_invalid" in low
+                            or "keyexpired" in low
+                        )
+                        if resp.status == 429 or (resp.status in (400, 403) and fatal):
+                            _YT_API_DEAD[key] = time.time() + (
+                                300 if resp.status == 429 else 3600
+                            )
+                            logger("MUSIC_YT_API",
+                                   f"key retired (HTTP {resp.status}): {body[:120]}")
+                        else:
+                            logger("MUSIC_YT_API",
+                                   f"transient HTTP {resp.status} (key kept): {body[:120]}")
                         continue
-                    if resp.status != 200:
-                        continue
-                    data = await resp.json()
 
             items = [i for i in (data.get("items") or [])
                      if (i.get("id") or {}).get("videoId")]
