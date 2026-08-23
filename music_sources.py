@@ -203,55 +203,112 @@ def _ms_find_bin(name: str) -> str | None:
 #
 # Leave YTDLP_COOKIES unset to keep the current no-cookie behavior.
 _YTDLP_COOKIES_ENV = os.environ.get("YTDLP_COOKIES", "").strip()
-_YTDLP_COOKIE_FILE: str | None = None   # path to temp file, set at startup
+
+# ROOT-CAUSE FIX (log 2026-08-23: every cloud_dl rung, including web_safari
+# +cookies, dies with "Sign in to confirm you're not a bot"):
+# yt-dlp WRITES the cookie jar back to `cookiefile` on close. This bot runs
+# several yt-dlp extractions in parallel (download + prefetch + stream warm),
+# so two writers truncate/interleave the SAME cookie file. The surviving
+# first line stops being the "# Netscape HTTP Cookie File" header and the
+# refreshed __Secure-3PSID / SAPISID / LOGIN_INFO cookies get corrupted →
+# every subsequent request is anonymous → bot-gate on every rung.
+# Fix (from Melody_music): keep the normalized cookie text in MEMORY as the
+# single source of truth and hand every yt-dlp run its OWN throwaway copy.
+_YTDLP_COOKIE_TEXT: str = ""
+_YTDLP_COOKIE_DIR = "/tmp/yt_cookies_runs"
+_YTDLP_COOKIE_LOCK = threading.Lock()
+_YTDLP_COOKIE_TTL_SECONDS = 900
+
+
+def _normalize_cookie_text(raw: str) -> str:
+    """Return a clean Netscape cookie file body, or '' if nothing usable."""
+    # Heroku Config Var CLI paste bug: literal \n / \t instead of real ones.
+    content = raw.replace("\\n", "\n").replace("\\t", "\t")
+    lines_out: list[str] = ["# Netscape HTTP Cookie File", ""]
+    for line in content.splitlines():
+        stripped = line.rstrip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        if "\t" not in stripped:
+            parts = stripped.split()
+            if len(parts) == 7:
+                stripped = "\t".join(parts)
+        if stripped.count("\t") == 6:
+            lines_out.append(stripped)
+    if len(lines_out) <= 2:
+        return ""
+    return "\n".join(lines_out) + "\n"
+
 
 def _init_yt_cookies():
-    """Write YTDLP_COOKIES env var content to a temp file if set.
-
-    HEROKU FIX: Heroku Config Vars sometimes store multi-line values with
-    literal '\\n' escape sequences instead of real newlines (especially when
-    set via CLI or copy-paste). We unescape them here so yt-dlp gets a valid
-    Netscape cookie file instead of one long line that fails format detection.
-    """
-    global _YTDLP_COOKIE_FILE
+    global _YTDLP_COOKIE_TEXT
     if not _YTDLP_COOKIES_ENV:
         return
-    import tempfile
-    try:
-        fd, path = tempfile.mkstemp(suffix=".txt", prefix="yt_cookies_")
-        with os.fdopen(fd, "w", encoding="utf-8") as f:
-            # Unescape literal \n sequences (Heroku Config Var copy-paste bug)
-            content = _YTDLP_COOKIES_ENV.replace("\\n", "\n").replace("\\t", "\t")
-            # Ensure the Netscape header line is present (yt-dlp requires it)
-            if not content.lstrip().startswith("# Netscape HTTP Cookie File"):
-                content = "# Netscape HTTP Cookie File\n\n" + content.lstrip()
-            # Validate lines: only write comments + valid 7-field Netscape entries.
-            # Rejects HTML, JSON, or space-separated cookies that cause yt-dlp to
-            # throw "does not look like a Netscape format cookies file".
-            valid_lines = []
-            for line in content.splitlines():
-                stripped = line.rstrip()
-                if not stripped or stripped.startswith("#"):
-                    valid_lines.append(stripped)
-                    continue
-                # Auto-convert space-separated → tab-separated (common copy-paste issue)
-                if "\t" not in stripped:
-                    parts = stripped.split()
-                    if len(parts) == 7:
-                        stripped = "\t".join(parts)
-                # Accept only lines with exactly 7 tab-separated fields
-                if stripped.count("\t") == 6:
-                    valid_lines.append(stripped)
-            f.write("\n".join(valid_lines) + "\n")
-        _YTDLP_COOKIE_FILE = path
-    except Exception:
-        _YTDLP_COOKIE_FILE = None
+    _YTDLP_COOKIE_TEXT = _normalize_cookie_text(_YTDLP_COOKIES_ENV)
 
-_init_yt_cookies()   # run once at import time
+
+_init_yt_cookies()
+
+
+def _reap_cookie_copies() -> None:
+    cutoff = time.time() - _YTDLP_COOKIE_TTL_SECONDS
+    try:
+        for name in os.listdir(_YTDLP_COOKIE_DIR):
+            path = os.path.join(_YTDLP_COOKIE_DIR, name)
+            try:
+                if os.path.getmtime(path) < cutoff:
+                    os.remove(path)
+            except OSError:
+                pass
+    except OSError:
+        pass
+
+
+def cookiefile_for_run() -> "str | None":
+    """Fresh private copy of the cookie jar for one yt-dlp run (or None).
+
+    Never returns the master path — yt-dlp may write back to it and corrupt
+    the jar for every concurrent extraction.
+    """
+    if not _YTDLP_COOKIE_TEXT:
+        return None
+    with _YTDLP_COOKIE_LOCK:
+        try:
+            os.makedirs(_YTDLP_COOKIE_DIR, exist_ok=True)
+            _reap_cookie_copies()
+            path = os.path.join(
+                _YTDLP_COOKIE_DIR,
+                f"c_{os.getpid()}_{threading.get_ident()}_{time.time_ns()}.txt",
+            )
+            tmp = path + ".tmp"
+            with open(tmp, "w", encoding="utf-8", newline="\n") as f:
+                f.write(_YTDLP_COOKIE_TEXT)
+            os.replace(tmp, path)
+            return path
+        except OSError:
+            return None
+
+
+# Back-compat shim: any caller that still reads _YTDLP_COOKIE_FILE gets a
+# fresh private copy (never the master).
+class _CookieFileProxy:
+    def __bool__(self) -> bool:
+        return bool(_YTDLP_COOKIE_TEXT)
+
+    def __str__(self) -> str:
+        return cookiefile_for_run() or ""
+
+    def __fspath__(self) -> str:
+        return cookiefile_for_run() or ""
+
+
+_YTDLP_COOKIE_FILE = _CookieFileProxy() if _YTDLP_COOKIE_TEXT else None
+
 
 def _cookie_opts() -> dict:
-    """Return ``{"cookiefile": path}`` if cookies are configured, else empty dict."""
-    return {"cookiefile": _YTDLP_COOKIE_FILE} if _YTDLP_COOKIE_FILE else {}
+    """Return ``{"cookiefile": path}`` with a fresh per-run copy, or empty."""
+    p = cookiefile_for_run()
+    return {"cookiefile": p} if p else {}
 # ─────────────────────────────────────────────────────────────────────────────
 
 try:
@@ -3671,7 +3728,10 @@ def _cloud_download_sync(
     if yt_dlp is None:
         return None
 
-    cookie = _YTDLP_COOKIE_FILE
+    # Per-run: is a cookie jar available at all? Actual file is minted fresh
+    # per rung (see cookiefile_for_run() below) so parallel yt-dlp writers
+    # can't corrupt each other's jar mid-flight.
+    cookie = bool(_YTDLP_COOKIE_TEXT)
     is_search = not (url_or_query.startswith("http://") or url_or_query.startswith("https://"))
     target = f"ytsearch1:{url_or_query}" if is_search else url_or_query
 
@@ -3888,7 +3948,9 @@ def _cloud_download_sync(
         # otherwise yt-dlp skips every client in the rung and the download
         # dies with "Requested format is not available" (see note above).
         if cookie and _clients_accept_cookies(clients):
-            opts["cookiefile"] = cookie
+            _fresh = cookiefile_for_run()
+            if _fresh:
+                opts["cookiefile"] = _fresh
 
         # Capture yt-dlp stderr for debug logging
         _ydl_error: list[str] = []
