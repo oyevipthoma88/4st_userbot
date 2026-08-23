@@ -100,6 +100,14 @@
     "WORDSEEK_BOT_LINK": {
       "description": "t.me link to the WordSeek cheat bot, shown as a cross-promo button on /start (optional).",
       "required": false
+    },
+    "YTDLP_COOKIES": {
+      "description": "cookies.txt from a logged-in YouTube account (plain Netscape text, JSON array, or base64). Fixes 'Sign in to confirm you're not a bot'.",
+      "required": false
+    },
+    "YT_PROXY": {
+      "description": "Optional non-datacenter proxy for yt-dlp, e.g. http://user:pass@host:port. Cures YouTube bot-gating on Heroku IPs.",
+      "required": false
     }
   },
   "buildpacks": [
