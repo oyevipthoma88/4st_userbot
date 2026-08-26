@@ -4159,8 +4159,13 @@ async def check_must_join(user_id: int):
 
 async def send_must_join_prompt(event, missing):
     """Locked screen shown until every requirement is satisfied."""
-    rows = [[Button.url(label, url)] for label, url in missing]
-    rows.append([Button.inline("✅ Joined — Recheck", b"mj_recheck")])
+    try:
+        rows = [[Button.url(label, url)] for label, url in missing]
+        rows.append([Button.inline("✅ Joined — Recheck", b"mj_recheck")])
+    except Exception as _button_err:
+        # A malformed owner-configured join URL must not abort `/start`.
+        bot_logger("BOT_MJ_BUTTON_WARN", str(_button_err))
+        rows = None
     text = (
         "<blockquote>🔒  <b>ACCESS LOCKED</b>\n"
         "─────────────────────\n"
@@ -4169,13 +4174,21 @@ async def send_must_join_prompt(event, missing):
         "  Join karne ke baad ✅ Recheck dabao.</blockquote>"
     )
     try:
-        await asyncio.wait_for(event.reply(text, buttons=rows, parse_mode='html'), timeout=8.0)
+        if rows:
+            await asyncio.wait_for(event.reply(text, buttons=rows, parse_mode='html'), timeout=8.0)
+        else:
+            await asyncio.wait_for(event.reply(text, parse_mode='html'), timeout=8.0)
         return
     except Exception as _reply_err:
         bot_logger("BOT_MJ_REPLY_WARN", str(_reply_err))
     try:
         await asyncio.wait_for(
-            asstbot.send_message(event.chat_id or event.sender_id, text, buttons=rows, parse_mode='html'),
+            asstbot.send_message(
+                event.chat_id or event.sender_id,
+                text,
+                **({"buttons": rows} if rows else {}),
+                parse_mode='html',
+            ),
             timeout=5.0,
         )
         return
@@ -4222,19 +4235,21 @@ async def asst_start_handler(event):
 
         await _send_start_menu(event, sender_id, sender)
     except Exception as _e:
-        bot_logger("BOT_START_ERR", str(_e))
-        # Keep failures visible to the user instead of only logging them.
+        bot_logger("BOT_START_ERR", repr(_e))
+        # Never show a generic dead-end error. Even if an optional menu feature
+        # crashes, send a dependency-free plain reply immediately.
+        _fallback = (
+            "⚡ 4ST PRIME CORE\n\n"
+            "Your request was received. The full menu could not be loaded, "
+            "but the bot is online. Send /start again in a moment."
+        )
         try:
             await asyncio.wait_for(
-                asstbot.send_message(
-                    event.chat_id,
-                    "⚠️ Temporary error while opening the menu. Please send /start again.",
-                    parse_mode=None,
-                ),
+                event.reply(_fallback, parse_mode=None),
                 timeout=5.0,
             )
         except Exception as _reply_err:
-            bot_logger("BOT_START_ERROR_REPLY_ERR", str(_reply_err))
+            bot_logger("BOT_START_ERROR_REPLY_ERR", repr(_reply_err))
 
 
 # Register without a Telethon pattern. Telegram bot commands may include a
