@@ -1,5 +1,6 @@
 import os
 import asyncio
+import contextlib
 import time
 import random
 import sys
@@ -4118,10 +4119,14 @@ def _mj_clean(v: str) -> str:
 
 
 def _mj_link(v: str) -> str:
+    """Return a valid Telegram link, or an empty string for bad config."""
     v = (v or "").strip()
-    if v.startswith("http"):
+    if re.match(r"^https?://t\.me/(?:\+?[A-Za-z0-9_/?=&.-]+)$", v):
         return v
-    return f"https://t.me/{_mj_clean(v)}"
+    clean = _mj_clean(v)
+    if not re.match(r"^\+?[A-Za-z0-9_/?=&.-]+$", clean):
+        return ""
+    return f"https://t.me/{clean}"
 
 
 async def check_must_join(user_id: int):
@@ -4140,13 +4145,21 @@ async def check_must_join(user_id: int):
         if not target:
             continue
         try:
-            entity = await asstbot.get_entity(_mj_clean(target) if "+" not in target else target)
+            clean_target = _mj_clean(target)
+            if not clean_target:
+                bot_logger("BOT_MJ_CONFIG_WARN", f"Ignoring invalid must-join target for {label}")
+                continue
+            entity = await asstbot.get_entity(clean_target if "+" not in clean_target else target)
             await asstbot.get_permissions(entity, user_id)
         except Exception as e:
             msg = str(e).lower()
             if "admin" in msg or "chat_admin_required" in msg or "could not find" in msg:
                 continue          # bot can't verify → fail open
-            missing.append((label, _mj_link(target)))
+            link = _mj_link(target)
+            if link:
+                missing.append((label, link))
+            else:
+                bot_logger("BOT_MJ_CONFIG_WARN", f"Ignoring invalid must-join URL for {label}")
 
     mj_bot = _mj_clean(cfg.get("MUST_JOIN_BOT", ""))
     if mj_bot:
@@ -4160,7 +4173,12 @@ async def check_must_join(user_id: int):
 async def send_must_join_prompt(event, missing):
     """Locked screen shown until every requirement is satisfied."""
     try:
-        rows = [[Button.url(label, url)] for label, url in missing]
+        rows = [
+            [Button.url(label, url)]
+            for label, url in (missing or [])
+            if isinstance(url, str)
+            and re.match(r"^https?://t\.me/(?:\+?[A-Za-z0-9_/?=&.-]+)$", url)
+        ]
         rows.append([Button.inline("✅ Joined — Recheck", b"mj_recheck")])
     except Exception as _button_err:
         # A malformed owner-configured join URL must not abort `/start`.
