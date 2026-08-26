@@ -4035,13 +4035,20 @@ async def _send_start_menu(event, sender_id: int, sender=None):
     """Send /start with layered fallbacks so a cosmetic feature cannot silence the bot."""
     about_text, buttons = _render_start_menu(sender_id, sender)
     # Pull the banner back from GitHub if the dyno restarted and wiped disk.
+    # This is best-effort and must never hold the user's first /start hostage.
     media_path = cfg.get("START_MEDIA_PATH")
     if not (media_path and os.path.exists(str(media_path))):
         try:
-            media_path = media_store.ensure_local_media(cfg, DATA_DIR, bot_logger)
+            media_path = await asyncio.wait_for(
+                asyncio.to_thread(media_store.ensure_local_media, cfg, DATA_DIR, bot_logger),
+                timeout=3.0,
+            )
         except Exception as _media_err:
             bot_logger("BOT_START_MEDIA_WARN", str(_media_err))
             media_path = None
+
+    async def _reply_with_timeout(coro, timeout=8.0):
+        return await asyncio.wait_for(coro, timeout=timeout)
 
     # First try the rich path (custom emoji entities + inline buttons).
     try:
@@ -4049,9 +4056,9 @@ async def _send_start_menu(event, sender_id: int, sender=None):
         entities = inject_premium_emojis(parsed_text, entities, PREMIUM_EMOJI_IDS)
         send_kw = {"formatting_entities": entities, "parse_mode": None, "buttons": buttons}
         if media_path and os.path.exists(str(media_path)):
-            await event.reply(parsed_text, file=media_path, **send_kw)
+            await _reply_with_timeout(event.reply(parsed_text, file=media_path, **send_kw))
         else:
-            await event.reply(parsed_text, **send_kw)
+            await _reply_with_timeout(event.reply(parsed_text, **send_kw))
         return
     except Exception as _rich_err:
         bot_logger("BOT_START_RICH_WARN", str(_rich_err))
@@ -4060,26 +4067,27 @@ async def _send_start_menu(event, sender_id: int, sender=None):
     # incompatibilities without losing the actual /start reply.
     try:
         if media_path and os.path.exists(str(media_path)):
-            await event.reply(about_text, file=media_path, buttons=buttons, parse_mode="html")
+            await _reply_with_timeout(event.reply(about_text, file=media_path, buttons=buttons, parse_mode="html"))
         else:
-            await event.reply(about_text, buttons=buttons, parse_mode="html")
+            await _reply_with_timeout(event.reply(about_text, buttons=buttons, parse_mode="html"))
         return
     except Exception as _html_err:
         bot_logger("BOT_START_HTML_WARN", str(_html_err))
 
     # Final path deliberately drops buttons and media: the user must always get
     # a response even if a stale custom button or start image is invalid.
-    try:
-        await asstbot.send_message(event.chat_id, about_text, parse_mode="html")
-        return
-    except Exception as _plain_html_err:
-        bot_logger("BOT_START_PLAIN_HTML_WARN", str(_plain_html_err))
-
-    try:
-        plain_text = re.sub(r"<[^>]+>", "", about_text)
-        await asstbot.send_message(event.chat_id, plain_text, parse_mode=None)
-    except Exception as _final_err:
-        bot_logger("BOT_START_SEND_ERR", str(_final_err))
+    plain_text = re.sub(r"<[^>]+>", "", about_text)
+    for _send_mode in ("html", None):
+        try:
+            await _reply_with_timeout(
+                asstbot.send_message(event.chat_id, about_text if _send_mode == "html" else plain_text,
+                                     parse_mode=_send_mode),
+                timeout=5.0,
+            )
+            return
+        except Exception as _send_err:
+            bot_logger("BOT_START_SEND_WARN", str(_send_err))
+    bot_logger("BOT_START_SEND_ERR", "All /start reply fallbacks failed")
 
 
 # ══════════════════════════════════════════
@@ -4150,12 +4158,24 @@ async def send_must_join_prompt(event, missing):
         "  Join karne ke baad ✅ Recheck dabao.</blockquote>"
     )
     try:
-        await event.reply(text, buttons=rows, parse_mode='html')
-    except Exception:
-        try:
-            await asstbot.send_message(event.sender_id, text, buttons=rows, parse_mode='html')
-        except Exception:
-            pass
+        await asyncio.wait_for(event.reply(text, buttons=rows, parse_mode='html'), timeout=8.0)
+        return
+    except Exception as _reply_err:
+        bot_logger("BOT_MJ_REPLY_WARN", str(_reply_err))
+    try:
+        await asyncio.wait_for(
+            asstbot.send_message(event.chat_id or event.sender_id, text, buttons=rows, parse_mode='html'),
+            timeout=5.0,
+        )
+        return
+    except Exception as _fallback_err:
+        bot_logger("BOT_MJ_FALLBACK_WARN", str(_fallback_err))
+    with contextlib.suppress(Exception):
+        await asyncio.wait_for(
+            asstbot.send_message(event.chat_id or event.sender_id,
+                                 re.sub(r"<[^>]+>", "", text), parse_mode=None),
+            timeout=5.0,
+        )
 
 
 async def asst_start_handler(event):
@@ -4169,10 +4189,16 @@ async def asst_start_handler(event):
         return
 
     try:
-        sender    = await event.get_sender()
+        sender    = await asyncio.wait_for(event.get_sender(), timeout=5.0)
         sender_id = event.sender_id
-        asyncio.create_task(log_to_channel("BOT_START", {"Command": "/start"}, user_obj=sender))
-        _mj_ok, _mj_missing = await check_must_join(sender_id)
+        bot_logger("BOT_START_RECEIVED", f"sender={sender_id} chat={event.chat_id} command={text[:80]!r}")
+        asyncio.create_task(log_to_channel("BOT_START", {"Command": text[:80]}, user_obj=sender))
+        try:
+            _mj_ok, _mj_missing = await asyncio.wait_for(check_must_join(sender_id), timeout=8.0)
+        except Exception as _mj_err:
+            # A slow/unavailable membership check must not make /start look dead.
+            bot_logger("BOT_START_MJ_WARN", str(_mj_err))
+            _mj_ok, _mj_missing = True, []
         if not _mj_ok:
             await send_must_join_prompt(event, _mj_missing)
             return
@@ -4197,13 +4223,10 @@ async def asst_start_handler(event):
             bot_logger("BOT_START_ERROR_REPLY_ERR", str(_reply_err))
 
 
-# BUG FIX: this handler was defined but NEVER registered on asstbot, so /start
-# and /help in the bot's DM did nothing (bot logged to the channel but never
-# replied in DM). Register it explicitly for incoming private messages.
-asstbot.add_event_handler(
-    asst_start_handler,
-    events.NewMessage(incoming=True, pattern=r"^/(?:start|help)(?:@\w+)?(?:\s+.*)?$"),
-)
+# Register without a Telethon pattern. Telegram bot commands may include a
+# username suffix/entity that differs from the visible text; the handler itself
+# performs the normalized /start and /help check, so no valid DM is filtered out.
+asstbot.add_event_handler(asst_start_handler, events.NewMessage(incoming=True))
 
 
 
