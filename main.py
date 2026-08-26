@@ -4033,7 +4033,18 @@ def _render_start_menu(sender_id: int, sender=None, is_owner: bool = None):
 
 async def _send_start_menu(event, sender_id: int, sender=None):
     """Send /start with layered fallbacks so a cosmetic feature cannot silence the bot."""
-    about_text, buttons = _render_start_menu(sender_id, sender)
+    try:
+        about_text, buttons = _render_start_menu(sender_id, sender)
+    except Exception as _render_err:
+        # Button/custom-link construction must never abort /start before the
+        # actual send fallbacks get a chance. Use a dependency-free plain menu.
+        bot_logger("BOT_START_RENDER_WARN", str(_render_err))
+        about_text = (
+            "<b>⚡ 4ST PRIME CORE</b>\n\n"
+            "Your account is connected. Send /start again after a moment to "
+            "load the full menu."
+        )
+        buttons = None
     # Pull the banner back from GitHub if the dyno restarted and wiped disk.
     # This is best-effort and must never hold the user's first /start hostage.
     media_path = cfg.get("START_MEDIA_PATH")
@@ -4214,10 +4225,13 @@ async def asst_start_handler(event):
         bot_logger("BOT_START_ERR", str(_e))
         # Keep failures visible to the user instead of only logging them.
         try:
-            await asstbot.send_message(
-                event.chat_id,
-                "⚠️ Temporary error while opening the menu. Please send /start again.",
-                parse_mode=None,
+            await asyncio.wait_for(
+                asstbot.send_message(
+                    event.chat_id,
+                    "⚠️ Temporary error while opening the menu. Please send /start again.",
+                    parse_mode=None,
+                ),
+                timeout=5.0,
             )
         except Exception as _reply_err:
             bot_logger("BOT_START_ERROR_REPLY_ERR", str(_reply_err))
