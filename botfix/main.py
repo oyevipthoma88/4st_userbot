@@ -2980,36 +2980,54 @@ def _render_start_menu(sender_id: int, sender=None, is_owner: bool = None):
 
 
 async def _send_start_menu(event, sender_id: int, sender=None):
-    """Sends the /start menu as a fresh reply (used by the /start command)."""
+    """Send /start with layered fallbacks so a cosmetic feature cannot silence the bot."""
     about_text, buttons = _render_start_menu(sender_id, sender)
     media_path = cfg.get("START_MEDIA_PATH")
+
+    # First try the rich path (custom emoji entities + inline buttons).
     try:
-        try:
-            parsed_text, entities = asstbot.parse_mode.parse(about_text)
-            entities = inject_premium_emojis(parsed_text, entities, PREMIUM_EMOJI_IDS)
-            send_kw = {"formatting_entities": entities, "parse_mode": None, "buttons": buttons}
-            if media_path and os.path.exists(str(media_path)):
-                await event.reply(parsed_text, file=media_path, **send_kw)
-            else:
-                await event.reply(parsed_text, **send_kw)
-        except Exception:
-            if media_path and os.path.exists(str(media_path)):
-                await event.reply(about_text, file=media_path, buttons=buttons, parse_mode='html')
-            else:
-                await event.reply(about_text, buttons=buttons, parse_mode='html')
-    except Exception:
-        try:
-            await event.reply(about_text, parse_mode='html')
-        except Exception:
-            pass
+        parsed_text, entities = asstbot.parse_mode.parse(about_text)
+        entities = inject_premium_emojis(parsed_text, entities, PREMIUM_EMOJI_IDS)
+        send_kw = {"formatting_entities": entities, "parse_mode": None, "buttons": buttons}
+        if media_path and os.path.exists(str(media_path)):
+            await event.reply(parsed_text, file=media_path, **send_kw)
+        else:
+            await event.reply(parsed_text, **send_kw)
+        return
+    except Exception as _rich_err:
+        bot_logger("BOT_START_RICH_WARN", str(_rich_err))
+
+    # Retry with normal HTML formatting, preserving the menu when possible.
+    try:
+        if media_path and os.path.exists(str(media_path)):
+            await event.reply(about_text, file=media_path, buttons=buttons, parse_mode="html")
+        else:
+            await event.reply(about_text, buttons=buttons, parse_mode="html")
+        return
+    except Exception as _html_err:
+        bot_logger("BOT_START_HTML_WARN", str(_html_err))
+
+    # Last resort: drop optional UI features and send text directly from the bot.
+    try:
+        await asstbot.send_message(event.chat_id, about_text, parse_mode="html")
+        return
+    except Exception as _plain_html_err:
+        bot_logger("BOT_START_PLAIN_HTML_WARN", str(_plain_html_err))
+
+    try:
+        plain_text = re.sub(r"<[^>]+>", "", about_text)
+        await asstbot.send_message(event.chat_id, plain_text, parse_mode=None)
+    except Exception as _final_err:
+        bot_logger("BOT_START_SEND_ERR", str(_final_err))
 
 
-@asstbot.on(events.NewMessage(incoming=True))
+@asstbot.on(events.NewMessage(incoming=True, pattern=r"^/(?:start|help)(?:@\w+)?(?:\s+.*)?$"))
 async def asst_start_handler(event):
     if not event.is_private:
         return
     text = (event.text or "").strip()
-    if text not in ("/start", "/help"):
+    cmd = text.split()[0].split("@")[0].lower() if text else ""
+    if cmd not in ("/start", "/help"):
         return
     try:
         sender    = await event.get_sender()
@@ -3025,6 +3043,14 @@ async def asst_start_handler(event):
         await _send_start_menu(event, sender_id, sender)
     except Exception as _e:
         bot_logger("BOT_START_ERR", str(_e))
+        try:
+            await asstbot.send_message(
+                event.chat_id,
+                "⚠️ Temporary error while opening the menu. Please send /start again.",
+                parse_mode=None,
+            )
+        except Exception as _reply_err:
+            bot_logger("BOT_START_ERROR_REPLY_ERR", str(_reply_err))
 
 # ── Premium emoji injection for the assistant bot ─────────────────────
 # asstbot is a bot token but we still inject MessageEntityCustomEmoji

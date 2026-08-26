@@ -4008,34 +4008,54 @@ def _render_start_menu(sender_id: int, sender=None, is_owner: bool = None):
 
 
 async def _send_start_menu(event, sender_id: int, sender=None):
-    """Sends the /start menu as a fresh reply (used by the /start command)."""
+    """Send /start with layered fallbacks so a cosmetic feature cannot silence the bot."""
     about_text, buttons = _render_start_menu(sender_id, sender)
     # Pull the banner back from GitHub if the dyno restarted and wiped disk.
     media_path = cfg.get("START_MEDIA_PATH")
     if not (media_path and os.path.exists(str(media_path))):
         try:
             media_path = media_store.ensure_local_media(cfg, DATA_DIR, bot_logger)
-        except Exception:
+        except Exception as _media_err:
+            bot_logger("BOT_START_MEDIA_WARN", str(_media_err))
             media_path = None
+
+    # First try the rich path (custom emoji entities + inline buttons).
     try:
-        try:
-            parsed_text, entities = asstbot.parse_mode.parse(about_text)
-            entities = inject_premium_emojis(parsed_text, entities, PREMIUM_EMOJI_IDS)
-            send_kw = {"formatting_entities": entities, "parse_mode": None, "buttons": buttons}
-            if media_path and os.path.exists(str(media_path)):
-                await event.reply(parsed_text, file=media_path, **send_kw)
-            else:
-                await event.reply(parsed_text, **send_kw)
-        except Exception:
-            if media_path and os.path.exists(str(media_path)):
-                await event.reply(about_text, file=media_path, buttons=buttons, parse_mode='html')
-            else:
-                await event.reply(about_text, buttons=buttons, parse_mode='html')
-    except Exception:
-        try:
-            await event.reply(about_text, parse_mode='html')
-        except Exception:
-            pass
+        parsed_text, entities = asstbot.parse_mode.parse(about_text)
+        entities = inject_premium_emojis(parsed_text, entities, PREMIUM_EMOJI_IDS)
+        send_kw = {"formatting_entities": entities, "parse_mode": None, "buttons": buttons}
+        if media_path and os.path.exists(str(media_path)):
+            await event.reply(parsed_text, file=media_path, **send_kw)
+        else:
+            await event.reply(parsed_text, **send_kw)
+        return
+    except Exception as _rich_err:
+        bot_logger("BOT_START_RICH_WARN", str(_rich_err))
+
+    # HTML + buttons/media is the second path. This handles parser/entity
+    # incompatibilities without losing the actual /start reply.
+    try:
+        if media_path and os.path.exists(str(media_path)):
+            await event.reply(about_text, file=media_path, buttons=buttons, parse_mode="html")
+        else:
+            await event.reply(about_text, buttons=buttons, parse_mode="html")
+        return
+    except Exception as _html_err:
+        bot_logger("BOT_START_HTML_WARN", str(_html_err))
+
+    # Final path deliberately drops buttons and media: the user must always get
+    # a response even if a stale custom button or start image is invalid.
+    try:
+        await asstbot.send_message(event.chat_id, about_text, parse_mode="html")
+        return
+    except Exception as _plain_html_err:
+        bot_logger("BOT_START_PLAIN_HTML_WARN", str(_plain_html_err))
+
+    try:
+        plain_text = re.sub(r"<[^>]+>", "", about_text)
+        await asstbot.send_message(event.chat_id, plain_text, parse_mode=None)
+    except Exception as _final_err:
+        bot_logger("BOT_START_SEND_ERR", str(_final_err))
 
 
 # ══════════════════════════════════════════
@@ -4142,6 +4162,15 @@ async def asst_start_handler(event):
         await _send_start_menu(event, sender_id, sender)
     except Exception as _e:
         bot_logger("BOT_START_ERR", str(_e))
+        # Keep failures visible to the user instead of only logging them.
+        try:
+            await asstbot.send_message(
+                event.chat_id,
+                "⚠️ Temporary error while opening the menu. Please send /start again.",
+                parse_mode=None,
+            )
+        except Exception as _reply_err:
+            bot_logger("BOT_START_ERROR_REPLY_ERR", str(_reply_err))
 
 
 # BUG FIX: this handler was defined but NEVER registered on asstbot, so /start
@@ -4149,7 +4178,7 @@ async def asst_start_handler(event):
 # replied in DM). Register it explicitly for incoming private messages.
 asstbot.add_event_handler(
     asst_start_handler,
-    events.NewMessage(incoming=True, pattern=r"^/(start|help)\b"),
+    events.NewMessage(incoming=True, pattern=r"^/(?:start|help)(?:@\w+)?(?:\s+.*)?$"),
 )
 
 
