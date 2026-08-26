@@ -42,11 +42,12 @@ Sources implemented (no cookies, no login required):
       Music and Bensound links are also playable through this generic path
       even though they don't have a dedicated no-key *search* API.
 
-Every downloaded/converted file is normalized to the best practical quality
-for Telegram voice chats: 320kbps CBR MP3 audio (44.1kHz stereo) — going
-higher just wastes bandwidth since Telegram voice chats cap well below
-that — and, where a source offers it, the highest bitrate/resolution
-version available is picked instead of a default/preview-quality stream.
+YouTube playback preserves the provider's playable m4a/webm/opus source
+container by default, avoiding an extra FFmpeg transcode before playback.
+Set MUSIC_TRANSCODE_AUDIO=1 when a normalized Opus output is required. Long-tail
+fallback sources may still be converted when their provider requires it; where
+a source offers it, the highest practical bitrate/resolution version is picked
+instead of a default/preview-quality stream.
 
 A tiny on-disk "stream cache" is also provided so repeat requests for the
 same song reuse the already-downloaded file instead of re-fetching it.
@@ -106,6 +107,16 @@ _ensure_ffmpeg()
 _MS_FFMPEG_BIN  = _ffsetup.FFMPEG_BIN  or "ffmpeg"
 _MS_FFPROBE_BIN = _ffsetup.FFPROBE_BIN or "ffprobe"
 _MS_FFMPEG_DIR  = _ffsetup.FFMPEG_DIR
+
+# YouTube already provides playable m4a/webm/opus audio. Re-encoding every
+# download to Opus adds an avoidable FFmpeg pass after the network download.
+# Preserve the source container by default for faster first playback; set
+# MUSIC_TRANSCODE_AUDIO=1 when a normalized Opus output is explicitly needed.
+def _youtube_audio_opts() -> dict:
+    flag = os.environ.get("MUSIC_TRANSCODE_AUDIO", "0").strip().lower()
+    if flag in {"1", "true", "yes", "on"}:
+        return _audio_pp("opus", "192")
+    return {**_ffmpeg_opts(), "postprocessors": []}
 
 # ── ROOT FIX (music play nahi hota) #1 — dead-mirror cooldown ───────────────
 # Piped/Invidious public mirrors are mostly dead (502/404/401/DNS/SSL).  Har
@@ -3523,21 +3534,35 @@ def _ensure_ytdlp_updated_sync():
 
 
 async def _ensure_ytdlp_updated():
-    """Silent yt-dlp self-update — best-effort, once per process (technique #39).
+    """Best-effort yt-dlp self-update, once per process.
 
-    BUG FIX: this used to call `subprocess.run(...)` (blocking I/O) directly
-    from inside an `async def` on the event loop thread. `subprocess.run`
-    does not yield to the loop — it freezes the *entire* bot (every chat,
-    every command, the pytgcalls callbacks) for up to the full 45s timeout
-    on the very first play command after every restart. If pip happened to
-    be slow or unreachable at that moment, the first song after any deploy
-    would look like a total hang with zero visible errors. Running the
-    blocking call in a worker thread via `asyncio.to_thread` fixes this
-    without changing the "update once per process" behaviour.
+    This is intentionally callable from the startup warm-up only. Updating a
+    package during the first user request adds avoidable cold-start latency and
+    cannot change the already-imported yt_dlp module anyway.
     """
     if _YT_UPDATE_DONE or yt_dlp is None:
         return
     await asyncio.to_thread(_ensure_ytdlp_updated_sync)
+
+
+async def warm_up_music_runtime(logger=None) -> None:
+    """Warm optional music dependencies without blocking the first `.play`.
+
+    Heroku builds normally contain yt-dlp, Deno and bgutil already. When a
+    build misses one of them, repair it while the worker is starting instead
+    of making the first song wait for pip/download/install work. Playback has
+    its own fallbacks and can proceed while this best-effort warm-up runs.
+    """
+    logger = logger or (lambda *a: None)
+    tasks = [asyncio.create_task(_ensure_ytdlp_updated())]
+    if _YTDLP_COOKIE_FILE and not _BGUTIL_ACTIVE:
+        tasks.append(asyncio.create_task(_ensure_bgutil_runtime(logger)))
+    elif _BGUTIL_ACTIVE and not _BGUTIL_HTTP_READY:
+        tasks.append(asyncio.create_task(warm_up_bgutil_server()))
+    results = await asyncio.gather(*tasks, return_exceptions=True)
+    for result in results:
+        if isinstance(result, Exception):
+            logger("MUSIC_WARMUP_WARN", str(result))
 
 
 def _yt_normalize_query(q: str) -> str:
@@ -4161,7 +4186,7 @@ def _cloud_download_sync(
             # ffmpeg/ffprobe PAIR exists, otherwise postprocessors=[] plus
             # fixup="never" so yt-dlp's implicit fixup pass can't invoke a
             # missing binary. This is the actual "ffprobe and ffmpeg not found" fix.
-            **_audio_pp("opus", "192")
+            **_youtube_audio_opts()
         }
         # BUG FIX: always inject cookies when available — even for tv_embedded/android_vr
         # with player_skip. YouTube now bot-checks these clients from cloud IPs regardless
@@ -4538,7 +4563,7 @@ def _yt_base_opts(out_tmpl: str, client: str, fmt: str) -> dict:
         # otherwise yt-dlp's automatic fixup postprocessors still try to
         # invoke a nonexistent ffmpeg and crash with "ffprobe and ffmpeg
         # not found", even though our own postprocessor list is empty.
-        **_audio_pp("opus", "192"),  # good headroom above Telegram VC's ceiling
+        **_youtube_audio_opts(),  # preserve source audio for faster startup
         # FFmpeg reconnect + low-latency flags (techniques #27-29, jugad #6):
         # nobuffer/low_delay/tiny probesize shrink startup latency so a
         # track begins streaming to the voice chat almost immediately
@@ -5029,31 +5054,18 @@ async def youtube_search_download(query: str, out_tmpl: str, logger=None) -> dic
     if yt_dlp is None:
         return None
 
-    try:
-        await _ensure_ytdlp_updated()  # technique #39
-    except Exception:
-        pass
+    # yt-dlp updates and bgutil/Deno installation are scheduled by
+    # warm_up_music_runtime() at worker startup. Never block a user request on
+    # package installation or a network repair task.
 
-    # bgutil PO-token install — await when cookies are active so the PO-token
-    # provider is ready before the first "web" client request hits YouTube.
-    # Without bgutil, authenticated "web" requests from Heroku/cloud IPs get
-    # "No video formats found" because YouTube requires PO-tokens from datacenter IPs.
-    # No-cookie path: fire-and-forget (tv_embedded doesn't need PO-tokens).
+    # Install/repair bgutil in the background. The first song uses the
+    # normal cookie/client ladder while the provider warms up; it must not
+    # wait here for a Deno download, archive extraction, or `deno install`.
     if not _BGUTIL_ACTIVE and not _BGUTIL_INSTALL_DONE:
-        if _YTDLP_COOKIE_FILE:
-            # Cookies active → wait for bgutil so PO-token is ready immediately
-            await _ensure_bgutil_runtime(logger)
-        else:
-            asyncio.create_task(_ensure_bgutil_runtime(logger))
+        asyncio.create_task(_ensure_bgutil_runtime(logger))
     elif _BGUTIL_ACTIVE and not _BGUTIL_HTTP_READY:
-        # bgutil is vendored but useless without a JS runtime — make sure
-        # Deno exists before the warm HTTP provider is started.
-        with contextlib.suppress(Exception):
-            await asyncio.to_thread(ensure_deno_runtime, logger)
-        # Warm PO-token HTTP server up in the background (script mode is used
-        # meanwhile, so this never blocks the first song).
-        with contextlib.suppress(Exception):
-            asyncio.create_task(warm_up_bgutil_server())
+        # The warm HTTP provider is also best-effort and must not delay play.
+        asyncio.create_task(warm_up_bgutil_server())
 
     is_direct = bool(_URL_RE.match(query.strip()))
     video_id  = _yt_extract_video_id(query) if is_direct else None
@@ -5365,11 +5377,7 @@ async def youtube_video_download(query: str, out_tmpl: str, logger=None) -> dict
     if yt_dlp is None:
         return None
 
-    try:
-        await _ensure_ytdlp_updated()
-    except Exception:
-        pass
-
+    # yt-dlp updates run in the startup warm-up, never in a user request.
     is_direct = bool(_URL_RE.match(query.strip()))
 
     # FAST PATH: Data API v3 se query → watch URL (see yt_api_search).

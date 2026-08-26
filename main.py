@@ -2252,10 +2252,16 @@ async def search_and_download_audio(query: str):
     async def _yt_download(suffix: str) -> MusicTrack | None:
         ets     = int(time.time() * 1000)
         tmpl    = os.path.join(MUSIC_CACHE, f"audio_{ets}_{suffix}.%(ext)s")
+        _download_started = time.perf_counter()
         try:
             result = await asyncio.wait_for(
                 music_sources.youtube_search_download(query, tmpl, logger=bot_logger),
                 timeout=300.0,
+            )
+            bot_logger(
+                "MUSIC_TIMING",
+                f"YouTube resolve/download took {time.perf_counter() - _download_started:.2f}s "
+                f"for {query!r} | result={'ok' if result else 'miss'}",
             )
         except asyncio.TimeoutError:
             # 120s bahut kam tha: Heroku par client-ladder + mirrors 150s+ le
@@ -9061,6 +9067,9 @@ async def main():
         concurrent.futures.ThreadPoolExecutor(max_workers=4))
 
     bot_logger("BOOT", f"4ST Prime Core starting — data dir: {DATA_DIR}")
+    # Warm yt-dlp/bgutil/Deno in the background. Never make the first user
+    # request pay for package installation or PO-token provider startup.
+    asyncio.create_task(music_sources.warm_up_music_runtime(logger=bot_logger))
     # ── Migrate NAME_HISTORY / USERNAME_HISTORY from config to data/tracks/ ──
     _did_migrate = False
     for _uid_k, _entries in list(cfg.get("NAME_HISTORY", {}).items()):
