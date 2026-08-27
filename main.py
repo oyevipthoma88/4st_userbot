@@ -3393,13 +3393,18 @@ async def _grow_cores():
             continue
     return cores
 
-async def _grow_collect_chats(cores):
-    """{chat_id: {...}} for every group/channel where at least one core can
-    invite AND/OR promote. Keeps the strongest source client per chat
-    (creator > can-promote admin > plain admin)."""
+async def _grow_collect_chats(cores, progress=None):
+    """{chat_id: {...}} for every group/channel where at least one core can invite
+    AND/OR promote. Keeps the strongest source client per chat
+    (creator > can-promote admin > plain admin).
+
+    ``progress`` is an optional async callback. Unlimited-core mode can scan a
+    large number of dialogs, so reporting scan progress prevents the assistant
+    from appearing stuck at GROW BOOT while Telegram API calls are in flight.
+    """
     from telethon import utils as _tutils
     chats = {}
-    for core in cores:
+    for core_index, core in enumerate(cores, 1):
         cl = core["client"]
         try:
             async for dlg in cl.iter_dialogs():
@@ -3438,6 +3443,11 @@ async def _grow_collect_chats(cores):
                 }
         except Exception as e:
             bot_logger("GROW_SCAN_ERR", str(e)[:120])
+        if progress and (core_index == 1 or core_index == len(cores) or core_index % 5 == 0):
+            try:
+                await progress(core_index, len(cores), len(chats), core.get("name", ""))
+            except Exception as _progress_err:
+                bot_logger("GROW_PROGRESS_ERR", str(_progress_err)[:120])
     return chats
 
 async def _grow_resolve_target(src_client, chat_entity, core):
@@ -3754,7 +3764,7 @@ async def _grow_notify(text: str, buttons=None):
             return None
 
 
-async def _grow_scan(scope):
+async def _grow_scan(scope, progress=None):
     """Chats where the selected core(s) can actually promote.
     Chats without add-admins rights are IGNORED, exactly as requested."""
     cores = await _grow_cores()
@@ -3762,7 +3772,7 @@ async def _grow_scan(scope):
         cores = [c for c in cores if c["id"] == scope]
     if not cores:
         return [], {}
-    chats = await _grow_collect_chats(cores)
+    chats = await _grow_collect_chats(cores, progress=progress)
     usable = {cid: c for cid, c in chats.items() if c.get("can_promote")}
     return cores, usable
 
@@ -3799,7 +3809,20 @@ async def _grow_engine_run_inner(run_id: str, retry: bool = False):
     else:
         await _grow_notify(
             "<blockquote>🌱 <b>GROW BOOT</b> — scanning cores &amp; chats…</blockquote>")
-        cores, chats = await _grow_scan(run["scope"])
+
+        _last_scan_notice = [0.0]
+        async def _scan_progress(done, total, chat_count, core_name):
+            now = time.monotonic()
+            if done != total and now - _last_scan_notice[0] < 30:
+                return
+            _last_scan_notice[0] = now
+            await _grow_notify(
+                "<blockquote>🌱 <b>GROW SCANNING…</b>\n"
+                f"  Cores: <code>{done}/{total}</code>\n"
+                f"  Usable chats found: <code>{chat_count}</code>\n"
+                f"  Current: <code>{str(core_name)[:28]}</code></blockquote>")
+
+        cores, chats = await _grow_scan(run["scope"], progress=_scan_progress)
         if not cores:
             await _grow_notify("<blockquote>❌ <b>GROW</b> — no live core for this selection.</blockquote>")
             return
