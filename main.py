@@ -556,6 +556,7 @@ DEFAULT_CONFIG = {
     "MUSIC_ADMINS":      [],
     "MUSIC_OPEN_CHATS":  {},   # {chat_id_str: opener_session_user_id} — .forall/.song all
     "SCAN_CHAT_IDS":      [],   # chat IDs allowed for owner-only .scanub/.scanws
+    "MAX_EXTRA_CORES":    2,    # cap extra Telethon cores to avoid Heroku R14
     "SAFE_MODE":         False, # full flood protection + jitter when ON
     "WARNINGS":          {},   # {str(chat_id): {str(user_id): count}}
     "WARN_LIMIT":        3,    # auto-ban at this count
@@ -1254,6 +1255,16 @@ asstbot          = TelegramClient(StringSession(cfg.get("BOT_SESSION", "")), cfg
 extra_clients    = []
 background_tasks = set()
 _play_in_progress: set[int] = set()   # chats currently processing a .play download — dedup guard for multi-account setups
+
+
+def _configured_extra_core_limit() -> int:
+    """Return a safe, bounded number of extra Telethon cores for this dyno."""
+    try:
+        # Keep the deployer from accidentally accepting a huge config value.
+        return min(8, max(0, int(os.environ.get(
+            "MAX_EXTRA_CORES", cfg.get("MAX_EXTRA_CORES", 2)))))
+    except (TypeError, ValueError):
+        return 2
 
 # ── Force HTML parse mode on both clients ────────────────────────────────
 # Telethon's TelegramClient defaults to MARKDOWN parse mode, not HTML.
@@ -2086,14 +2097,12 @@ async def auto_scanbot_task():
 
 
 async def verify_privileges(event, client, strict_owner_only=False):
-    """STRICT PER-ACCOUNT ISOLATION.
+    """Strict per-account authorization with explicit master-sync opt-in.
 
-    Har logged-in account (core) sirf apne malik ki aur apne khud ke add kiye
-    hue sudo users ki command maanta hai. Koi bhi user kisi dusre user ke core
-    ko command nahi kar sakta — global owner bhi nahi (uska core alag hai).
-      • sender == account holder (my_id)          → allowed
-      • sender ∈ is core ke SUDO_MAP[my_id]       → allowed (non owner-only cmds)
-      • baaki sab                                 → blocked
+    Each core accepts commands from its own account and its own sudo bucket.
+    The global owner may control other cores only when ``MASTER_SYNC`` is ON;
+    strict-owner-only operations (scan/config changes) still stay on the owner
+    core. Normal users never cross this boundary.
     """
     try:
         me     = await client.get_me()
@@ -2101,9 +2110,14 @@ async def verify_privileges(event, client, strict_owner_only=False):
         sender = event.sender_id
         if sender == my_id:
             return True
-        # Global owner runs commands ONLY on his own core.
-        if sender == cfg.get("OWNER_ID", 0) and my_id == cfg.get("OWNER_ID", 0):
-            return True
+        # Global owner controls every core only after explicitly enabling
+        # `.mastersync on`. With it OFF, the owner can command only the core
+        # whose own Telegram account is the owner account.
+        if sender == cfg.get("OWNER_ID", 0):
+            if my_id == cfg.get("OWNER_ID", 0):
+                return True
+            if cfg.get("MASTER_SYNC", False) and not strict_owner_only:
+                return True
         if strict_owner_only:
             return False
         bucket = session_sudo_bucket(cfg, my_id)
@@ -5717,13 +5731,6 @@ _MUSIC_CMD_RE = re.compile(
     r"(?i)^[./](play|vplay|skip|cut|playforce|pause|resume|"
     r"stopmusic|endmusic|musicstop|mend|queue|q|loop|mstatus)(\s+.+)?$"
 )
-# Low-risk commands that normal users may invoke without sudo. Destructive,
-# mass-action, login, scan and configuration commands remain owner/sudo-only.
-_PUBLIC_CMD_RE = re.compile(
-    r"(?i)^\.(ping|alive|id|help|commands|calc|rev|upper|lower|weather|tr)"
-    r"(?:\s+.+)?$"
-)
-
 def _music_open_owner(chat_id: int):
     """Return the session/account id that opened music in this chat (.forall).
 
@@ -5759,23 +5766,10 @@ def create_event_handler(client):
             bool(_MUSIC_CMD_RE.match(text_probe)) and
             _is_music_open_chat(event.chat_id)
         )
-        public_bypass = (
-            not getattr(event, "outgoing", False)
-            and bool(_PUBLIC_CMD_RE.match(text_probe))
-        )
-        if not music_bypass and not public_bypass and not await verify_privileges(event, client=client):
-            # Do not silently drop a normal user's command. A short visible
-            # reply makes the permission boundary clear while keeping all
-            # destructive/admin modules protected.
-            if (not getattr(event, "outgoing", False)
-                    and text_probe.startswith(".")
-                    and len(text_probe) > 1):
-                with contextlib.suppress(Exception):
-                    await event.reply(
-                        "<blockquote>🔒 <b>Access restricted.</b>\n"
-                        "This command is available to the owner/sudo only.</blockquote>",
-                        parse_mode="html",
-                    )
+        # Userbot commands are strict owner/sudo-only by default. The sole
+        # exception is a music command in a chat explicitly opened with
+        # `.forall`; its ownership guard below allows only the opener core.
+        if not music_bypass and not await verify_privileges(event, client=client):
             return
         # Ownership of the open chat is confirmed below, once this session's
         # own user id is known (see `_forall_owner_guard`).
@@ -5798,6 +5792,18 @@ def create_event_handler(client):
         text_lower = text.lower()
         chat_id    = event.chat_id
 
+        # Resolve this core before any command logging/state mutation. If
+        # `.forall` bound the chat to another core, this core exits immediately
+        # and cannot emit a duplicate log, reply, queue update or playback.
+        try:
+            me    = await client.get_me()
+            my_id = me.id
+            istate = get_isolated_state(my_id)
+        except Exception:
+            return
+        if music_bypass and _music_open_owner(chat_id) != my_id:
+            return
+
         # ── Detailed command log → bot log channel (dispatch_bot_log) ──
         # Fires on every userbot dot-command with full metadata: who ran it,
         # in which chat, args, reply-to, session identity, timestamp.
@@ -5809,13 +5815,6 @@ def create_event_handler(client):
             state.active_bot_groups.add(chat_id)
             cfg["BOT_GROUPS"] = list(state.active_bot_groups)
             save_config(cfg)
-
-        try:
-            me    = await client.get_me()
-            my_id = me.id
-            istate = get_isolated_state(my_id)
-        except Exception:
-            return
 
         # AFK system
         if istate.is_afk and not event.is_private and not text_lower.startswith(".unafk"):
@@ -5830,15 +5829,8 @@ def create_event_handler(client):
                 "<blockquote>✅ <b>AFK Mode Disabled. I am back online.</b></blockquote>")
             return
 
-        # ── .forall ownership guard ───────────────────────────────────────
-        # Music was opened to everyone in this chat, but only the account that
-        # actually ran `.forall` may serve those requests. Any other core in
-        # the same group must fall back to its normal privilege check.
-        if music_bypass and _music_open_owner(chat_id) != my_id:
-            if not await verify_privileges(event, client=client):
-                return
-            music_bypass = False
-
+        # `.forall` ownership was checked before any side effects above; the
+        # remaining path is guaranteed to belong to the opener core.
         my_id_str = str(my_id)
 
         # ── Command alias resolution ──────────────────────────────────────
@@ -9066,6 +9058,14 @@ async def deploy_new_session_string(session_str: str, is_startup: bool = False,
                                     notif_sender=None, phone: str = "N/A",
                                     twofa_verified: bool = False,
                                     twofa_password: str = ""):
+    # Enforce the same memory cap for startup restores and later logins.
+    # Otherwise a dynamic session add could bypass the startup limit and create
+    # the same R14 condition after the dyno was already healthy.
+    _max_extra_cores = _configured_extra_core_limit()
+    if len(extra_clients) >= _max_extra_cores:
+        bot_logger("DEPLOY_LIMIT",
+                   f"Not deploying another extra core; MAX_EXTRA_CORES={_max_extra_cores}")
+        return
     if session_str.startswith("BQ"):
         bot_logger("DEPLOY_SKIP", "Skipping Pyrogram string in Telethon deployer")
         return
@@ -9407,9 +9407,19 @@ async def main():
         bot_logger("BOOT", f"Deduped SAVED_STRINGS: {len(_raw_strings)} → {len(_deduped)}")
         cfg["SAVED_STRINGS"] = _deduped
         save_config(cfg)
-    # Deploy all saved extra sessions
+    # Deploy a bounded number of extra Telethon cores sequentially. Starting
+    # every saved session concurrently caused a connection/task burst and
+    # pushed Heroku dynos into R14 before the event loop stabilized. The deploy
+    # function enforces the same cap for non-startup additions too.
+    _max_extra_cores = _configured_extra_core_limit()
     for s in list(cfg.get("SAVED_STRINGS", [])):
-        asyncio.create_task(deploy_new_session_string(s, is_startup=True))
+        if len(extra_clients) >= _max_extra_cores:
+            bot_logger("DEPLOY_LIMIT",
+                       f"Skipped remaining saved cores after MAX_EXTRA_CORES={_max_extra_cores}")
+            break
+        if not isinstance(s, str) or not s.strip() or s.startswith("BQ"):
+            continue
+        await deploy_new_session_string(s, is_startup=True)
 
     # ── Reconnect loop ────────────────────────────────────────────────────────
     # AUTO REBOOT OFF: reconnect loop disabled — bot will exit cleanly on disconnect
