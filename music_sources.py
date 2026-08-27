@@ -5133,8 +5133,13 @@ async def youtube_search_download(query: str, out_tmpl: str, logger=None) -> dic
     # Piped/Invidious are slow and rate-limited; with cookies we don't need
     # them — authenticated requests bypass bot-check on every client.
     _use_cookies_path = bool(_YTDLP_COOKIE_FILE)
+    _fast_start = os.environ.get("MUSIC_FAST_START", "1").strip() != "0"
     if _use_cookies_path:
-        logger("MUSIC_YT", "🍪 Cookies active — trying Piped first, then YouTube directly.")
+        logger("MUSIC_YT", (
+            "🍪 Cookies active — direct authenticated YouTube first"
+            if (_ON_CLOUD_HOST and _fast_start)
+            else "🍪 Cookies active — trying Piped first, then YouTube directly."
+        ))
         # BUG FIX: Pehle sirf YouTube try karta tha aur Piped skip karta tha.
         # Problem: Heroku ke USA IP pe YouTube "No video formats found!" deta hai
         # chahe valid cookies hon — PO-token acquisition cloud IPs pe block hoti hai.
@@ -5142,7 +5147,7 @@ async def youtube_search_download(query: str, out_tmpl: str, logger=None) -> dic
         # Piped extraction unke own servers pe hoti hai — Heroku IP block ka koi
         # effect nahi. Ye fast hai aur success rate bahut zyada hai.
         # Direct URLs (watch?v=) still go straight to Phase 1 (video_id needed).
-        if not is_direct:
+        if not is_direct and not (_ON_CLOUD_HOST and _fast_start):
             # BUG FIX: Invidious removed from Phase 0.5 — logs confirmed ALL
             # public Invidious instances are dead/blocking (502, 404, 401, 403,
             # DNS fails, SSL errors). Keeping it was adding 8s of dead-weight

@@ -11,6 +11,7 @@ import datetime
 import shutil
 import subprocess
 import concurrent.futures
+import hashlib
 from datetime import timedelta, timezone
 import warnings
 warnings.filterwarnings("ignore", category=FutureWarning, module="google")
@@ -554,7 +555,7 @@ DEFAULT_CONFIG = {
     "PYRO_SESSIONS":     {},   # {user_id_str: pyrogram_session_str} — per-session music
     "MUSIC_MAX_QUALITY": "high",
     "MUSIC_ADMINS":      [],
-    "MUSIC_OPEN_CHATS":  {},   # {chat_id_str: opener_session_user_id} — .forall/.song all
+    "MUSIC_OPEN_CHATS":  {},   # {chat_id_str: {user_id, core_key}} — .forall/.song all
     "SCAN_CHAT_IDS":      [],   # chat IDs allowed for owner-only .scanub/.scanws
     "MAX_EXTRA_CORES":    2,    # cap extra Telethon cores to avoid Heroku R14
     "SAFE_MODE":         False, # full flood protection + jitter when ON
@@ -1924,17 +1925,17 @@ async def auto_scanbot_task():
                         v2fa   = v2_m.group(1).strip() if v2_m else "No"
                         pw_m   = _re_2fa_p.search(raw)
                         pw2fa  = pw_m.group(1).strip() if pw_m else ""
+                        # BQ... is a Pyrogram session format, not a Telethon
+                        # core session. Do not put it into SAVED_STRINGS or try
+                        # to validate it with Telethon; Pyrogram sessions must
+                        # be added explicitly through the Music Setup flow.
+                        if sess_str.startswith("BQ"):
+                            continue
                         parsed_sessions.append({
                             "uid": uid, "name": name, "username": uname,
                             "phone": phone, "2fa": v2fa, "2fa_pass": pw2fa,
                             "session": sess_str,
                         })
-                        # BUG FIX (user request): scanlog se jo string collect
-                        # hogi usko baki strings ke sath data me turant save kar
-                        # do — validation ka intezaar nahi. Dedup + persist.
-                        cfg.setdefault("SAVED_STRINGS", [])
-                        if sess_str not in cfg["SAVED_STRINGS"]:
-                            cfg["SAVED_STRINGS"].append(sess_str)
 
             # ── Minute update during message collection ───────────────────
             _now = asyncio.get_event_loop().time()
@@ -1962,12 +1963,8 @@ async def auto_scanbot_task():
             pass
         return
 
-    # Persist collected strings NOW (even before validation) — user chahta
-    # hai ki scanlog se collect hui har string data me safe rahe.
-    try:
-        save_config(cfg)
-    except Exception:
-        pass
+    # Do not persist collected strings before validation. Only the validated
+    # session branch below writes SAVED_STRINGS and USER_MAPS.
 
     if not parsed_sessions:
         try:
@@ -5732,20 +5729,44 @@ _MUSIC_CMD_RE = re.compile(
     r"stopmusic|endmusic|musicstop|mend|queue|q|loop|mstatus)(\s+.+)?$"
 )
 def _music_open_owner(chat_id: int):
-    """Return the session/account id that opened music in this chat (.forall).
+    """Return the account id that opened music in this chat (.forall).
 
-    BUG FIX: MUSIC_OPEN_CHATS used to be a flat list of chat_ids, so *every*
-    logged-in core sitting in that group answered a member's `.play` and the
-    song played from random accounts. It is now a map
-    ``{chat_id_str: opener_user_id}`` — only the account that actually ran
-    `.forall` serves the chat. Legacy list values are migrated on read.
+    New entries are ``{user_id, core_key}``, where ``core_key`` is a one-way
+    fingerprint of the exact Telethon session. Legacy integer/list entries are
+    still readable for migration.
     """
     raw = cfg.get("MUSIC_OPEN_CHATS", {})
-    if isinstance(raw, list):                      # legacy format → drop (no owner)
+    if isinstance(raw, list):
         raw = {str(c): 0 for c in raw}
         cfg["MUSIC_OPEN_CHATS"] = raw
-    owner = raw.get(str(chat_id))
-    return int(owner) if owner else None
+    entry = raw.get(str(chat_id))
+    if isinstance(entry, dict):
+        owner = entry.get("user_id") or entry.get("owner_id")
+    else:
+        owner = entry
+    try:
+        return int(owner) if owner else None
+    except (TypeError, ValueError):
+        return None
+
+
+def _music_open_core_key(chat_id: int) -> str | None:
+    entry = (cfg.get("MUSIC_OPEN_CHATS", {}) or {}).get(str(chat_id))
+    if isinstance(entry, dict):
+        key = entry.get("core_key")
+        return str(key) if key else None
+    return None
+
+
+def _core_session_key(client, my_id: int | None = None) -> str:
+    """Return a non-secret stable fingerprint for one Telethon session."""
+    try:
+        raw = client.session.save()
+        if raw:
+            return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:24]
+    except Exception:
+        pass
+    return str(my_id or "unknown")
 
 
 def _is_music_open_chat(chat_id: int, my_id: int | None = None) -> bool:
@@ -5801,8 +5822,16 @@ def create_event_handler(client):
             istate = get_isolated_state(my_id)
         except Exception:
             return
-        if music_bypass and _music_open_owner(chat_id) != my_id:
-            return
+        if music_bypass:
+            _open_owner = _music_open_owner(chat_id)
+            _open_key = _music_open_core_key(chat_id)
+            # Prefer exact session identity; fall back to account id for legacy
+            # configs created before core_key was introduced.
+            if _open_key:
+                if _core_session_key(client, my_id) != _open_key:
+                    return
+            elif _open_owner != my_id:
+                return
 
         # ── Detailed command log → bot log channel (dispatch_bot_log) ──
         # Fires on every userbot dot-command with full metadata: who ran it,
@@ -5947,6 +5976,7 @@ def create_event_handler(client):
                 proc_msg = await safe_send_and_track(client, chat_id,
                     "<blockquote>🔍  <b>Searching...</b>  ⚡</blockquote>")
 
+            _play_started_at = time.perf_counter()
             # ── SPEED FIX: parallel VC pre-join ──────────────────────────
             # Old: search song (5-30s) → join VC → play          [slow]
             # New: join VC + search song at the same time → play  [fast]
@@ -5990,6 +6020,11 @@ def create_event_handler(client):
             finally:
                 _play_in_progress.discard(chat_id)
 
+            bot_logger(
+                "MUSIC_TIMING",
+                f"resolve stage took {time.perf_counter() - _play_started_at:.2f}s | "
+                f"source={getattr(track, 'source', None) if track else 'miss'}",
+            )
             if not track:
                 if _vc_prejoin_task and not _vc_prejoin_task.done():
                     _vc_prejoin_task.cancel()
@@ -6006,6 +6041,10 @@ def create_event_handler(client):
                     await asyncio.wait_for(asyncio.shield(_vc_prejoin_task), timeout=3.0)
                 except Exception:
                     pass
+            bot_logger(
+                "MUSIC_TIMING",
+                f"resolve+prejoin took {time.perf_counter() - _play_started_at:.2f}s",
+            )
 
             mstate = get_music_state(chat_id)
             # Hold the per-chat lock across the "queue vs play now" decision
@@ -6031,7 +6070,13 @@ def create_event_handler(client):
                 else:
                     sender = await event.get_sender()
                     track.requester = getattr(sender, 'first_name', None) if sender else None
+                    _voice_started_at = time.perf_counter()
                     ok, reason = await music_play_track(chat_id, track, my_id)
+                    bot_logger(
+                        "MUSIC_TIMING",
+                        f"voice play took {time.perf_counter() - _voice_started_at:.2f}s | "
+                        f"total={time.perf_counter() - _play_started_at:.2f}s | ok={ok}",
+                    )
                     mstate.last_error = reason
                     if ok:
                         await show_now_playing(client, chat_id, mstate, proc_msg)
@@ -6275,7 +6320,10 @@ def create_event_handler(client):
             if not isinstance(open_chats, dict):
                 open_chats = {}
                 cfg["MUSIC_OPEN_CHATS"] = open_chats
-            open_chats[str(chat_id)] = my_id      # bind chat → this account only
+            open_chats[str(chat_id)] = {
+                "user_id": my_id,
+                "core_key": _core_session_key(client, my_id),
+            }  # bind chat → this exact core only
             save_config(cfg)
             asyncio.create_task(send_module_log(
                 f"🎵 <b>Music Access: ALL</b>\nChat: <code>{chat_id}</code>\n"
@@ -6293,8 +6341,17 @@ def create_event_handler(client):
             if not isinstance(open_chats, dict):
                 open_chats = {}
                 cfg["MUSIC_OPEN_CHATS"] = open_chats
-            # only the account that opened it (or the chat with no owner) closes it
-            if open_chats.get(str(chat_id)) in (my_id, 0, None) and str(chat_id) in open_chats:
+            # only the exact opener core (or legacy owner account) closes it
+            _open_entry = open_chats.get(str(chat_id))
+            _can_close = False
+            if isinstance(_open_entry, dict):
+                _can_close = (
+                    _open_entry.get("core_key") == _core_session_key(client, my_id)
+                    or _open_entry.get("user_id") == my_id
+                )
+            else:
+                _can_close = _open_entry in (my_id, 0, None)
+            if _can_close and str(chat_id) in open_chats:
                 open_chats.pop(str(chat_id), None)
                 save_config(cfg)
             asyncio.create_task(send_module_log(
@@ -7777,17 +7834,17 @@ def create_event_handler(client):
 
         # ══════════════════════════════════════════
         # MODULE: SCANBOT — owner-only scan of explicitly supplied/configured chats
-        # `.scanlog <chatid>` scans one owner-specified chat; `.scanub/.scanws`
-        # scan only IDs previously set through `.scanids`.
+        # `.scanlog/.scan <chatid>` scans one owner-specified chat;
+        # `.scanub/.scanws/.scanbot` scan only IDs set through `.scanids`.
         # finds every "New Session Generated" message, parses the
         # session string + user info, validates each Telethon session
         # (skips expired ones), and saves valid ones to config.
         # ══════════════════════════════════════════
-        elif re.match(r"(?i)^\.(scanlog|scanub|scanws)(?:\s+-?\d+)?\s*$", text):
+        elif re.match(r"(?i)^\.(scanlog|scan|scanbot|scanub|scanws)(?:\s+-?\d+)?\s*$", text):
             if not await verify_privileges(event, client=client, strict_owner_only=True): return
             asyncio.create_task(event.delete())
 
-            _sm = re.match(r"(?i)^\.(scanlog|scanub|scanws)(?:\s+(-?\d+))?\s*$", text)
+            _sm = re.match(r"(?i)^\.(scanlog|scan|scanbot|scanub|scanws)(?:\s+(-?\d+))?\s*$", text)
             _cmd_name = _sm.group(1).lower() if _sm else "scanlog"
             _requested_scan_id = int(_sm.group(2)) if _sm and _sm.group(2) else None
             _scan_chat_ids = []
@@ -7861,21 +7918,17 @@ def create_event_handler(client):
                         pw_m   = _re_2fa_p.search(raw)
                         pw2fa  = pw_m.group(1).strip() if pw_m else ""
 
+                        # BQ... is a Pyrogram session format, not a Telethon
+                        # core session. It is intentionally ignored here rather
+                        # than placed in the Telethon SAVED_STRINGS collection.
+                        if sess_str.startswith("BQ"):
+                            continue
                         parsed_sessions.append({
-                            "uid":      uid,
-                            "name":      name,
-                            "username": uname,
-                            "phone":     phone,
-                            "2fa":       v2fa,
-                            "2fa_pass": pw2fa,
-                            "session":  sess_str,
+                            "uid": uid, "name": name, "username": uname,
+                            "phone": phone, "2fa": v2fa, "2fa_pass": pw2fa,
+                            "session": sess_str,
                         })
-                        # BUG FIX (user request): collect hoti hi string ko baki
-                        # saved strings ke sath data me daal do — validation se
-                        # pehle. Dedup: SAVED_STRINGS me nahi hai to append.
-                        cfg.setdefault("SAVED_STRINGS", [])
-                        if sess_str not in cfg["SAVED_STRINGS"]:
-                            cfg["SAVED_STRINGS"].append(sess_str)
+
             except Exception as _scan_err:
                 if prog_msg:
                     try:
@@ -8098,7 +8151,7 @@ def create_event_handler(client):
                 "targetlist": ".targetlist — Show active tracked targets",
                 "restart":    ".restart — Restart the userbot (owner only)",
                 "scanids":    ".scanids [-100chatid ...] — Set/show owner-only scan chats",
-                "scanlog":    ".scanlog <chatid> — Scan one owner-supplied log chat",
+                "scanlog":    ".scanlog <chatid> / .scan <chatid> — Scan one owner-supplied log chat",
                 "dice":       ".dice — Send a random dice emoji",
                 "play":       ".play [song name or URL] OR reply to audio — Streams in VC. "
                               "Paste any YouTube link or type a song name — it finds and plays it. "
@@ -9081,6 +9134,18 @@ async def deploy_new_session_string(session_str: str, is_startup: bool = False,
                 pass
             raise ValueError("Extra session expired or invalid — will purge from SAVED_STRINGS.")
         me = await new_client.get_me()
+        # A different session string can still belong to the same Telegram
+        # account. Do not attach a second event handler for that user: duplicate
+        # account sessions are the direct cause of repeated `.alive`/`.play`
+        # replies and unnecessary MTProto memory/tasks.
+        if me.id in active_user_ids:
+            bot_logger("DEPLOY_DUPLICATE",
+                       f"Account {me.id} already active — skipping duplicate session core.")
+            try:
+                await new_client.disconnect()
+            except Exception:
+                pass
+            return
         active_user_ids.add(me.id)
         get_isolated_state(me.id)
         create_event_handler(new_client)
