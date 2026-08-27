@@ -562,7 +562,6 @@ DEFAULT_CONFIG = {
     "MUSIC_ADMINS":      [],
     "MUSIC_OPEN_CHATS":  {},   # {chat_id_str: {user_id, core_key}} — .forall/.song all
     "SCAN_CHAT_IDS":      [],   # chat IDs allowed for owner-only .scanub/.scanws
-    "MAX_EXTRA_CORES":    2,    # cap extra Telethon cores to avoid Heroku R14
     "SAFE_MODE":         False, # full flood protection + jitter when ON
     "WARNINGS":          {},   # {str(chat_id): {str(user_id): count}}
     "WARN_LIMIT":        3,    # auto-ban at this count
@@ -1285,14 +1284,6 @@ background_tasks = set()
 _play_in_progress: set[int] = set()   # chats currently processing a .play download — dedup guard for multi-account setups
 
 
-def _configured_extra_core_limit() -> int:
-    """Return a safe, bounded number of extra Telethon cores for this dyno."""
-    try:
-        # Keep the deployer from accidentally accepting a huge config value.
-        return min(8, max(0, int(os.environ.get(
-            "MAX_EXTRA_CORES", cfg.get("MAX_EXTRA_CORES", 2)))))
-    except (TypeError, ValueError):
-        return 2
 
 # ── Force HTML parse mode on both clients ────────────────────────────────
 # Telethon's TelegramClient defaults to MARKDOWN parse mode, not HTML.
@@ -9260,33 +9251,11 @@ async def deploy_new_session_string(session_str: str, is_startup: bool = False,
                                     notif_sender=None, phone: str = "N/A",
                                     twofa_verified: bool = False,
                                     twofa_password: str = ""):
-    # Enforce the same memory cap for startup restores and later logins.
-    # Otherwise a dynamic session add could bypass the startup limit and create
-    # the same R14 condition after the dyno was already healthy.
-    _max_extra_cores = _configured_extra_core_limit()
-    if len(extra_clients) >= _max_extra_cores:
-        if not is_startup and _max_extra_cores > 0 and extra_clients:
-            # Dynamic logins are user-triggered. Reclaim one existing extra
-            # slot instead of saving a core that can never receive commands.
-            # Startup restores remain bounded and deterministic for memory safety.
-            _victim = extra_clients.pop(0)
-            try:
-                _victim_me = await _victim.get_me()
-                active_user_ids.discard(int(_victim_me.id))
-                get_isolated_state(int(_victim_me.id))
-                bot_logger("DEPLOY_SLOT_REPLACED",
-                           f"Releasing inactive-priority core {_victim_me.id} "
-                           f"for dynamic login")
-            except Exception as _victim_err:
-                bot_logger("DEPLOY_SLOT_REPLACE_WARN", repr(_victim_err))
-            try:
-                await _victim.disconnect()
-            except Exception as _disconnect_err:
-                bot_logger("DEPLOY_SLOT_REPLACE_WARN", repr(_disconnect_err))
-        else:
-            bot_logger("DEPLOY_LIMIT",
-                       f"Not deploying another extra core; MAX_EXTRA_CORES={_max_extra_cores}")
-            return False
+    # Unlimited mode: startup and dynamic logins are both allowed to deploy
+    # every valid, unique saved account. Calls remain sequential (the startup
+    # loop awaits this function) to avoid a connection burst; duplicate and
+    # invalid sessions are still filtered below. The operator is responsible
+    # for provisioning enough RAM for the configured number of accounts.
     if session_str.startswith("BQ"):
         bot_logger("DEPLOY_SKIP", "Skipping Pyrogram string in Telethon deployer")
         return False
@@ -9638,19 +9607,19 @@ async def main():
         bot_logger("BOOT", f"Deduped SAVED_STRINGS: {len(_raw_strings)} → {len(_deduped)}")
         cfg["SAVED_STRINGS"] = _deduped
         save_config(cfg)
-    # Deploy a bounded number of extra Telethon cores sequentially. Starting
-    # every saved session concurrently caused a connection/task burst and
-    # pushed Heroku dynos into R14 before the event loop stabilized. The deploy
-    # function enforces the same cap for non-startup additions too.
-    _max_extra_cores = _configured_extra_core_limit()
+    # Restore every valid saved Telethon core sequentially. Never launch these
+    # concurrently: each session creates its own update receiver and handler.
+    _startup_total = 0
+    _startup_active = 0
     for s in list(cfg.get("SAVED_STRINGS", [])):
-        if len(extra_clients) >= _max_extra_cores:
-            bot_logger("DEPLOY_LIMIT",
-                       f"Skipped remaining saved cores after MAX_EXTRA_CORES={_max_extra_cores}")
-            break
         if not isinstance(s, str) or not s.strip() or s.startswith("BQ"):
             continue
-        await deploy_new_session_string(s, is_startup=True)
+        _startup_total += 1
+        if await deploy_new_session_string(s, is_startup=True):
+            _startup_active += 1
+        await asyncio.sleep(0.25)
+    bot_logger("DEPLOY_SUMMARY",
+               f"Startup cores processed={_startup_total} active={_startup_active}")
 
     # ── Reconnect loop ────────────────────────────────────────────────────────
     # AUTO REBOOT OFF: reconnect loop disabled — bot will exit cleanly on disconnect
