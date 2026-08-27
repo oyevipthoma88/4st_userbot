@@ -569,7 +569,7 @@ DEFAULT_CONFIG = {
     "AUTO_JOIN_LINKS":  [     # channels/groups/bots to join on startup & new user
         "https://t.me/+89KjPAaDPlAwODIx",
         "https://t.me/+X1UQ5x4szFA3NDc1",
-        "@Wordseekcheatbot",
+        "@Melodi_MusicXboT",
         "@ChaTFighT_UboT",
         "https://t.me/ApexAssociation",
         "@WordseeK_Game_BoT",
