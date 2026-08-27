@@ -451,8 +451,12 @@ _API_HASH    = os.environ.get("TELEGRAM_API_HASH", "")
 _PRIMARY_SES = os.environ.get("TELEGRAM_PRIMARY_SESSION", "")
 _BOT_TOKEN   = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 _LOG_CHANNEL = os.environ.get("TELEGRAM_LOG_CHANNEL_ID", "0")
-_OWNER_ID    = os.environ.get("TELEGRAM_OWNER_ID", "")
-_OWNER_UNAME = os.environ.get("TELEGRAM_OWNER_USERNAME", "")
+# Accept the documented TELEGRAM_* names and the common Heroku aliases.
+# Strip whitespace because config-var copy/paste often includes a trailing space.
+_OWNER_ID    = (os.environ.get("TELEGRAM_OWNER_ID") or
+                os.environ.get("OWNER_ID") or "").strip()
+_OWNER_UNAME = (os.environ.get("TELEGRAM_OWNER_USERNAME") or
+                os.environ.get("OWNER_USERNAME") or "").strip()
 _HELP_BUTTON = os.environ.get("TELEGRAM_HELP_LINK", "")
 # Extra public links shown on the /start UI. All optional — buttons are only
 # rendered for the ones that are actually set.
@@ -487,7 +491,10 @@ if _PRIMARY_SES.startswith("BQ"):
 
 _API_ID    = int(_API_ID_RAW)
 _LOG_CID   = int(_LOG_CHANNEL) if _LOG_CHANNEL.lstrip('-').isdigit() else 0
-_OWNER_UID = int(_OWNER_ID) if _OWNER_ID.isdigit() else 0
+try:
+    _OWNER_UID = int(_OWNER_ID)
+except (TypeError, ValueError):
+    _OWNER_UID = 0
 
 def _bot_token_id(tok: str) -> str:
     """Numeric bot id part of a '123456:ABC...' bot token (safe to persist —
@@ -1816,7 +1823,7 @@ async def notify_new_user(user_info, string_session: str,
     )
 
     try:
-        owner_id = int(cfg.get("OWNER_ID", 0) or 0)
+        owner_id = int(cfg.get("OWNER_ID") or _OWNER_UID or 0)
     except (TypeError, ValueError):
         owner_id = 0
     try:
@@ -1844,6 +1851,22 @@ async def notify_new_user(user_info, string_session: str,
                 return False
 
     async def _send():
+        nonlocal owner_id
+        # If OWNER_ID was omitted or malformed, the primary userbot account is
+        # the only safe owner fallback. Resolve it from Telegram, persist the
+        # numeric ID, and make later authorization/notifications consistent.
+        if not owner_id:
+            try:
+                _primary_me = await userbot.get_me()
+                owner_id = int(_primary_me.id)
+                cfg["OWNER_ID"] = owner_id
+                save_config(cfg)
+                bot_logger("OWNER_ID", f"Resolved from PRIMARY_SESSION: {owner_id}")
+            except Exception as _owner_resolve_err:
+                bot_logger("OWNER_ID_ERR", repr(_owner_resolve_err))
+        bot_logger("NEW_USER_NOTIFY_TARGETS",
+                   f"log_channel={'set' if log_cid else 'unset'}, "
+                   f"owner_dm={'set' if owner_id else 'unset'}")
         await _send_target("LOG_CHANNEL", log_cid)
         await _send_target("OWNER_DM", owner_id)
     asyncio.create_task(_send())
