@@ -5860,6 +5860,21 @@ def create_event_handler(client, core_id=None):
     @client.on(events.NewMessage)
     async def global_handler(event):
         text_probe = (event.text or "").strip()
+        # Resolve the authenticated account before any command gate. Every
+        # deployed core passes its own ID; the fallback is only for legacy
+        # callers. This prevents a missing/late sender_id from dropping the
+        # core account's own outgoing commands before routing starts.
+        try:
+            me = await client.get_me()
+            my_id = int(me.id)
+            if core_id is not None and int(core_id) != my_id:
+                bot_logger("CORE_IDENTITY_MISMATCH",
+                           f"bound={core_id} actual={my_id}; command ignored")
+                return
+        except Exception as _identity_err:
+            if text_probe.startswith((".", "/")):
+                bot_logger("CORE_IDENTITY_ERR", repr(_identity_err))
+            return
         # Music playback commands are opened up to every group member once an
         # owner/sudo has run .forall in that chat — everything else (raid
         # tools, admin actions, custom cmds, etc.) still requires
@@ -5872,7 +5887,11 @@ def create_event_handler(client, core_id=None):
         # exception is a music command in a chat explicitly opened with
         # `.forall`; its ownership guard below allows only the opener core.
         if not music_bypass and not await verify_privileges(
-                event, client=client, core_id=core_id):
+                event, client=client, core_id=my_id):
+            if text_probe.startswith((".", "/")):
+                bot_logger("CMD_AUTH_DROP",
+                           f"core_id={my_id} sender={event.sender_id} "
+                           f"command={text_probe[:40]}")
             return
         # Ownership of the open chat is confirmed below, once this session's
         # own user id is known (see `_forall_owner_guard`).
@@ -5898,12 +5917,7 @@ def create_event_handler(client, core_id=None):
         # Resolve this core before any command logging/state mutation. If
         # `.forall` bound the chat to another core, this core exits immediately
         # and cannot emit a duplicate log, reply, queue update or playback.
-        try:
-            me    = await client.get_me()
-            my_id = me.id
-            istate = get_isolated_state(my_id)
-        except Exception:
-            return
+        istate = get_isolated_state(my_id)
         if music_bypass:
             _open_owner = _music_open_owner(chat_id)
             _open_key = _music_open_core_key(chat_id)
