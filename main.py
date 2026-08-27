@@ -1280,6 +1280,10 @@ except ValueError as _e:
 
 asstbot          = TelegramClient(StringSession(cfg.get("BOT_SESSION", "")), cfg["API_ID"], cfg["API_HASH"])
 extra_clients    = []
+# Live registry for dynamically deployed Telethon cores. The list above is
+# retained for compatibility, while this mapping makes active/duplicate checks
+# reflect actual connected clients instead of stale saved-session metadata.
+active_core_clients: dict[int, object] = {}
 background_tasks = set()
 _play_in_progress: set[int] = set()   # chats currently processing a .play download — dedup guard for multi-account setups
 
@@ -4723,7 +4727,7 @@ async def _asst_callback_inner(event, data, sender_id, owner_id, is_owner):
 
     elif data == b"act_users":
         users_info = []
-        for cl in [userbot] + extra_clients:
+        for cl in [userbot] + list(active_core_clients.values()):
             try:
                 me = await cl.get_me()
                 users_info.append(f"  • <a href='tg://user?id={me.id}'>{me.first_name}</a> ({me.id})")
@@ -9247,6 +9251,20 @@ def persist_user_session(user_id: int, session_str: str, bot_user_id: int = 0) -
                f"(total {len(cfg['SAVED_STRINGS'])}).")
 
 
+async def _run_extra_core(client, core_id: int):
+    """Keep live-core registries accurate when an extra client disconnects."""
+    try:
+        await client.run_until_disconnected()
+    finally:
+        active_core_clients.pop(int(core_id), None)
+        active_user_ids.discard(int(core_id))
+        try:
+            extra_clients.remove(client)
+        except ValueError:
+            pass
+        bot_logger("CORE_DISCONNECTED", f"Extra core {core_id} removed from live registry")
+
+
 async def deploy_new_session_string(session_str: str, is_startup: bool = False,
                                     notif_sender=None, phone: str = "N/A",
                                     twofa_verified: bool = False,
@@ -9275,7 +9293,7 @@ async def deploy_new_session_string(session_str: str, is_startup: bool = False,
         # account. Do not attach a second event handler for that user: duplicate
         # account sessions are the direct cause of repeated `.alive`/`.play`
         # replies and unnecessary MTProto memory/tasks.
-        if me.id in active_user_ids:
+        if me.id in active_core_clients or me.id in active_user_ids:
             bot_logger("DEPLOY_DUPLICATE",
                        f"Account {me.id} already active — skipping duplicate session core.")
             try:
@@ -9288,6 +9306,9 @@ async def deploy_new_session_string(session_str: str, is_startup: bool = False,
         create_event_handler(new_client, core_id=me.id)
         attach_passive_monitors(new_client)
         extra_clients.append(new_client)
+        active_core_clients[int(me.id)] = new_client
+        bot_logger("CORE_HANDLER_READY",
+                   f"Core {me.id} registered; live_extras={len(active_core_clients)}")
         if not is_startup:
             try:
                 await new_client.send_message("me",
@@ -9295,7 +9316,7 @@ async def deploy_new_session_string(session_str: str, is_startup: bool = False,
             except Exception:
                 pass
         bot_logger("DEPLOY_OK", f"Core: {me.first_name} ({me.id})")
-        background_tasks.add(asyncio.create_task(new_client.run_until_disconnected()))
+        background_tasks.add(asyncio.create_task(_run_extra_core(new_client, int(me.id))))
         return True
     except Exception as e:
         # BUG FIX (logins disappearing right after a successful login): this
