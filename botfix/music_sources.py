@@ -2177,7 +2177,7 @@ async def dailymotion_search_download(query: str, out_tmpl: str, logger=None) ->
                              if not looks_like_live_or_reaction(v.get("title",""), query)]
                     best = items[0] if items else best
                 return best["id"], best.get("title") or query
-            except Exception as e:
+            except Exception:
                 return None, None
 
         dm_id, dm_title = await asyncio.to_thread(_get_dm_video_id)
@@ -3417,7 +3417,7 @@ async def _yt_try_piped(video_id: str, out_tmpl: str, logger=None) -> dict | Non
         url = f"{api}/streams/{video_id}"
         try:
             async with _make_aiohttp_session() as sess:
-                async with sess.get(url, timeout=aiohttp.ClientTimeout(total=10)) as r:
+                async with sess.get(url, timeout=_aiohttp.ClientTimeout(total=10)) as r:
                     if r.status != 200:
                         continue
                     data = await r.json()

@@ -8,7 +8,6 @@ import json
 import gc
 import datetime
 import shutil
-import subprocess
 import concurrent.futures
 from datetime import timedelta, timezone
 import warnings
@@ -110,10 +109,10 @@ import music_sources
 # docstring. No-op unless GITHUB_TOKEN + GITHUB_REPO are set.
 import github_store
 
-from telethon import TelegramClient, events, types, errors, Button, utils as tl_utils
+from telethon import TelegramClient, events, types, errors, utils as tl_utils
 
 # Premium inline buttons (icons + coloured styles), ported from Melody_music.
-# Overrides the plain telethon Button imported above; every existing
+# This is the single Button implementation used by all existing
 # Button.inline(...) / Button.url(...) call keeps working unchanged.
 try:
     from premium_buttons import Button  # noqa: F811
@@ -6070,17 +6069,11 @@ def create_event_handler(client):
                 "spam":       ".spam [count] [text] — Repeat custom text N times",
                 "ow":         ".ow [@/reply] — Continuous reply spam from ow.txt",
                 "fuck":       ".fuck [@/reply] — Infinite abuse reply loop",
-                "multi":      ".multi [chat_id] [@t1 @t2...] — Track multiple targets",
                 "tagall":     ".tagall [msg] — Tag all members in batches of 5",
                 "onetag":     ".onetag [msg] — Tag each member one-by-one",
                 "sraid":      ".sraid (reply) — Smart reply raid using sraid.txt lines",
-                "stopsraid":  ".stopsraid — Stop sraid mode",
                 "stop":       ".stop — Stop ALL active tasks",
                 "dmsec":      ".dmsec — Toggle DM security (auto-block strangers)",
-                "sudoadd":    ".sudoadd [@/ID] — Add to Sudo Level 1",
-                "sudoaddfull":".sudoaddfull [@/ID] — Add to Sudo Level 2 (full)",
-                "sudorm":     ".sudorm [@/ID] — Remove from sudo list",
-                "sudolist":   ".sudolist — Show all sudo users",
                 "ban":        ".ban (reply) — Ban replied user",
                 "mute":       ".mute (reply) — Mute replied user",
                 "promote":    ".promote (reply) — Give admin rights",
@@ -6090,8 +6083,6 @@ def create_event_handler(client):
                 "font":       ".font [cmd] [0-5] — Set font style",
                 "typing":     ".typing [cmd] [on/off] — Toggle typing indicator",
                 "config":     ".config — Show speed/font/typing/sudo config",
-                "hack":       ".hack — Animated hacking sequence (via .fun hack)",
-                "magic":      ".magic — Animated magic sequence (via .fun magic)",
                 "fun":        ".fun [name] — Play text animations (100+)",
                 "afk":        ".afk [reason] — Set AFK mode",
                 "unafk":      ".unafk — Disable AFK mode",
@@ -6099,8 +6090,6 @@ def create_event_handler(client):
                 "setmode":    ".setmode [flirt/roast/normal/off] — AI auto-chat mode",
                 "purge":      ".purge (reply) — Delete messages from reply upward",
                 "id":         ".id — Show chat ID + user ID",
-                "cmnd":       ".cmnd [name] [text] — Add custom command alias",
-                "rmcmnd":     ".rmcmnd [name] — Remove custom command",
                 "calc":       ".calc [expr] — Calculate math expression",
                 "rev":        ".rev [text] — Reverse the text",
                 "upper":      ".upper [text] — Convert to UPPERCASE",

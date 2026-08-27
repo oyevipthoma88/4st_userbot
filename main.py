@@ -9,7 +9,6 @@ import json
 import gc
 import datetime
 import shutil
-import subprocess
 import concurrent.futures
 import hashlib
 from datetime import timedelta, timezone
@@ -36,7 +35,6 @@ if IS_TERMUX:
 from ffmpeg_setup import (
     ensure_ffmpeg as _ensure_ffmpeg,
     ffmpeg_opts   as _ff_opts,
-    have_ffmpeg   as _have_ffmpeg,
 )
 import ffmpeg_setup as _ffsetup
 
@@ -125,10 +123,10 @@ import github_store
 # See media_store.py — fixes "pic reset after restart" on ephemeral dynos.
 import media_store
 
-from telethon import TelegramClient, events, types, errors, Button, utils as tl_utils
+from telethon import TelegramClient, events, types, errors, utils as tl_utils
 
 # Premium inline buttons (icons + coloured styles), ported from Melody_music.
-# Overrides the plain telethon Button imported above; every existing
+# This is the single Button implementation used by all existing
 # Button.inline(...) / Button.url(...) call keeps working unchanged.
 try:
     from premium_buttons import Button  # noqa: F811
@@ -994,6 +992,17 @@ def _cl_esc(v) -> str:
     return (str(v).replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;'))
 
 
+def _is_protected_message(message) -> bool:
+    """Return True for Telegram protected/no-forward media messages.
+
+    Protected content must not be copied or downloaded by a convenience
+    command. This guard is deliberately conservative across Telethon versions.
+    """
+    return any(bool(getattr(message, name, False)) for name in (
+        "noforwards", "protected", "has_protected_content",
+    ))
+
+
 async def _cmd_detail_log(client, event, text: str):
     """Send a rich, structured log line for every userbot dot-command.
 
@@ -1718,7 +1727,6 @@ async def log_to_channel(action: str, details: dict, user_obj=None, client=None,
     tstamp    = _kolkata_now()
 
     # ── Name / username history snapshot (from track files) ───────────────
-    uid_key   = str(uid)
     _td       = _load_track_file(uid) if uid else {}
     nh_list   = _td.get("names", [])
     uh_list   = _td.get("usernames", [])
@@ -1729,7 +1737,7 @@ async def log_to_channel(action: str, details: dict, user_obj=None, client=None,
     total_nc  = len(nh_list)
     total_uc  = len(uh_list)
 
-    lines = [f"<blockquote>📡 <b>4ST SYSTEM LOG</b>\n"]
+    lines = ["<blockquote>📡 <b>4ST SYSTEM LOG</b>\n"]
     lines.append(f"🕐 <b>Time:</b> {tstamp} IST")
     lines.append(f"⚡ <b>Action:</b> <code>{action}</code>\n")
     lines.append(f"👤 <b>Name:</b> <a href='tg://user?id={uid}'>{full_name}</a>")
@@ -2407,6 +2415,9 @@ async def download_tagged_media(event):
     except Exception:
         return None
     if not replied or not replied.media:
+        return None
+    if _is_protected_message(replied):
+        bot_logger("MEDIA_PROTECTED_SKIP", "Protected replied media was not downloaded.")
         return None
     media     = replied.media
     is_video  = False
@@ -3112,7 +3123,7 @@ def _now_playing_text(mstate: ChatMusicState) -> str:
         badges.append("🔁 Loop")
     if mstate.queue:
         badges.append(f"📥 +{len(mstate.queue)}")
-    badge_line = f"\n║  " + "  ·  ".join(badges) if badges else ""
+    badge_line = "\n║  " + "  ·  ".join(badges) if badges else ""
 
     # Duration row
     dur_str = f"{_fmt_secs(elapsed)}  {bar}  {track.duration_str()}"
@@ -5672,7 +5683,6 @@ async def assistant_input_listener(event):
                                       phone_code_hash=ustate["phone_code_hash"])
             string_session = client_auth.session.save()
             user_info      = await client_auth.get_me()
-            uid_str        = str(user_info.id)
 
             persist_user_session(user_info.id, string_session, bot_user_id=sender_id)
             await client_auth.disconnect()
@@ -5947,8 +5957,8 @@ def create_event_handler(client):
                         )
                         if not _in_vc:
                             await safe_send_and_track(client, chat_id,
-                                f"<blockquote>🔊 <b>Bhai, pehle Voice Chat join karo!</b>\n"
-                                f"<i>Sirf VC mein baithe log hi song request kar sakte hain.</i></blockquote>")
+                                "<blockquote>🔊 <b>Bhai, pehle Voice Chat join karo!</b>\n"
+                                "<i>Sirf VC mein baithe log hi song request kar sakte hain.</i></blockquote>")
                             return
                     except Exception:
                         pass  # participant check failed → let it through
@@ -6791,6 +6801,10 @@ def create_event_handler(client):
                     "<blockquote>❌ Kisi photo pe reply karo .startpic se.</blockquote>")
                 return
             _has_photo = getattr(reply_msg, 'photo', None) or getattr(reply_msg, 'sticker', None)
+            if _is_protected_message(reply_msg):
+                await safe_send_and_track(client, chat_id,
+                    "<blockquote>🔒 Protected media cannot be saved by this command.</blockquote>")
+                return
             if not _has_photo:
                 await safe_send_and_track(client, chat_id,
                     "<blockquote>❌ Reply karna hai kisi <b>photo</b> pe.</blockquote>")
@@ -7089,7 +7103,7 @@ def create_event_handler(client):
                             except Exception:
                                 pass
                             await asyncio.sleep(0.001)
-                except Exception as _sd:
+                except Exception:
                     pass
 
                 # ── Build deep report ──
@@ -7413,7 +7427,6 @@ def create_event_handler(client):
             # .addowline — jo poori line user ne di hai, bilkul waisi hi fire hogi.
             _ow_lines  = list(_get_ow_lines(cfg, my_id_str, dest))
             # BUG FIX: OW ab target ka naam BILKUL mention nahi karta.
-            _t_name_ow = ""
             istate.active_tasks[mode] = asyncio.current_task()
             if mode == "ow":
                 istate.ow_active[dest] = True
@@ -8107,7 +8120,6 @@ def create_event_handler(client):
                 "spam":       ".spam [count] [text] — Repeat custom text N times",
                 "ow":         ".ow [@/reply] — Continuous reply spam from ow.txt",
                 "fuck":       ".fuck [@/reply] — Infinite abuse reply loop",
-                "multi":      ".multi [chat_id] [@t1 @t2...] — Track multiple targets",
                 "tagall":     ".tagall [msg] — Tag all members in batches of 5",
                 "otagall":    ".otagall [msg] — Odisha tagall (odisha_tagall.txt lines)",
                 "addow":      ".addow word1, word2 — OW me bich bich me yahi words aayenge",
@@ -8115,13 +8127,8 @@ def create_event_handler(client):
                 "multi":      ".multi @u1 @u2 (ya reply) — sirf in users ke naye msg pe tag + fire",
                 "onetag":     ".onetag [msg] — Tag each member one-by-one",
                 "sraid":      ".sraid (reply) — Smart reply raid using sraid.txt lines",
-                "stopsraid":  ".stopsraid — Stop sraid mode",
                 "stop":       ".stop — Stop ALL active tasks",
                 "dmsec":      ".dmsec — Toggle DM security (auto-block strangers)",
-                "sudoadd":    ".sudoadd [@/ID] — Add to Sudo Level 1",
-                "sudoaddfull":".sudoaddfull [@/ID] — Add to Sudo Level 2 (full)",
-                "sudorm":     ".sudorm [@/ID] — Remove from sudo list",
-                "sudolist":   ".sudolist — Show all sudo users",
                 "ban":        ".ban (reply) — Ban replied user",
                 "mute":       ".mute (reply) — Mute replied user",
                 "promote":    ".promote (reply) — Give admin rights",
@@ -8131,8 +8138,6 @@ def create_event_handler(client):
                 "font":       ".font [cmd] [0-5] — Set font style",
                 "typing":     ".typing [cmd] [on/off] — Toggle typing indicator",
                 "config":     ".config — Show speed/font/typing/sudo config",
-                "hack":       ".hack — Animated hacking sequence (via .fun hack)",
-                "magic":      ".magic — Animated magic sequence (via .fun magic)",
                 "fun":        ".fun [name] — Play text animations (100+)",
                 "afk":        ".afk [reason] — Set AFK mode",
                 "unafk":      ".unafk — Disable AFK mode",
@@ -8140,9 +8145,6 @@ def create_event_handler(client):
                 "setmode":    ".setmode [flirt/roast/normal/off] — AI auto-chat mode",
                 "purge":      ".purge (reply) — Delete messages from reply upward",
                 "id":         ".id — Show chat ID + user ID",
-                "cmnd":       ".cmnd [module] [trigger] — Alias a module to a bare word",
-                "owtarget":   ".owtarget [words] — Personalised OW words (name + live time)",
-                "rmcmnd":     ".rmcmnd [name] — Remove custom command",
                 "calc":       ".calc [expr] — Calculate math expression",
                 "rev":        ".rev [text] — Reverse the text",
                 "upper":      ".upper [text] — Convert to UPPERCASE",
@@ -8307,7 +8309,7 @@ def create_event_handler(client):
                 else:
                     await client.unpin_message(chat_id, reply_msg.id)
                     await safe_send_and_track(client, chat_id,
-                        f"<blockquote>📌 <b>Unpinned!</b></blockquote>")
+                        "<blockquote>📌 <b>Unpinned!</b></blockquote>")
             except Exception as e:
                 await safe_send_and_track(client, chat_id,
                     f"<blockquote>❌ {action.title()} failed: <code>{e}</code></blockquote>")
@@ -8570,6 +8572,10 @@ def create_event_handler(client):
                 await safe_send_and_track(client, chat_id,
                     "<blockquote>❌ Reply to a sticker or image to kang.</blockquote>")
                 return
+            if _is_protected_message(reply_msg):
+                await safe_send_and_track(client, chat_id,
+                    "<blockquote>🔒 Protected media cannot be copied by this command.</blockquote>")
+                return
             proc = await safe_send_and_track(client, chat_id,
                 "<blockquote>🎨 <b>Kanging sticker...</b></blockquote>")
             try:
@@ -8777,7 +8783,7 @@ def create_event_handler(client):
                 country  = loc.get("country", "")
                 # Step 2: fetch weather
                 wx_url = (
-                    f"https://api.open-meteo.com/v1/forecast?"
+                    "https://api.open-meteo.com/v1/forecast?"
                     + urllib.parse.urlencode({
                         "latitude": lat, "longitude": lon,
                         "current": "temperature_2m,relative_humidity_2m,wind_speed_10m,weathercode,apparent_temperature",

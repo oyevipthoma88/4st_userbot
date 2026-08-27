@@ -2569,7 +2569,7 @@ async def dailymotion_search_download(query: str, out_tmpl: str, logger=None) ->
                              if not looks_like_live_or_reaction(v.get("title",""), query)]
                     best = items[0] if items else best
                 return best["id"], best.get("title") or query
-            except Exception as e:
+            except Exception:
                 return None, None
 
         dm_id, dm_title = await asyncio.to_thread(_get_dm_video_id)
