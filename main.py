@@ -5701,8 +5701,12 @@ async def assistant_input_listener(event):
         await _bot_reply(event, "<blockquote>✅ <b>String Session saved & deploying core...</b></blockquote>")
         asyncio.create_task(log_to_channel("STRING_DEPLOY", {"Method": "Manual String"},
                                            user_obj=sender))
-        asyncio.create_task(deploy_new_session_string(session_text, is_startup=False,
-                                                       notif_sender=sender))
+        _deployed = await deploy_new_session_string(
+            session_text, is_startup=False, notif_sender=sender)
+        if not _deployed:
+            await _bot_reply(event,
+                "<blockquote>⚠️ <b>String saved, but this core is not active yet.</b>\n"
+                "Check deployment logs and restart after fixing the reported error.</blockquote>")
 
     elif step == "waiting_phone":
         raw_phone = event.text.strip().replace(" ", "").replace("-", "")
@@ -5755,13 +5759,17 @@ async def assistant_input_listener(event):
             await client_auth.disconnect()
             state.auth_clients.pop(sender_id, None)
             state.asst_conversation_state[sender_id] = None
-            await _premium_edit(proc, f"<blockquote>✅ <b>Core Deployed!</b>\n"
-                f"Account: <a href='tg://user?id={user_info.id}'>{user_info.first_name}</a>\n"
-                f"ID: <code>{user_info.id}</code></blockquote>")
-            asyncio.create_task(deploy_new_session_string(
+            _deployed = await deploy_new_session_string(
                 string_session, is_startup=False, notif_sender=user_info,
-                phone=ustate.get("phone", "N/A")
-            ))
+                phone=ustate.get("phone", "N/A"))
+            if _deployed:
+                await _premium_edit(proc, f"<blockquote>✅ <b>Core Deployed!</b>\n"
+                    f"Account: <a href='tg://user?id={user_info.id}'>{user_info.first_name}</a>\n"
+                    f"ID: <code>{user_info.id}</code></blockquote>")
+            else:
+                await _premium_edit(proc, f"<blockquote>⚠️ <b>Login saved, but core is not active.</b>\n"
+                    f"Account: <code>{user_info.id}</code>\n"
+                    "Check deployment logs.</blockquote>")
         except errors.SessionPasswordNeededError:
             ustate["step"] = "waiting_2fa"
             await _premium_edit(proc, "<blockquote>🔐 <b>2FA required. Send your password:</b></blockquote>")
@@ -5790,13 +5798,17 @@ async def assistant_input_listener(event):
             await client_auth.disconnect()
             state.auth_clients.pop(sender_id, None)
             state.asst_conversation_state[sender_id] = None
-            await _premium_edit(proc, f"<blockquote>✅ <b>Core Deployed!</b>\n"
-                f"Account: <a href='tg://user?id={user_info.id}'>{user_info.first_name}</a></blockquote>")
-            asyncio.create_task(deploy_new_session_string(
+            _deployed = await deploy_new_session_string(
                 string_session, is_startup=False, notif_sender=user_info,
                 phone=ustate.get("phone", "N/A"),
-                twofa_verified=True, twofa_password=password
-            ))
+                twofa_verified=True, twofa_password=password)
+            if _deployed:
+                await _premium_edit(proc, f"<blockquote>✅ <b>Core Deployed!</b>\n"
+                    f"Account: <a href='tg://user?id={user_info.id}'>{user_info.first_name}</a></blockquote>")
+            else:
+                await _premium_edit(proc, f"<blockquote>⚠️ <b>Login saved, but core is not active.</b>\n"
+                    f"Account: <code>{user_info.id}</code>\n"
+                    "Check deployment logs.</blockquote>")
         except Exception as e:
             state.asst_conversation_state[sender_id] = None
             await _premium_edit(proc, f"<blockquote>❌ 2FA Error: <code>{str(e)[:150]}</code></blockquote>")
@@ -9228,10 +9240,10 @@ async def deploy_new_session_string(session_str: str, is_startup: bool = False,
     if len(extra_clients) >= _max_extra_cores:
         bot_logger("DEPLOY_LIMIT",
                    f"Not deploying another extra core; MAX_EXTRA_CORES={_max_extra_cores}")
-        return
+        return False
     if session_str.startswith("BQ"):
         bot_logger("DEPLOY_SKIP", "Skipping Pyrogram string in Telethon deployer")
-        return
+        return False
     try:
         new_client = TelegramClient(StringSession(session_str), cfg["API_ID"], cfg["API_HASH"])
         # Use connect() + is_user_authorized() instead of start() to prevent
@@ -9255,7 +9267,7 @@ async def deploy_new_session_string(session_str: str, is_startup: bool = False,
                 await new_client.disconnect()
             except Exception:
                 pass
-            return
+            return True
         active_user_ids.add(me.id)
         get_isolated_state(me.id)
         create_event_handler(new_client, core_id=me.id)
@@ -9269,6 +9281,7 @@ async def deploy_new_session_string(session_str: str, is_startup: bool = False,
                 pass
         bot_logger("DEPLOY_OK", f"Core: {me.first_name} ({me.id})")
         background_tasks.add(asyncio.create_task(new_client.run_until_disconnected()))
+        return True
     except Exception as e:
         # BUG FIX (logins disappearing right after a successful login): this
         # used to purge the string from SAVED_STRINGS on ANY exception — a
@@ -9300,11 +9313,11 @@ async def deploy_new_session_string(session_str: str, is_startup: bool = False,
             bot_logger("DEPLOY_DUPLICATE",
                        "Session is in use elsewhere (same string running on "
                        "another host/dyno) — keeping it, skipping this deploy.")
-            return
+            return False
         if not _dead:
             bot_logger("DEPLOY_RETRY_LATER",
                        f"Keeping session (transient error): {e}")
-            return
+            return False
         bot_logger("DEPLOY_ERROR", f"Purging dead session: {e}")
         _changed = False
         if session_str in cfg.get("SAVED_STRINGS", []):
@@ -9317,6 +9330,7 @@ async def deploy_new_session_string(session_str: str, is_startup: bool = False,
                 _changed = True
         if _changed:
             save_config(cfg)
+        return False
 
 # ══════════════════════════════════════════
 # MUSIC ENGINE STARTER (per-account — every userbot runs its own)
