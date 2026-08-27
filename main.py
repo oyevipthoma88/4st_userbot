@@ -6567,28 +6567,46 @@ def create_event_handler(client, core_id=None):
             await safe_send_and_track(client, chat_id, help_msg)
 
         elif re.match(r"(?i)^\.(ping|alive)$", text):
-            # Only let this specific account respond to its own ping command.
-            # Use verify_privileges — handles own-account AND MASTER_SYNC automatically
-            if event.sender_id != my_id:
-                if not await verify_privileges(event, client=client):
-                    return
+            # Keep the Odishaubot user-facing status card, but retain the
+            # production per-core authorization for every logged-in account.
+            if not await verify_privileges(event, client=client, core_id=my_id):
+                return
             asyncio.create_task(event.delete())
             t_start = time.monotonic()
             uptime  = str(timedelta(seconds=int(time.monotonic() - BOOT_TIME)))
             real_ms = round((time.monotonic() - t_start) * 1000, 2)
-            ping_payload = (
-                "<blockquote expandable>"
-                "✨ <b>𝟒𝐒𝐓 𝐏𝐑𝐈𝐌𝐄 𝐂𝐎𝐑𝐄</b> ✨\n"
-                "┏━━━━━━━━━━━━━━━━━━━━┓\n"
-                f"┃ 📡 <b>Ping</b>     ⟶ <code>{real_ms} ms</code>\n"
-                f"┃ ⏱️ <b>Uptime</b>   ⟶ <code>{uptime}</code>\n"
-                "┃ ⚡ <b>Engine</b>   ⟶ <code>Telethon + PyTgCalls</code>\n"
-                "┃ 💠 <b>Status</b>   ⟶ <code>Perfect Sync</code>\n"
-                f"┃ 🎵 <b>Music</b>    ⟶ <code>{'🟢 Active' if _account_has_own_pyro(my_id) else '🔴 Pyrogram Not Setup'}</code>\n"
-                f"┃ 👤 <b>Master</b>   ⟶ <a href='tg://user?id={my_id}'>{me.first_name}</a>\n"
-                "┗━━━━━━━━━━━━━━━━━━━━┛"
-                "</blockquote>"
+            _music_state = (
+                "🟢 Active" if _account_has_own_pyro(my_id)
+                else "🔴 Pyrogram Not Setup"
             )
+            if cfg.get("BOT_LANG", "en").lower() in ("od", "odia", "or"):
+                ping_payload = (
+                    "<blockquote expandable>"
+                    "✨ <b>𝟒𝐒𝐓 𝐏𝐑𝐈𝐌𝐄 𝐂𝐎𝐑𝐄</b> ✨\n"
+                    "┏━━━━━━━━━━━━━━━━━━━━┓\n"
+                    f"┃ 📡 <b>ପିଙ୍ଗ</b>     ⟶ <code>{real_ms} ms</code>\n"
+                    f"┃ ⏱️ <b>ଚାଲିଛି</b>   ⟶ <code>{uptime}</code>\n"
+                    "┃ ⚡ <b>ଇଞ୍ଜିନ</b>   ⟶ <code>Telethon + PyTgCalls</code>\n"
+                    "┃ 💠 <b>ସ୍ଥିତି</b>    ⟶ <code>ସମ୍ପୂର୍ଣ୍ଣ ସିଙ୍କ</code>\n"
+                    f"┃ 🎵 <b>ସଙ୍ଗୀତ</b>   ⟶ <code>{'🟢 ସକ୍ରିୟ' if _music_state.startswith('🟢') else '🔴 ଲଗଇନ ବାକି'}</code>\n"
+                    f"┃ 👤 <b>ମାଲିକ</b>    ⟶ <a href='tg://user?id={my_id}'>{me.first_name}</a>\n"
+                    "┗━━━━━━━━━━━━━━━━━━━━┛"
+                    "</blockquote>"
+                )
+            else:
+                ping_payload = (
+                    "<blockquote expandable>"
+                    "✨ <b>𝟒𝐒𝐓 𝐏𝐑𝐈𝐌𝐄 𝐂𝐎𝐑𝐄</b> ✨\n"
+                    "┏━━━━━━━━━━━━━━━━━━━━┓\n"
+                    f"┃ 📡 <b>Ping</b>     ⟶ <code>{real_ms} ms</code>\n"
+                    f"┃ ⏱️ <b>Uptime</b>   ⟶ <code>{uptime}</code>\n"
+                    "┃ ⚡ <b>Engine</b>   ⟶ <code>Telethon + PyTgCalls</code>\n"
+                    "┃ 💠 <b>Status</b>   ⟶ <code>Perfect Sync</code>\n"
+                    f"┃ 🎵 <b>Music</b>    ⟶ <code>{_music_state}</code>\n"
+                    f"┃ 👤 <b>Master</b>   ⟶ <a href='tg://user?id={my_id}'>{me.first_name}</a>\n"
+                    "┗━━━━━━━━━━━━━━━━━━━━┛"
+                    "</blockquote>"
+                )
             await safe_send_and_track(client, chat_id, ping_payload)
 
         elif re.match(r"(?i)^\.fun(?:\s+(.+))?$", text):
