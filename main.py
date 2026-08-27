@@ -5668,8 +5668,35 @@ async def assistant_input_listener(event):
             return
         all_known = cfg["SAVED_STRINGS"]
         if session_text in all_known:
-            await _bot_reply(event, "<blockquote>❌ <b>This String is already registered.</b></blockquote>")
+            # A previous login may have saved the string but failed to get a
+            # live slot because the extra-core memory cap was full. Treat an
+            # inactive saved string as a deploy retry, not as a hard duplicate.
+            _saved_uid = next((uid for uid, saved in
+                               (cfg.get("USER_MAPS", {}).get("telethon", {}) or {}).items()
+                               if saved == session_text), None)
+            try:
+                _saved_active = bool(_saved_uid and
+                                     int(_saved_uid) in active_user_ids)
+            except (TypeError, ValueError):
+                _saved_active = False
+            if _saved_active:
+                await _bot_reply(event,
+                    "<blockquote>❌ <b>This String is already registered.</b>\n"
+                    "This core is already active.</blockquote>")
+                state.asst_conversation_state[sender_id] = None
+                return
             state.asst_conversation_state[sender_id] = None
+            await _bot_reply(event,
+                "<blockquote>🔄 <b>String already saved; activating its core...</b></blockquote>")
+            _retried = await deploy_new_session_string(
+                session_text, is_startup=False, notif_sender=sender)
+            if _retried:
+                await _bot_reply(event,
+                    "<blockquote>✅ <b>Saved core is active now.</b></blockquote>")
+            else:
+                await _bot_reply(event,
+                    "<blockquote>⚠️ <b>String is saved, but core activation failed.</b>\n"
+                    "Check <code>DEPLOY_LIMIT</code>/<code>DEPLOY_ERROR</code> logs.</blockquote>")
             return
         state.asst_conversation_state[sender_id] = None
         # Validate the string BEFORE saving so a dead/typo string never lands
@@ -9238,9 +9265,28 @@ async def deploy_new_session_string(session_str: str, is_startup: bool = False,
     # the same R14 condition after the dyno was already healthy.
     _max_extra_cores = _configured_extra_core_limit()
     if len(extra_clients) >= _max_extra_cores:
-        bot_logger("DEPLOY_LIMIT",
-                   f"Not deploying another extra core; MAX_EXTRA_CORES={_max_extra_cores}")
-        return False
+        if not is_startup and _max_extra_cores > 0 and extra_clients:
+            # Dynamic logins are user-triggered. Reclaim one existing extra
+            # slot instead of saving a core that can never receive commands.
+            # Startup restores remain bounded and deterministic for memory safety.
+            _victim = extra_clients.pop(0)
+            try:
+                _victim_me = await _victim.get_me()
+                active_user_ids.discard(int(_victim_me.id))
+                get_isolated_state(int(_victim_me.id))
+                bot_logger("DEPLOY_SLOT_REPLACED",
+                           f"Releasing inactive-priority core {_victim_me.id} "
+                           f"for dynamic login")
+            except Exception as _victim_err:
+                bot_logger("DEPLOY_SLOT_REPLACE_WARN", repr(_victim_err))
+            try:
+                await _victim.disconnect()
+            except Exception as _disconnect_err:
+                bot_logger("DEPLOY_SLOT_REPLACE_WARN", repr(_disconnect_err))
+        else:
+            bot_logger("DEPLOY_LIMIT",
+                       f"Not deploying another extra core; MAX_EXTRA_CORES={_max_extra_cores}")
+            return False
     if session_str.startswith("BQ"):
         bot_logger("DEPLOY_SKIP", "Skipping Pyrogram string in Telethon deployer")
         return False
