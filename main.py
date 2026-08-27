@@ -2101,8 +2101,15 @@ async def auto_scanbot_task():
         pass
 
 
-async def verify_privileges(event, client, strict_owner_only=False):
+async def verify_privileges(event, client, strict_owner_only=False, core_id=None):
     """Strict per-account authorization with explicit master-sync opt-in.
+
+    ``event.sender_id`` is not guaranteed to be populated consistently for an
+    outgoing event across Telethon versions. A command sent by the account
+    represented by ``client`` is nevertheless unambiguously its own command,
+    so outgoing events are accepted before the normal sender-id checks.
+    ``core_id`` is cached by the per-client handler to avoid an extra API call
+    on every command.
 
     Each core accepts commands from its own account and its own sudo bucket.
     The global owner may control other cores only when ``MASTER_SYNC`` is ON;
@@ -2110,9 +2117,15 @@ async def verify_privileges(event, client, strict_owner_only=False):
     core. Normal users never cross this boundary.
     """
     try:
-        me     = await client.get_me()
-        my_id  = me.id
+        my_id  = int(core_id) if core_id else (await client.get_me()).id
+        # Telethon can expose an outgoing self-message with a missing or
+        # non-normalized sender_id. Since this event was emitted by this exact
+        # client, it is safe to treat it as the core owner's command.
+        if getattr(event, "outgoing", False):
+            return True
         sender = event.sender_id
+        if sender is None:
+            sender = getattr(getattr(event, "message", None), "sender_id", None)
         if sender == my_id:
             return True
         # Global owner controls every core only after explicitly enabling
@@ -5785,7 +5798,8 @@ def _is_music_open_chat(chat_id: int, my_id: int | None = None) -> bool:
         return False
     return True if my_id is None else owner == my_id
 
-def create_event_handler(client):
+def create_event_handler(client, core_id=None):
+    """Attach the command router to one authenticated Telethon core."""
     @client.on(events.NewMessage)
     async def global_handler(event):
         text_probe = (event.text or "").strip()
@@ -5800,7 +5814,8 @@ def create_event_handler(client):
         # Userbot commands are strict owner/sudo-only by default. The sole
         # exception is a music command in a chat explicitly opened with
         # `.forall`; its ownership guard below allows only the opener core.
-        if not music_bypass and not await verify_privileges(event, client=client):
+        if not music_bypass and not await verify_privileges(
+                event, client=client, core_id=core_id):
             return
         # Ownership of the open chat is confirmed below, once this session's
         # own user id is known (see `_forall_owner_guard`).
@@ -9154,7 +9169,7 @@ async def deploy_new_session_string(session_str: str, is_startup: bool = False,
             return
         active_user_ids.add(me.id)
         get_isolated_state(me.id)
-        create_event_handler(new_client)
+        create_event_handler(new_client, core_id=me.id)
         attach_passive_monitors(new_client)
         extra_clients.append(new_client)
         if not is_startup:
@@ -9440,7 +9455,7 @@ async def main():
             me = await userbot.get_me()
             active_user_ids.add(me.id)
             get_isolated_state(me.id)
-            create_event_handler(userbot)
+            create_event_handler(userbot, core_id=me.id)
             attach_passive_monitors(userbot)
             if me.id == cfg.get("OWNER_ID"):
                 try:
