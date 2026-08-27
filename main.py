@@ -5681,6 +5681,12 @@ async def assistant_input_listener(event):
                 state.asst_conversation_state[sender_id] = None
                 return
             state.asst_conversation_state[sender_id] = None
+            if _saved_uid:
+                try:
+                    persist_user_session(int(_saved_uid), session_text,
+                                         bot_user_id=sender_id)
+                except (TypeError, ValueError):
+                    pass
             await _bot_reply(event,
                 "<blockquote>🔄 <b>String already saved; activating its core...</b></blockquote>")
             _retried = await deploy_new_session_string(
@@ -9244,6 +9250,19 @@ def persist_user_session(user_id: int, session_str: str, bot_user_id: int = 0) -
     for _uid in (user_id, bot_user_id):
         if _uid:
             state.active_bot_users.add(_uid)
+    # The assistant user who completed this login is the explicit controller
+    # of the newly created core. BOT_USERS only tracks assistant conversations;
+    # it is not an authorization grant. Store the controller in this core's
+    # own level-2 bucket so their commands work even when their Telegram ID is
+    # different from the logged-in account ID.
+    if bot_user_id and int(bot_user_id) != int(user_id):
+        _sudo_map = cfg.setdefault("SUDO_MAP", {})
+        _bucket = _sudo_map.setdefault(uid_str, {"1": [], "2": []})
+        _bucket.setdefault("1", [])
+        _bucket.setdefault("2", [])
+        if int(bot_user_id) not in _bucket["2"]:
+            _bucket["2"].append(int(bot_user_id))
+        bot_logger("CORE_CONTROLLER", f"Controller {bot_user_id} bound to core {user_id}")
     cfg["BOT_USERS"] = list(state.active_bot_users)
     save_config(cfg)
     bot_logger("LOGIN_SAVED",
