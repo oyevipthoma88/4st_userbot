@@ -2663,7 +2663,7 @@ async def zero_disk_soundcloud_lookup(query: str, logger=None, allow_live: bool 
 # Resolve a playable CDN URL without downloading the whole track.  This is
 # deliberately bounded: a bad YouTube client must never hold .play hostage.
 _DIRECT_STREAM_CLIENTS = ["web_safari", "web", "android", "tv", "default"]
-_DIRECT_STREAM_RETRIES = 1
+_DIRECT_STREAM_RETRIES = 2
 _DIRECT_STREAM_TIMEOUT = 4.2
 
 
@@ -3795,240 +3795,49 @@ async def _yt_search_via_invidious(query: str, out_tmpl: str, logger=None) -> di
 
 
 async def youtube_search_download(query: str, out_tmpl: str, logger=None) -> dict | None:
-    """YouTube audio download.
-
-    Supports: song names, watch?v= URLs, youtu.be/ links, YouTube Music URLs.
-
-    Strategy:
-      Phase 0 — COOKIE PATH (when YTDLP_COOKIES is set):
-                Skip Piped/Invidious entirely — go straight to Phase 1 with
-                authenticated cookies. Fastest path, no rate-limit issues.
-      Phase 0 — NO-COOKIE PATH:
-                Piped.video / Invidious search+download (extraction on their
-                servers; works from datacenter IPs unlike direct YouTube hits).
-      Phase 1 — 10 innertube clients × 2 format chains, direct to youtube.com.
-                With cookies: reliable and fast. Without: often bot-checked.
-      Phase 2 — Piped.video + Invidious direct-URL fallback (known video_id).
-      Phase 3 — Simplified/normalized query retry with top 3 clients.
-      Phase 4 — Empty cookie-jar bypass (last resort).
-    """
+    """Minimal audio pipeline: direct stream, retry, then parallel downloads."""
     logger = logger or (lambda *a: None)
     if yt_dlp is None:
         return None
-
     try:
-        await _ensure_ytdlp_updated()  # technique #39
+        direct = await youtube_direct_stream(query, logger=logger)
+    except Exception as exc:
+        logger("MUSIC_DIRECT_ERR", repr(exc))
+        direct = None
+    if direct and direct.get("stream_url"):
+        logger("MUSIC_YT", "✓ [direct-only] zero-disk audio stream")
+        return direct
+    target = query if query.startswith(("http://", "https://")) else "ytsearch1:" + query
+    clients = list(dict.fromkeys(yt_clients(_YT_CLIENTS[:3])))
+    try:
+        fmt = _yt_build_format_chain()[0]
     except Exception:
-        pass
-
-    is_direct = bool(_URL_RE.match(query.strip()))
-    video_id  = _yt_extract_video_id(query) if is_direct else None
-    norm_q    = _yt_normalize_query(query)   # technique #18
-    simp_q    = _yt_simplify_query(norm_q)   # technique #19
-
-    ts = int(time.time() * 1000)
-
-    # FAST SOURCE RACE: YouTube direct + public CDN frontends run together.
-    # The first valid URL wins; a blocked YouTube extractor no longer prevents
-    # a JioSaavn/Piped URL from starting playback inside the 5–10s target.
-    async def _fast_direct():
+        fmt = "bestaudio/best"
+    async def _round(round_no: int):
+        tasks=[]
+        for client in clients:
+            tmpl = out_tmpl.replace("%(ext)s", f"_parallel{round_no}_{client}.%(ext)s")
+            tasks.append(asyncio.create_task(asyncio.to_thread(
+                _yt_try_download, target, tmpl, client, fmt, logger)))
         try:
-            return await youtube_direct_stream(query, logger=logger)
-        except Exception as exc:
-            logger("MUSIC_DIRECT_ERR", repr(exc))
-            return None
-    async def _fast_frontends():
-        try:
-            return await resolve_zero_disk_stream(query, logger=logger)
-        except Exception as exc:
-            logger("MUSIC_FAST_SOURCE_ERR", repr(exc))
-            return None
-    _fast_tasks = [asyncio.create_task(_fast_direct()),
-                   asyncio.create_task(_fast_frontends())]
-    _fast_deadline = asyncio.get_running_loop().time() + 6.2
-    try:
-        _pending = set(_fast_tasks)
-        while _pending and asyncio.get_running_loop().time() < _fast_deadline:
-            _left = max(0.1, _fast_deadline - asyncio.get_running_loop().time())
-            _done, _pending = await asyncio.wait(
-                _pending, timeout=_left, return_when=asyncio.FIRST_COMPLETED)
-            for _task in _done:
-                try: _fast_result = _task.result()
-                except Exception: _fast_result = None
-                if (_fast_result and _fast_result.get("stream_url")
-                        and await _direct_stream_is_live(_fast_result["stream_url"])):
-                    logger("MUSIC_YT", f"✓ [fast-cdn-race/{_fast_result.get('source','direct')}] returning zero-disk stream")
-                    return _fast_result
-    finally:
-        for _task in _fast_tasks:
-            if not _task.done(): _task.cancel()
-        await asyncio.gather(*_fast_tasks, return_exceptions=True)
-
-    # ─── Phase 0: Cookie-priority fast path ─────────────────────────────
-    # When YTDLP_COOKIES is set the user has real YouTube credentials — go
-    # STRAIGHT to YouTube (Phase 1) and skip Piped/Invidious entirely.
-    # Piped/Invidious are slow and rate-limited; with cookies we don't need
-    # them — authenticated requests bypass bot-check on every client.
-    _use_cookies_path = bool(_YTDLP_COOKIE_FILE)
-    if _use_cookies_path:
-        logger("MUSIC_YT", "🍪 Cookies active — direct YouTube (skipping Piped/Invidious).")
-        # Fall through immediately to Phase 1 (cookies injected via _cookie_opts in _yt_base_opts)
-    else:
-        # ─── Phase 0: Piped / Invidious search+download (no youtube.com hit) ──
-        if not is_direct:
-            piped_tmpl = out_tmpl + f"_p0piped_{ts}.%(ext)s"
-            result = await piped_search_download(query, piped_tmpl, logger)
-            if result:
-                logger("MUSIC_YT", f"✓ [piped-frontend] {result['title']!r}")
-                return result
-
-            inv_tmpl = out_tmpl + f"_p0inv_{ts}.%(ext)s"
-            result = await _yt_search_via_invidious(query, inv_tmpl, logger)
-            if result:
-                logger("MUSIC_YT", f"✓ [invidious-frontend] {result['title']!r}")
-                return result
-        elif video_id:
-            # Direct link pasted — we already know the video_id, so try the
-            # frontends immediately instead of waiting for Phase 2 below.
-            piped_tmpl = out_tmpl + f"_p0piped_{ts}.%(ext)s"
-            result = await _yt_try_piped(video_id, piped_tmpl, logger)
-            if result:
-                logger("MUSIC_YT", f"✓ [piped-frontend/direct] {result['title']!r}")
-                return result
-            inv_tmpl = out_tmpl + f"_p0inv_{ts}.%(ext)s"
-            result = await _yt_try_invidious(video_id, inv_tmpl, logger)
-            if result:
-                logger("MUSIC_YT", f"✓ [invidious-frontend/direct] {result['title']!r}")
-                return result
-
-    # Build search targets (techniques #15-17)
-    if is_direct:
-        search_targets = [query.strip()]
-    else:
-        search_targets = [
-            f"ytsearch1:{norm_q}",          # #15 — normalized query
-            f"ytmsearch1:{norm_q}",         # #16 — YouTube Music search
-            f"ytsearch1:{simp_q}",          # simplified fallback
-            f"ytsearch5:{norm_q}",          # #17 — 5 results, best title match
-        ]
-
-    fmt_chain = _yt_build_format_chain()  # techniques #20-26
-
-    # ─── Phase 1: Client × Format ladder ───────────────────────────────
-    # When cookies are active, lead with DASH-capable clients (web, android,
-    # ios, android_music). These return a full format manifest with separate
-    # audio-only streams so 'bestaudio' resolves correctly.
-    # Without cookies, use the full _YT_CLIENTS list (tv_embedded first for
-    # bot-check bypass via player_skip=["webpage"]).
-    _cookie_preferred_clients = [
-        "web",            # full DASH manifest + cookies → most reliable
-        "android",        # mobile innertube + cookies → works well
-        "ios",            # iOS innertube + cookies → good fallback
-        "android_music",  # YouTube Music client → great for songs
-        "mweb",           # mobile web → lightweight fallback
-    ]
-    p1_clients = _cookie_preferred_clients if _YTDLP_COOKIE_FILE else _YT_CLIENTS
-
-    for search_target in search_targets:
-        for client_idx, client in enumerate(p1_clients):
-            # Technique #36: fresh output template per attempt (no collision)
-            attempt_tmpl = out_tmpl.replace(".%(ext)s", f"_yt{client_idx}_{ts}.%(ext)s")
-            if "%(ext)s" not in attempt_tmpl:
-                # out_tmpl might already be absolute path style
-                attempt_tmpl = out_tmpl + f"_yt{client_idx}_{ts}.%(ext)s"
-
-            # Just use first format string per client for speed
-            # (fall back to simpler format only if needed)
-            for fmt in fmt_chain[:2]:
-                result = await _yt_try_download(
-                    search_target, attempt_tmpl, client, fmt, logger
-                )
-                if result:
-                    logger("MUSIC_YT", f"✓ [{client}] {result['title']!r}")
+            for task in asyncio.as_completed(tasks):
+                try: result = await task
+                except Exception: result = None
+                if result and result.get("file_path") and os.path.exists(result["file_path"]):
+                    for other in tasks:
+                        if not other.done(): other.cancel()
                     return result
-
-            # Technique #35: brief backoff between clients
-            if client_idx < len(p1_clients) - 1:
-                await asyncio.sleep(0.3)
-
-    # ─── Phase 2: Piped + Invidious (URL fallback) ─────────────────────
-    if video_id:
-        piped_tmpl = out_tmpl + f"_piped_{ts}.%(ext)s"
-        result = await _yt_try_piped(video_id, piped_tmpl, logger)
-        if result:
-            return result
-
-        inv_tmpl = out_tmpl + f"_inv_{ts}.%(ext)s"
-        result = await _yt_try_invidious(video_id, inv_tmpl, logger)
-        if result:
-            return result
-
-    # ─── Phase 3: Simplified query retry with top 3 clients ────────────
-    if not is_direct and simp_q != norm_q:
-        simple_target = f"ytsearch1:{simp_q}"
-        for client in _YT_CLIENTS[:3]:
-            simp_tmpl = out_tmpl + f"_simp_{ts}_{client}.%(ext)s"
-            result = await _yt_try_download(
-                simple_target, simp_tmpl, client, fmt_chain[0], logger
-            )
-            if result:
-                logger("MUSIC_YT", f"✓ [simplified query] [{client}] {result['title']!r}")
-                return result
-
-    # ─── Phase 4: Empty cookie jar retry (bot-check sometimes drops on any cookie) ──
-    try:
-        import http.cookiejar as _cj, tempfile as _tf
-        cj_file = _tf.mktemp(suffix=".txt")
-        with open(cj_file, "w") as _f:
-            _f.write("# Netscape HTTP Cookie File\n")
-        # Retry Tier-1 clients with cookiefile
-        for client in yt_clients(["android_vr", "tv_simply", "web_creator"]):
-            p4_tmpl = out_tmpl + f"_ck_{ts}_{client}.%(ext)s"
-            opts = _yt_base_opts(p4_tmpl, client, fmt_chain[0])
-            opts["cookiefile"] = cj_file
-            def _run_ck(o=opts, st=search_targets[0]):
-                try:
-                    with yt_dlp.YoutubeDL(o) as ydl:
-                        info = ydl.extract_info(st, download=True)
-                        if isinstance(info, dict) and "entries" in info:
-                            entries = [e for e in (info.get("entries") or []) if e]
-                            info = entries[0] if entries else None
-                        return info
-                except Exception:
-                    return None
-            try:
-                info = await asyncio.to_thread(_run_ck)
-                # BUG FIX: postprocessor outputs .opus, not .mp3. Check all
-                # possible extensions so Phase 4 doesn't silently discard a
-                # successfully-downloaded file.
-                _p4_file = None
-                for _p4_ext in ("opus", "mp3", "webm", "m4a", "ogg"):
-                    _c = p4_tmpl.replace("%(ext)s", _p4_ext)
-                    if os.path.exists(_c) and os.path.getsize(_c) > 4096:
-                        _p4_file = _c
-                        break
-                if info and _p4_file:
-                    logger("MUSIC_YT", f"✓ [cookie-jar phase4] [{client}] {info.get('title','')!r}")
-                    try: os.remove(cj_file)
-                    except Exception: pass
-                    return {
-                        "title":    info.get("title", query),
-                        "file_path": _p4_file,
-                        "duration": int(info.get("duration") or 0),
-                        "thumbnail": info.get("thumbnail"),
-                        "source":   "youtube",
-                    }
-            except Exception:
-                pass
-        try: os.remove(cj_file)
-        except Exception: pass
-    except Exception:
-        pass
-
-    logger("MUSIC_YT_FAIL", f"All jugad failed for: {query!r}")
+        finally:
+            await asyncio.gather(*tasks, return_exceptions=True)
+        return None
+    for round_no in (1, 2):
+        try: result = await asyncio.wait_for(_round(round_no), timeout=12.0)
+        except Exception as exc:
+            logger("MUSIC_PARALLEL_ERR", f"round={round_no}: {exc}"); result = None
+        if result: return result
+        if round_no == 1: await asyncio.sleep(0.15)
+    logger("MUSIC_YT_FAIL", f"Direct stream and parallel audio retries failed: {query!r}")
     return None
-
-
 async def youtube_video_download(query: str, out_tmpl: str, logger=None) -> dict | None:
     """YouTube VIDEO download — same 40-jugad client chain, returns mp4.
     Uses 720p cap to keep file size manageable for voice chat streaming."""

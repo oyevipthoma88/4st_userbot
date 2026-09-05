@@ -3057,7 +3057,7 @@ async def zero_disk_soundcloud_lookup(query: str, logger=None, allow_live: bool 
 # Resolve a playable CDN URL without downloading the whole track.  This is
 # deliberately bounded: a bad YouTube client must never hold .play hostage.
 _DIRECT_STREAM_CLIENTS = ["web_safari", "web", "android", "tv", "default"]
-_DIRECT_STREAM_RETRIES = 1
+_DIRECT_STREAM_RETRIES = 2
 _DIRECT_STREAM_TIMEOUT = 4.2
 
 
@@ -4051,6 +4051,7 @@ def _cloud_download_sync(
     out_tmpl: str,
     audio_only: bool = True,
     logger=None,
+    combos_override=None,
 ) -> dict | None:
     """Musicbot-style direct local download — works 100% on Heroku/cloud IPs.
 
@@ -4230,6 +4231,8 @@ def _cloud_download_sync(
     _botgate_hits = 0          # how many rungs died on "Sign in to confirm…"
     _pot403_hits = 0           # web-family rungs killed by a 403 media request
     _sabr_hits = 0             # rungs killed by the SABR-only experiment (tv/default)
+    if combos_override is not None:
+        combos = list(combos_override)
     for fmt, clients, use_player_skip in combos:
         actual_fmt = fmt if _MS_FFMPEG_DIR else _NO_FFMPEG_FMT
         clients = yt_clients(clients)
@@ -5144,389 +5147,66 @@ async def _yt_search_via_invidious(query: str, out_tmpl: str, logger=None) -> di
 
 
 async def youtube_search_download(query: str, out_tmpl: str, logger=None) -> dict | None:
-    """YouTube audio download.
+    """Minimal audio pipeline: direct stream, retry, then parallel downloads.
 
-    Supports: song names, watch?v= URLs, youtu.be/ links, YouTube Music URLs.
-
-    Strategy:
-      Phase H — HEROKU / CLOUD HOST FAST PATH (when _ON_CLOUD_HOST):
-                Musicbot jugad — direct local download with web+cookies+Deno+bgutil.
-                CDN streaming is always IP-blocked on Heroku; skip all Piped/CDN
-                jugad and go straight to _cloud_download_sync. Returns immediately
-                on success (~5-8s). Falls through to Phase 0 if cookies missing.
-      Phase 0 — COOKIE PATH (when YTDLP_COOKIES is set):
-                Skip Piped/Invidious entirely — go straight to Phase 1 with
-                authenticated cookies. Fastest path, no rate-limit issues.
-      Phase 0 — NO-COOKIE PATH:
-                Piped.video / Invidious search+download (extraction on their
-                servers; works from datacenter IPs unlike direct YouTube hits).
-      Phase 1 — 10 innertube clients × 2 format chains, direct to youtube.com.
-                With cookies: reliable and fast. Without: often bot-checked.
-      Phase 2 — Piped.video + Invidious direct-URL fallback (known video_id).
-      Phase 3 — Simplified/normalized query retry with top 3 clients.
-      Phase 4 — Empty cookie-jar bypass (last resort).
+    No Piped, Invidious, JioSaavn, SoundCloud, or serial client ladder is
+    allowed on this active YouTube audio path.
     """
     logger = logger or (lambda *a: None)
     if yt_dlp is None:
         return None
-
-    # yt-dlp updates and bgutil/Deno installation are scheduled by
-    # warm_up_music_runtime() at worker startup. Never block a user request on
-    # package installation or a network repair task.
-
-    # Install/repair bgutil in the background. The first song uses the
-    # normal cookie/client ladder while the provider warms up; it must not
-    # wait here for a Deno download, archive extraction, or `deno install`.
-    if not _BGUTIL_ACTIVE and not _BGUTIL_INSTALL_DONE:
-        asyncio.create_task(_ensure_bgutil_runtime(logger))
-    elif _BGUTIL_ACTIVE and not _BGUTIL_HTTP_READY:
-        # The warm HTTP provider is also best-effort and must not delay play.
-        asyncio.create_task(warm_up_bgutil_server())
-
-    is_direct = bool(_URL_RE.match(query.strip()))
-    video_id  = _yt_extract_video_id(query) if is_direct else None
-
-    # ── FAST PATH: YouTube Data API v3 (env YOUTUBE_API_KEY) ──────────────
-    # Query → video_id official API se (~300ms). Uske baad poora pipeline
-    # direct-URL mode me chalta hai: na ytsearch scraping, na dead Piped
-    # mirrors ka intezaar. Key na ho ya fail ho → purana behaviour.
-    if not is_direct and yt_api_enabled():
-        _api = await yt_api_search(query, logger, video=False)
-        if _api:
-            query     = _api["url"]
-            video_id  = _api["video_id"]
-            is_direct = True
-
-    norm_q    = _yt_normalize_query(query)   # technique #18
-    simp_q    = _yt_simplify_query(norm_q)   # technique #19
-
-    ts = int(time.time() * 1000)
-
-    # FAST SOURCE RACE: YouTube direct + public CDN frontends run together.
-    # The first valid URL wins; a blocked YouTube extractor no longer prevents
-    # a JioSaavn/Piped URL from starting playback inside the 5–10s target.
-    async def _fast_direct():
-        try:
-            return await youtube_direct_stream(query, logger=logger)
-        except Exception as exc:
-            logger("MUSIC_DIRECT_ERR", repr(exc))
-            return None
-    async def _fast_frontends():
-        try:
-            return await resolve_zero_disk_stream(query, logger=logger)
-        except Exception as exc:
-            logger("MUSIC_FAST_SOURCE_ERR", repr(exc))
-            return None
-    _fast_tasks = [asyncio.create_task(_fast_direct()),
-                   asyncio.create_task(_fast_frontends())]
-    _fast_deadline = asyncio.get_running_loop().time() + 6.2
+    # 1) Direct zero-disk stream with the bounded multi-client retry logic.
     try:
-        _pending = set(_fast_tasks)
-        while _pending and asyncio.get_running_loop().time() < _fast_deadline:
-            _left = max(0.1, _fast_deadline - asyncio.get_running_loop().time())
-            _done, _pending = await asyncio.wait(
-                _pending, timeout=_left, return_when=asyncio.FIRST_COMPLETED)
-            for _task in _done:
-                try: _fast_result = _task.result()
-                except Exception: _fast_result = None
-                if (_fast_result and _fast_result.get("stream_url")
-                        and await _direct_stream_is_live(_fast_result["stream_url"])):
-                    logger("MUSIC_YT", f"✓ [fast-cdn-race/{_fast_result.get('source','direct')}] returning zero-disk stream")
-                    return _fast_result
-    finally:
-        for _task in _fast_tasks:
-            if not _task.done(): _task.cancel()
-        await asyncio.gather(*_fast_tasks, return_exceptions=True)
+        direct = await youtube_direct_stream(query, logger=logger)
+    except Exception as exc:
+        logger("MUSIC_DIRECT_ERR", repr(exc))
+        direct = None
+    if direct and direct.get("stream_url"):
+        logger("MUSIC_YT", "✓ [direct-only] zero-disk audio stream")
+        return direct
 
-    # ─── Phase H: Heroku / Cloud host fast path (Musicbot jugad) ───────────
-    # On Heroku/Railway/Render/Fly.io the YouTube CDN (googlevideo.com) is
-    # IP-blocked. Piped instances are mostly dead (403/502). The complex
-    # 10-client ladder wastes 5-15 minutes before giving up.
-    #
-    # Musicbot's proven approach: skip CDN, download locally via:
-    #   - tv_embedded + player_skip (no cookies, no bgutil needed) → FIRST
-    #   - web + cookies + bgutil (best quality when available) → SECOND
-    # This works on every Heroku dyno regardless of bgutil status.
-    if _ON_CLOUD_HOST:
-        _deno = _find_deno()
-        logger("MUSIC_YT", (
-            f"☁️ Cloud host — Musicbot jugad | "
-            f"bgutil={'✅' if _BGUTIL_ACTIVE else '❌'} | "
-            f"deno={'✅ ' + str(_deno)[:40] if _deno else '❌ not found'} | "
-            f"cookies={'✅' if _YTDLP_COOKIE_FILE else '❌'} | "
-            f"proxy={'✅' if _YT_PROXY else '❌'}"
-        ))
-        if not _YTDLP_COOKIE_FILE and not _YT_PROXY:
-            logger("MUSIC_YT", (
-                "⚠️ No YTDLP_COOKIES and no YT_PROXY set — this dyno's IP is "
-                "bot-gated by YouTube on every client. Set YTDLP_COOKIES "
-                "(cookies.txt from a logged-in YouTube account; plain text, "
-                "JSON or base64) and/or YT_PROXY (e.g. "
-                "http://user:pass@host:port) in Heroku Config Vars, then "
-                "restart the worker."
-            ))
-        _ph_tmpl = out_tmpl + f"_phcloud_{ts}.%(ext)s"
+    # 2) Parallel local audio downloads. Each client gets its own output path
+    # and one retry round; the first valid file wins.
+    async def _download_round(round_no: int):
+        workers = [
+            ("web_safari", "bestaudio[ext=m4a]/bestaudio/best"),
+            ("web", "bestaudio[ext=m4a]/bestaudio/best"),
+            ("android", "bestaudio/best[acodec!=none]/best"),
+        ]
+        tasks = []
+        for client, fmt in workers:
+            target = out_tmpl.replace("%(ext)s", f"_parallel{round_no}_{client}.%(ext)s")
+            tasks.append(asyncio.create_task(asyncio.to_thread(
+                _cloud_download_sync, query, target, True, logger,
+                [(fmt, [client], False)])))
         try:
-            result = await asyncio.get_event_loop().run_in_executor(
-                None,
-                lambda: _cloud_download_sync(query, _ph_tmpl, audio_only=True, logger=logger),
-            )
-        except Exception as _exc:
-            logger("MUSIC_YT", f"Phase H error: {_exc}")
+            for task in asyncio.as_completed(tasks):
+                try:
+                    result = await task
+                except Exception:
+                    result = None
+                if result and result.get("file_path") and os.path.exists(result["file_path"]):
+                    for other in tasks:
+                        if not other.done():
+                            other.cancel()
+                    return result
+        finally:
+            await asyncio.gather(*tasks, return_exceptions=True)
+        return None
+
+    for round_no in (1, 2):
+        try:
+            result = await asyncio.wait_for(_download_round(round_no), timeout=12.0)
+        except Exception as exc:
+            logger("MUSIC_PARALLEL_ERR", f"round={round_no}: {exc}")
             result = None
         if result:
-            logger("MUSIC_YT", f"✅ [cloud-direct] {result['title']!r}")
+            logger("MUSIC_YT", f"✓ [parallel-audio/{round_no}] {result.get('title', query)!r}")
             return result
-        logger("MUSIC_YT", "☁️ Cloud direct download miss — falling through to Phase 0")
-
-    # ─── Phase 0: Cookie-priority fast path ─────────────────────────────
-    # When YTDLP_COOKIES is set the user has real YouTube credentials — go
-    # STRAIGHT to YouTube (Phase 1) and skip Piped/Invidious entirely.
-    # Piped/Invidious are slow and rate-limited; with cookies we don't need
-    # them — authenticated requests bypass bot-check on every client.
-    _use_cookies_path = bool(_YTDLP_COOKIE_FILE)
-    _fast_start = os.environ.get("MUSIC_FAST_START", "1").strip() != "0"
-    if _use_cookies_path:
-        logger("MUSIC_YT", (
-            "🍪 Cookies active — direct authenticated YouTube first"
-            if (_ON_CLOUD_HOST and _fast_start)
-            else "🍪 Cookies active — trying Piped first, then YouTube directly."
-        ))
-        # BUG FIX: Pehle sirf YouTube try karta tha aur Piped skip karta tha.
-        # Problem: Heroku ke USA IP pe YouTube "No video formats found!" deta hai
-        # chahe valid cookies hon — PO-token acquisition cloud IPs pe block hoti hai.
-        # Fix: Search queries ke liye Piped/Invidious PEHLE try karo (Phase 0.5).
-        # Piped extraction unke own servers pe hoti hai — Heroku IP block ka koi
-        # effect nahi. Ye fast hai aur success rate bahut zyada hai.
-        # Direct URLs (watch?v=) still go straight to Phase 1 (video_id needed).
-        if not is_direct and not (_ON_CLOUD_HOST and _fast_start):
-            # BUG FIX: Invidious removed from Phase 0.5 — logs confirmed ALL
-            # public Invidious instances are dead/blocking (502, 404, 401, 403,
-            # DNS fails, SSL errors). Keeping it was adding 8s of dead-weight
-            # delay before Phase 1 with 0% success rate. Only Piped remains.
-            _p05_piped_tmpl = out_tmpl + f"_p05piped_{ts}.%(ext)s"
-            result = await piped_search_download(query, _p05_piped_tmpl, logger)
-            if result:
-                logger("MUSIC_YT", f"✓ [piped-early/cookie-path] {result['title']!r}")
-                return result
-            logger("MUSIC_YT", "Piped miss — falling through to direct YouTube Phase 1.")
-        # Fall through to Phase 1 (cookies injected via _cookie_opts in _yt_base_opts)
-    else:
-        # ─── Phase 0: Piped / Invidious search+download (no youtube.com hit) ──
-        if not is_direct:
-            piped_tmpl = out_tmpl + f"_p0piped_{ts}.%(ext)s"
-            result = await piped_search_download(query, piped_tmpl, logger)
-            if result:
-                logger("MUSIC_YT", f"✓ [piped-frontend] {result['title']!r}")
-                return result
-
-            inv_tmpl = out_tmpl + f"_p0inv_{ts}.%(ext)s"
-            result = await _yt_search_via_invidious(query, inv_tmpl, logger)
-            if result:
-                logger("MUSIC_YT", f"✓ [invidious-frontend] {result['title']!r}")
-                return result
-        elif video_id:
-            # Direct link pasted — we already know the video_id, so try the
-            # frontends immediately instead of waiting for Phase 2 below.
-            piped_tmpl = out_tmpl + f"_p0piped_{ts}.%(ext)s"
-            result = await _yt_try_piped(video_id, piped_tmpl, logger)
-            if result:
-                logger("MUSIC_YT", f"✓ [piped-frontend/direct] {result['title']!r}")
-                return result
-            inv_tmpl = out_tmpl + f"_p0inv_{ts}.%(ext)s"
-            result = await _yt_try_invidious(video_id, inv_tmpl, logger)
-            if result:
-                logger("MUSIC_YT", f"✓ [invidious-frontend/direct] {result['title']!r}")
-                return result
-
-    # Build search targets (techniques #15-17)
-    if is_direct:
-        search_targets = [query.strip()]
-    else:
-        search_targets = [
-            f"ytsearch1:{norm_q}",          # #15 — normalized query
-            f"ytmsearch1:{norm_q}",         # #16 — YouTube Music search
-            f"ytsearch1:{simp_q}",          # simplified fallback
-            f"ytsearch5:{norm_q}",          # #17 — 5 results, best title match
-        ]
-
-    fmt_chain = _yt_build_format_chain()  # techniques #20-26
-
-    # ─── Phase 1: Client × Format ladder ───────────────────────────────
-    # When cookies are active, lead with DASH-capable clients (web, android,
-    # ios, android_music). These return a full format manifest with separate
-    # audio-only streams so 'bestaudio' resolves correctly.
-    # Without cookies, use the full _YT_CLIENTS list (tv_embedded first for
-    # bot-check bypass via player_skip=["webpage"]).
-    # COOKIE PATH: real authenticated clients only — no fake/bypass client tricks.
-    # Cookies provide full SAPISID/session auth so these clients get complete
-    # DASH manifests. bgutil generates PO-tokens for cloud IPs so "web" works
-    # from Heroku without fake player hacks.
-    # Order: web → android_music (best for Hindi/regional) → android → ios
-    # BUG FIX: On Heroku/cloud IPs, YouTube blocks PO-token acquisition for
-    # DASH clients (web, android) even with valid cookies — returns "No video
-    # formats found!" for every attempt. The real fix is to try Tier-1
-    # no-PO-token clients FIRST. tv_embedded/android_vr/web_creator use
-    # player_skip=["webpage"] which bypasses the sign-in/bot-check gate
-    # entirely and works from any IP without PO-tokens or bgutil.
-    # Order: Tier-1 bypass first → DASH clients → extra bypasses.
-    _cookie_preferred_clients = yt_clients([
-        # android runs cookie-free (see _YT_CLIENTS note) and is currently the
-        # only client YouTube still serves media to from a cloud IP, so it
-        # leads even when a cookie jar is configured.
-        "android",            # ★ PO-token-free + cookie-free, proven working
-        "default",            # ★ Melody-proven — cookies ke saath sabse reliable
-        "tv",                 # plain https formats, PO-token nahi chahiye
-        "web_safari",         # Safari fingerprint
-        "web",                # Standard web + cookies + bgutil PO-token
-    ])
-
-    p1_clients = _cookie_preferred_clients if _YTDLP_COOKIE_FILE else _YT_CLIENTS
-
-    for search_target in search_targets:
-        for client_idx, client in enumerate(p1_clients):
-            # Technique #36: fresh output template per attempt (no collision)
-            attempt_tmpl = out_tmpl.replace(".%(ext)s", f"_yt{client_idx}_{ts}.%(ext)s")
-            if "%(ext)s" not in attempt_tmpl:
-                # out_tmpl might already be absolute path style
-                attempt_tmpl = out_tmpl + f"_yt{client_idx}_{ts}.%(ext)s"
-
-            # Just use first format string per client for speed
-            # (fall back to simpler format only if needed)
-            for fmt in fmt_chain[:2]:
-                result = await _yt_try_download(
-                    search_target, attempt_tmpl, client, fmt, logger
-                )
-                if result:
-                    logger("MUSIC_YT", f"✓ [{client}] {result['title']!r}")
-                    return result
-
-            # Technique #35: brief backoff between clients
-            if client_idx < len(p1_clients) - 1:
-                await asyncio.sleep(0.3)
-
-    # ─── Phase 1.5: Cookie-path Piped/Invidious search fallback ───────────
-    # When YTDLP_COOKIES is set we skip Piped/Invidious in Phase 0.
-    # But Heroku/cloud IPs can be blocked by YouTube even with valid cookies
-    # (returns "No video formats found!" for every client).
-    # If Phase 1 failed for a search query, try Piped/Invidious as a
-    # fallback — they route extraction through their own servers, bypassing
-    # the Heroku IP block entirely.
-    if _use_cookies_path and not is_direct:
-        p15_piped_tmpl = out_tmpl + f"_p15piped_{ts}.%(ext)s"
-        result = await piped_search_download(query, p15_piped_tmpl, logger)
-        if result:
-            logger("MUSIC_YT", f"✓ [piped-fallback/cookie-path] {result['title']!r}")
-            return result
-        p15_inv_tmpl = out_tmpl + f"_p15inv_{ts}.%(ext)s"
-        result = await _yt_search_via_invidious(query, p15_inv_tmpl, logger)
-        if result:
-            logger("MUSIC_YT", f"✓ [invidious-fallback/cookie-path] {result['title']!r}")
-            return result
-
-    # ─── Phase 2: Piped + Invidious (URL fallback) ─────────────────────
-    if video_id:
-        piped_tmpl = out_tmpl + f"_piped_{ts}.%(ext)s"
-        result = await _yt_try_piped(video_id, piped_tmpl, logger)
-        if result:
-            return result
-
-        inv_tmpl = out_tmpl + f"_inv_{ts}.%(ext)s"
-        result = await _yt_try_invidious(video_id, inv_tmpl, logger)
-        if result:
-            return result
-
-    # ─── Phase 3: Simplified query retry with top 3 clients ────────────
-    if not is_direct and simp_q != norm_q:
-        simple_target = f"ytsearch1:{simp_q}"
-        for client in _YT_CLIENTS[:3]:
-            simp_tmpl = out_tmpl + f"_simp_{ts}_{client}.%(ext)s"
-            result = await _yt_try_download(
-                simple_target, simp_tmpl, client, fmt_chain[0], logger
-            )
-            if result:
-                logger("MUSIC_YT", f"✓ [simplified query] [{client}] {result['title']!r}")
-                return result
-
-    # ─── Phase 4: Empty cookie jar retry (bot-check sometimes drops on any cookie) ──
-    try:
-        import http.cookiejar as _cj, tempfile as _tf
-        cj_file = _tf.mktemp(suffix=".txt")
-        with open(cj_file, "w") as _f:
-            _f.write("# Netscape HTTP Cookie File\n")
-        # Retry Tier-1 clients with cookiefile
-        for client in yt_clients(["default", "tv", "web_safari"]):
-            p4_tmpl = out_tmpl + f"_ck_{ts}_{client}.%(ext)s"
-            opts = _yt_base_opts(p4_tmpl, client, fmt_chain[0])
-            opts["cookiefile"] = cj_file
-            def _run_ck(o=opts, st=search_targets[0]):
-                try:
-                    with yt_dlp.YoutubeDL(o) as ydl:
-                        info = ydl.extract_info(st, download=True)
-                        if isinstance(info, dict) and "entries" in info:
-                            entries = [e for e in (info.get("entries") or []) if e]
-                            info = entries[0] if entries else None
-                        return info
-                except Exception:
-                    return None
-            try:
-                info = await asyncio.to_thread(_run_ck)
-                # BUG FIX: postprocessor outputs .opus, not .mp3 — check all
-                # possible extensions so Phase 4 never discards a good file.
-                _p4_file = _resolve_downloaded_file(info, p4_tmpl)
-                if info and _p4_file:
-                    logger("MUSIC_YT", f"✓ [cookie-jar phase4] [{client}] {info.get('title','')!r}")
-                    try: os.remove(cj_file)
-                    except Exception: pass
-                    return {
-                        "title":    info.get("title", query),
-                        "file_path": _p4_file,
-                        "duration": int(info.get("duration") or 0),
-                        "thumbnail": info.get("thumbnail"),
-                        "source":   "youtube",
-                    }
-            except Exception:
-                pass
-        try: os.remove(cj_file)
-        except Exception: pass
-    except Exception:
-        pass
-
-    # ─── Phase 5: Non-YouTube last-resort audio fallback ────────────────
-    # Heroku/cloud dyno IPs are now hard-blocked by YouTube: every innertube
-    # client returns "No video formats found!", Piped mirrors answer 403/502
-    # and public Invidious instances are dead. Rather than returning nothing
-    # (silent VC), fall back to the free full-length audio sources that do NOT
-    # care about the dyno IP. Set MUSIC_FALLBACK_SOURCES=0 to disable.
-    if os.getenv("MUSIC_FALLBACK_SOURCES", "1").strip().lower() not in ("0", "false", "no"):
-        fb_query = norm_q if not is_direct else query
-        fallbacks = (
-            ("jiosaavn",   lambda t: jiosaavn_search_download(fb_query, t, logger)),
-            ("audiomack",  lambda t: audiomack_search_download(fb_query, t, logger)),
-            ("soundcloud", lambda t: soundcloud_search_download(fb_query, t, {}, logger)),
-            ("gaana",      lambda t: gaana_search_download(fb_query, t, logger)),
-            ("deezer",     lambda t: deezer_preview_search_download(fb_query, t, logger)),
-            ("itunes",     lambda t: itunes_preview_search_download(fb_query, t, logger)),
-        )
-        for name, runner in fallbacks:
-            fb_tmpl = out_tmpl + f"_fb_{ts}_{name}.%(ext)s"
-            try:
-                result = await asyncio.wait_for(runner(fb_tmpl), timeout=45.0)
-            except asyncio.TimeoutError:
-                logger("MUSIC_DL_ERR", f"{name} fallback timed out")
-                continue
-            except Exception as _fb_exc:
-                logger("MUSIC_DL_ERR", f"{name} fallback: {_fb_exc}")
-                continue
-            if result and result.get("file_path"):
-                result.setdefault("source", name)
-                logger("MUSIC_YT", f"✅ [fallback/{name}] {result.get('title')!r}")
-                return result
-
-    logger("MUSIC_YT_FAIL", f"All jugad failed for: {query!r}")
+        if round_no == 1:
+            await asyncio.sleep(0.15)
+    logger("MUSIC_YT_FAIL", f"Direct stream and parallel audio retries failed: {query!r}")
     return None
-
-
 async def youtube_video_download(query: str, out_tmpl: str, logger=None) -> dict | None:
     """YouTube VIDEO download — same 40-jugad client chain, returns mp4.
     Uses 720p cap to keep file size manageable for voice chat streaming."""
