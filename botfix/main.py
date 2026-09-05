@@ -4327,6 +4327,24 @@ _MUSIC_CMD_RE = re.compile(
 def _is_music_open_chat(chat_id: int) -> bool:
     return chat_id in cfg.get("MUSIC_OPEN_CHATS", [])
 
+# One owner/sudo message can be delivered to every connected userbot
+# session. Keep exactly one music dispatcher per chat so multiple cores do not
+# start duplicate yt-dlp downloads and VC joins for the same .play command.
+_MUSIC_DISPATCH_OWNER: dict[int, int] = {}
+_MUSIC_DISPATCH_LOCK = asyncio.Lock()
+
+async def _claim_music_dispatch(chat_id: int, core_id: int) -> bool:
+    """Atomically assign a chat's music commands to one active core."""
+    if chat_id is None:
+        return True
+    async with _MUSIC_DISPATCH_LOCK:
+        current = _MUSIC_DISPATCH_OWNER.get(int(chat_id))
+        if current is None or current == int(core_id) or current not in active_user_ids:
+            _MUSIC_DISPATCH_OWNER[int(chat_id)] = int(core_id)
+            return True
+        return False
+
+
 def create_event_handler(client):
     @client.on(events.NewMessage)
     async def global_handler(event):
@@ -4366,6 +4384,12 @@ def create_event_handler(client):
             me    = await client.get_me()
             my_id = me.id
             istate = get_isolated_state(my_id)
+            # Legacy handler has no bound core_id; claim owner/sudo music
+            # commands after identity resolution to prevent duplicate .play
+            # downloads across all active userbot sessions.
+            if bool(_MUSIC_CMD_RE.match(text_probe)) and not music_bypass:
+                if not await _claim_music_dispatch(event.chat_id, my_id):
+                    return
         except Exception:
             return
 

@@ -6060,6 +6060,24 @@ def _is_music_open_chat(chat_id: int, my_id: int | None = None) -> bool:
         return False
     return True if my_id is None else owner == my_id
 
+# One owner/sudo message can be delivered to every connected userbot
+# session. Keep exactly one music dispatcher per chat so multiple cores do not
+# start duplicate yt-dlp downloads and VC joins for the same .play command.
+_MUSIC_DISPATCH_OWNER: dict[int, int] = {}
+_MUSIC_DISPATCH_LOCK = asyncio.Lock()
+
+async def _claim_music_dispatch(chat_id: int, core_id: int) -> bool:
+    """Atomically assign a chat's music commands to one active core."""
+    if chat_id is None:
+        return True
+    async with _MUSIC_DISPATCH_LOCK:
+        current = _MUSIC_DISPATCH_OWNER.get(int(chat_id))
+        if current is None or current == int(core_id) or current not in active_user_ids:
+            _MUSIC_DISPATCH_OWNER[int(chat_id)] = int(core_id)
+            return True
+        return False
+
+
 def create_event_handler(client, core_id=None):
     """Attach the command router to one authenticated Telethon core."""
     @client.on(events.NewMessage)
@@ -6100,6 +6118,12 @@ def create_event_handler(client, core_id=None):
             return
         # Ownership of the open chat is confirmed below, once this session's
         # own user id is known (see `_forall_owner_guard`).
+        # Owner/sudo music commands outside `.forall` are claimed by one
+        # active core so the same Telegram update cannot start duplicate
+        # downloads in every connected session.
+        if bool(_MUSIC_CMD_RE.match(text_probe)) and not music_bypass:
+            if not await _claim_music_dispatch(event.chat_id, my_id):
+                return
 
         # Don't trigger in private chats talking to bots
         if event.is_private and getattr(event, 'outgoing', False):
