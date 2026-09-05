@@ -9266,7 +9266,7 @@ async def _gcsec_scan_chat(client, chat):
         new_participant = getattr(action, "new_participant", None)
         target_id = _gcsec_participant_id(new_participant)
         action_name = type(action).__name__.lower() if action is not None else ""
-        # Preserve the exact promoter chain from admin-log promotion events.
+        # Record promotion history for diagnostics only; enforcement is actor-only.
         if target_id and ("toggle" in action_name or "participant" in action_name):
             is_admin = bool(getattr(new_participant, "admin_rights", None))
             is_admin = is_admin or "admin" in type(new_participant).__name__.lower()
@@ -9284,11 +9284,11 @@ async def _gcsec_scan_chat(client, chat):
         bucket[:] = [t for t in bucket if ts - t <= _GCSEC_WINDOW]
         bucket.append(ts)
         if len(bucket) >= _GCSEC_THRESHOLD:
-            targets = {actor_id} | _gcsec_descendants(client, cid, actor_id)
-            for target_id in targets:
-                if target_id in protected:
-                    continue
-                await _gcsec_demote_and_mute(client, chat, target_id, len(bucket), action_kind)
+            # Strict safety rule: only the admin who performed the destructive
+            # actions is demoted/muted. Never cascade to promoted users.
+            if actor_id not in protected:
+                await _gcsec_demote_and_mute(
+                    client, chat, actor_id, len(bucket), action_kind)
             bucket.clear()
     _gcsec_seen[key] = current_max
 
