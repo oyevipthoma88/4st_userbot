@@ -2734,32 +2734,48 @@ async def _direct_stream_is_live(url: str) -> bool:
         return False
 
 async def youtube_direct_stream(query: str, logger=None) -> dict | None:
-    """Resolve audio with one bounded all-client race (~5 seconds max)."""
+    """Resolve a fresh audio CDN URL with real bounded retries.
+
+    Every round races all direct clients in parallel. A transient yt-dlp,
+    YouTube client, or CDN preflight failure gets a second independent round
+    instead of silently becoming a one-shot miss.
+    """
     logger = logger or (lambda *a: None)
     target = query.strip()
     if not target.startswith(("http://", "https://")):
         target = "ytsearch1:" + target
-    clients = list(dict.fromkeys(_DIRECT_STREAM_CLIENTS))
-    async def _one(client_name):
+    base_clients = list(dict.fromkeys(_DIRECT_STREAM_CLIENTS))
+    for attempt in range(1, _DIRECT_STREAM_RETRIES + 1):
+        # Rotate the first client on retry so a sticky client failure does not
+        # repeat the exact same ordering. All clients still race concurrently.
+        shift = (attempt - 1) % len(base_clients) if base_clients else 0
+        clients = base_clients[shift:] + base_clients[:shift]
+        async def _one(client_name):
+            try:
+                return await asyncio.wait_for(
+                    asyncio.to_thread(_direct_stream_extract_sync, target, [client_name],
+                                      globals().get("_YTDLP_COOKIE_FILE")),
+                    timeout=_DIRECT_STREAM_TIMEOUT)
+            except Exception:
+                return None
+        tasks = [asyncio.create_task(_one(c)) for c in clients]
         try:
-            return await asyncio.wait_for(
-                asyncio.to_thread(_direct_stream_extract_sync, target, [client_name],
-                                  globals().get("_YTDLP_COOKIE_FILE")),
-                timeout=_DIRECT_STREAM_TIMEOUT)
-        except Exception:
-            return None
-    tasks = [asyncio.create_task(_one(c)) for c in clients]
-    try:
-        for task in asyncio.as_completed(tasks):
-            result = await task
-            if result and result.get("stream_url") and await _direct_stream_is_live(result["stream_url"]):
-                logger("MUSIC_DIRECT", f"direct audio ready: {result.get('title','')[:60]}")
-                return result
-    finally:
-        for task in tasks:
-            if not task.done(): task.cancel()
-        await asyncio.gather(*tasks, return_exceptions=True)
-    logger("MUSIC_DIRECT_MISS", f"direct audio unavailable within bounded race: {query[:80]}")
+            for task in asyncio.as_completed(tasks):
+                result = await task
+                if (result and result.get("stream_url")
+                        and await _direct_stream_is_live(result["stream_url"])):
+                    logger("MUSIC_DIRECT",
+                           f"direct audio ready on retry {attempt}: {result.get('title','')[:60]}")
+                    return result
+        finally:
+            for task in tasks:
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+        if attempt < _DIRECT_STREAM_RETRIES:
+            await asyncio.sleep(0.15)
+    logger("MUSIC_DIRECT_MISS",
+           f"direct audio unavailable after {_DIRECT_STREAM_RETRIES} retries: {query[:80]}")
     return None
 
 async def resolve_zero_disk_stream(query: str, logger=None, allow_live: bool = False) -> dict | None:
@@ -3817,8 +3833,8 @@ async def youtube_search_download(query: str, out_tmpl: str, logger=None) -> dic
         tasks=[]
         for client in clients:
             tmpl = out_tmpl.replace("%(ext)s", f"_parallel{round_no}_{client}.%(ext)s")
-            tasks.append(asyncio.create_task(asyncio.to_thread(
-                _yt_try_download, target, tmpl, client, fmt, logger)))
+            tasks.append(asyncio.create_task(
+                _yt_try_download(target, tmpl, client, fmt, logger)))
         try:
             for task in asyncio.as_completed(tasks):
                 try: result = await task
