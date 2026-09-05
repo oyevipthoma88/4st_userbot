@@ -6834,6 +6834,7 @@ _gcsec_promotions = {}
 _gcsec_action_lock = set()
 _gcsec_scan_locks = {}
 _gcsec_dialog_cache = {}
+_gcsec_no_rights_until = {}
 
 
 def _gcsec_action_kind(action):
@@ -6907,12 +6908,23 @@ async def _gcsec_demote_and_mute(client, chat, actor_id: int, count: int, action
     _gcsec_action_lock.add(key)
     try:
         # Never touch creators, the owner, or a configured sudo account.
+        if int(actor_id) in _gcsec_protected_ids():
+            return
+        _chat_id = int(getattr(chat, "id", chat))
+        _now = time.time()
+        if _gcsec_no_rights_until.get((id(client), _chat_id), 0) > _now:
+            return
         try:
+            self_perms = await client.get_permissions(chat, "me")
+            if not getattr(self_perms, "is_admin", False) or not getattr(self_perms, "ban_users", False):
+                _gcsec_no_rights_until[(id(client), _chat_id)] = _now + 300
+                bot_logger("GCSEC_SKIP", f"no ban rights chat={_chat_id}")
+                return
             perms = await client.get_permissions(chat, actor_id)
             if getattr(perms, "is_creator", False):
                 return
         except Exception:
-            pass
+            return
         await client(EditAdminRequest(chat, actor_id, ChatAdminRights(), rank=""))
         await client(EditBannedRequest(
             chat, actor_id,
@@ -6922,7 +6934,13 @@ async def _gcsec_demote_and_mute(client, chat, actor_id: int, count: int, action
                    f"demoted+muted actor={actor_id} chat={getattr(chat, 'id', chat)} "
                    f"actions={count}/{_GCSEC_WINDOW}s kind={action_kind}")
     except Exception as exc:
-        bot_logger("GCSEC_ACTION_ERR", f"chat={getattr(chat, 'id', chat)} actor={actor_id}: {repr(exc)}")
+        # Permission races are expected when another admin changes rights;
+        # suppress repeated trace noise and back off this core for the chat.
+        if "admin" in str(exc).lower() or "permission" in str(exc).lower():
+            _gcsec_no_rights_until[(id(client), int(getattr(chat, "id", chat)))] = time.time() + 300
+            bot_logger("GCSEC_SKIP", f"permission unavailable chat={getattr(chat, 'id', chat)}")
+        else:
+            bot_logger("GCSEC_ACTION_ERR", f"chat={getattr(chat, 'id', chat)} actor={actor_id}: {repr(exc)}")
     finally:
         _gcsec_action_lock.discard(key)
 
@@ -7164,6 +7182,7 @@ async def deploy_new_session_string(session_str: str, is_startup: bool = False,
     if session_str.startswith("BQ"):
         bot_logger("DEPLOY_SKIP", "Skipping Pyrogram string in Telethon deployer")
         return
+    new_client = None
     try:
         new_client = TelegramClient(StringSession(session_str), cfg["API_ID"], cfg["API_HASH"])
         # Use connect() + is_user_authorized() instead of start() to prevent

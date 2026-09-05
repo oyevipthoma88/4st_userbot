@@ -34,6 +34,7 @@ Env used (already present in app.json):
 
 import base64
 import os
+import shutil
 import time
 
 try:
@@ -182,6 +183,21 @@ def ensure_local_media(cfg: dict, dest_dir: str, logger=None):
     path = cfg.get("START_MEDIA_PATH")
     if path and os.path.exists(str(path)):
         return path
+    # Private GitHub repos return 404 from raw.githubusercontent.com even
+    # though the asset is committed. Prefer the bundled release asset first.
+    bundled_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "media")
+    for name in ("start_media.jpg", "start_media.jpeg", "start_media.png", "start_media.webp"):
+        bundled = os.path.join(bundled_dir, name)
+        if os.path.isfile(bundled) and os.path.getsize(bundled) > 0:
+            target = os.path.join(dest_dir, name)
+            try:
+                os.makedirs(dest_dir, exist_ok=True)
+                if os.path.abspath(bundled) != os.path.abspath(target):
+                    shutil.copy2(bundled, target)
+                cfg["START_MEDIA_PATH"] = target
+                return target
+            except Exception:
+                return bundled
     restored = download_media(cfg.get("START_MEDIA_REF"), dest_dir, logger)
     if restored:
         cfg["START_MEDIA_PATH"] = restored

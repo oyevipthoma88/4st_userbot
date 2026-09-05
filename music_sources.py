@@ -3917,11 +3917,8 @@ if _BGUTIL_ACTIVE:
         "✅ bgutil PO-token provider active: %s", _BGUTIL_SERVER_HOME
     )
 else:
-    import logging as _logging
-    _logging.getLogger("music_sources").warning(
-        "⚠️ bgutil not found at %s — will attempt runtime install on first music request.",
-        _BGUTIL_SERVER_HOME,
-    )
+    # Provider intentionally disabled; strict audio path uses built-in yt-dlp.
+    pass
 
 
 # ── Deno runtime (build-time vendor + RUNTIME self-heal) ────────────────
@@ -4480,6 +4477,14 @@ _BGUTIL_INSTALL_DONE = False
 
 
 async def _ensure_bgutil_runtime(logger=None) -> None:
+    # External bgutil builds are incompatible with the deployed yt-dlp
+    # provider registry; strict audio playback intentionally does not install
+    # or register them at runtime.
+    return
+    # External bgutil builds are incompatible with the deployed yt-dlp
+    # provider registry; strict audio playback intentionally does not install
+    # or register them at runtime.
+    return
     """One-shot runtime bgutil installer — idempotent and async-safe."""
     global _BGUTIL_ACTIVE, _BGUTIL_INSTALL_DONE
     if _BGUTIL_ACTIVE or _BGUTIL_INSTALL_DONE:
