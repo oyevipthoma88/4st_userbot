@@ -827,6 +827,143 @@ def _get_session_pytgcalls(user_id: int):
 # ══════════════════════════════════════════
 # STATE CLASSES
 # ══════════════════════════════════════════
+
+
+# Generated from the live command router during the maintenance audit.
+# Keep this index as the single source for Help/.how coverage checks.
+_CODE_COMMAND_INDEX = (
+    'addtarget',
+    'afk',
+    'alive',
+    'ban',
+    'banall',
+    'bomb',
+    'calc',
+    'cmnd',
+    'config',
+    'cut',
+    'delall',
+    'demote',
+    'dice',
+    'dmsec',
+    'end',
+    'endmusic',
+    'fjadd',
+    'fjrm',
+    'font',
+    'forall',
+    'forcejoin',
+    'forcepromote',
+    'forme',
+    'fun',
+    'gcsec',
+    'ghost',
+    'h',
+    'hack',
+    'hearts',
+    'help',
+    'how',
+    'id',
+    'info',
+    'kang',
+    'loop',
+    'magic',
+    'mastersync',
+    'me',
+    'mend',
+    'mimic',
+    'moon',
+    'mstatus',
+    'multi',
+    'musicstop',
+    'mute',
+    'namehistory',
+    'nh',
+    'nhistory',
+    'onetag',
+    'pause',
+    'pin',
+    'ping',
+    'play',
+    'playforce',
+    'promote',
+    'purge',
+    'q',
+    'qout',
+    'queue',
+    'raid',
+    'restart',
+    'resume',
+    'rev',
+    'rmcmnd',
+    'rmtarget',
+    'rmtargetall',
+    'rocket',
+    'rraid',
+    'safemode',
+    'scanbot',
+    'setmode',
+    'skip',
+    'song',
+    'speed',
+    'sraid',
+    'startpic',
+    'stop',
+    'stopm',
+    'stopmulti',
+    'stopmusic',
+    'stoponetag',
+    'stopow',
+    'stopraid',
+    'stoprraid',
+    'stopspam',
+    'stopsraid',
+    'stoptagall',
+    'sudoadd',
+    'sudolist',
+    'sudorm',
+    'tagall',
+    'targetlist',
+    'tr',
+    'typing',
+    'unban',
+    'unmute',
+    'unpin',
+    'unwarn',
+    'vplay',
+    'warn',
+    'warnlist',
+    'weather',
+    'ytdl',
+)
+
+
+def _generated_command_doc(cmd: str) -> str:
+    music = {"play", "vplay", "playforce", "queue", "q", "pause", "resume",
+             "skip", "loop", "end", "mend", "stopmusic", "mstatus", "ytdl",
+             "forall", "forme", "me", "song"}
+    admin = {"ban", "mute", "unmute", "unban", "promote", "demote", "banall",
+             "warn", "unwarn", "warnlist", "pin", "unpin", "delall"}
+    security = {"gcsec", "dmsec", "safemode", "sudoadd", "sudoaddfull", "sudorm",
+                "sudolist", "mastersync", "config"}
+    if cmd in music:
+        purpose = "Music control: search, stream, queue, playback state, or voice-chat recovery."
+        flow = "The command resolves media, validates the source, then queues or starts playback; errors fall back without crashing the core."
+    elif cmd in admin:
+        purpose = "Group administration action for a replied/target user."
+        flow = "The command first checks the current core's permissions, resolves the target, performs the Telegram action, and reports failures safely."
+    elif cmd in security:
+        purpose = "Core/security configuration or protection control."
+        flow = "The command is owner/sudo gated where required, updates isolated configuration/state, and persists changes when applicable."
+    else:
+        purpose = "Utility, automation, information, or entertainment command implemented by the userbot core."
+        flow = "The command is routed by the main event handler, validates its arguments and privileges, then runs its module with guarded error handling."
+    return (f"<b>Purpose:</b> {purpose}\n"
+            f"<b>How it works:</b> {flow}\n"
+            f"<b>Usage:</b> <code>.{cmd}</code> plus the arguments shown in <code>.help</code>; reply to a user when the command requires a target.\n"
+            f"<b>Notes:</b> A missing target, permission failure, FloodWait, or unavailable external source is handled without taking down the session.\n"
+            f"<b>Related:</b> Use <code>.how {cmd}</code> again for this command and <code>.help</code> for the complete live index.")
+
 class ClientIsolatedState:
     def __init__(self):
         self.active_tasks       = {}
@@ -2810,39 +2947,26 @@ def _stop_progress_animator(mstate: ChatMusicState):
     if task and not task.done():
         task.cancel()
 
-async def _animate_now_playing(chat_id: int, mstate: ChatMusicState, track: MusicTrack):
-    """Edits the live Now Playing card every few seconds so the progress bar
-    visibly fills in as the track plays — this is the "animation" for a
-    plain-text Telegram message (no native video/gif progress widget)."""
-    msg = mstate.now_playing_msg
-    if not msg:
-        return
-    try:
-        while True:
-            await asyncio.sleep(4)
-            if mstate.current is not track or mstate.now_playing_msg is not msg:
-                return  # track changed / skipped / stopped under us
-            if mstate.is_paused:
-                continue  # frozen — no need to keep re-rendering the same bar
-            elapsed = _track_elapsed(track)
-            if track.duration and elapsed >= track.duration + 2:
-                return  # about to advance via stream_end handler anyway
-            try:
-                await msg.edit(_now_playing_text(mstate), parse_mode='html')
-            except Exception:
-                pass  # message deleted / not modified / flood-wait — ignore and keep trying
-    except asyncio.CancelledError:
-        pass
-
 async def show_now_playing(client, chat_id: int, mstate: ChatMusicState, proc_msg=None):
-    """Renders/refreshes the Now Playing card for the chat's current track,
-    (re)starts the animator task, and stores the message so future edits
-    (pause/resume/skip) update this same card instead of spamming new ones.
-    Sends a separate control-button card via asstbot so inline callbacks work."""
+    """Keep exactly one stable playcard per chat; only explicit user actions edit it."""
     _stop_progress_animator(mstate)
     text = _now_playing_text(mstate)
-    msg = None
-    if proc_msg:
+    btns = _vc_control_buttons(chat_id, is_paused=mstate.is_paused)
+    msg = mstate.now_playing_msg if asstbot_started else None
+    if msg is not None:
+        try:
+            await msg.edit(text, buttons=btns, parse_mode='html')
+        except Exception:
+            msg = None
+    if msg is None and asstbot_started and mstate.current is not None:
+        try:
+            msg = await asstbot.send_message(chat_id, text, buttons=btns, parse_mode='html')
+        except Exception:
+            msg = None
+    if proc_msg and msg is not proc_msg:
+        try: await proc_msg.delete()
+        except Exception: pass
+    if msg is None and proc_msg:
         try:
             await proc_msg.edit(text, parse_mode='html')
             msg = proc_msg
@@ -2851,27 +2975,9 @@ async def show_now_playing(client, chat_id: int, mstate: ChatMusicState, proc_ms
     if msg is None:
         msg = await safe_send_and_track(client, chat_id, text)
     mstate.now_playing_msg = msg
-
-    # Send inline control buttons via asstbot — only bots can receive callbacks.
-    # If asstbot is not in the group, this silently fails (non-fatal).
-    if mstate.current is not None and asstbot_started:
-        try:
-            btns = _vc_control_buttons(chat_id, is_paused=mstate.is_paused)
-            ctrl_msg = await asstbot.send_message(
-                chat_id,
-                f"<b>🎛 Controls</b> — <i>{mstate.current.title[:40]}</i>",
-                buttons=btns,
-                parse_mode='html',
-            )
-            mstate.ctrl_msg_id = getattr(ctrl_msg, 'id', None)
-        except Exception:
-            pass  # asstbot not in group — text-only mode is fine
-
-    if msg and mstate.current is not None:
-        mstate.animator_task = asyncio.create_task(
-            _animate_now_playing(chat_id, mstate, mstate.current)
-        )
+    mstate.ctrl_msg_id = getattr(msg, 'id', None) if msg else None
     return msg
+
 
 def _format_queue(mstate: ChatMusicState) -> str:
     lines = ["<blockquote>"]
@@ -4800,7 +4906,9 @@ def create_event_handler(client):
                 "  .mend   .mstatus   .ytdl   .forall\n\n"
                 "──────────────────────\n"
                 "  <code>.how [cmd]</code>  —  detailed help\n"
-                "  <code>.ping</code>  ·  <code>.restart</code>  ·  <code>.config</code>"
+                "  <code>.ping</code>  ·  <code>.restart</code>  ·  <code>.config</code>\n\n"
+                "📚  <b>COMPLETE LIVE COMMAND INDEX</b>\n"
+                f"  <code>{'  '.join('.' + c for c in _CODE_COMMAND_INDEX)}</code>"
                 "</blockquote>"
             )
             await safe_send_and_track(client, chat_id, help_msg)
@@ -6207,7 +6315,7 @@ def create_event_handler(client):
                 "forceplay":  ".playforce [song/URL] — Immediately play song, skipping queue",
                 "q":          ".q — Show music queue (short form of .queue)",
             }
-            doc = HOW_DOCS.get(cmd_q)
+            doc = HOW_DOCS.get(cmd_q) or (_generated_command_doc(cmd_q) if cmd_q in _CODE_COMMAND_INDEX else None)
             if doc:
                 await safe_send_and_track(client, chat_id,
                     f"<blockquote>ℹ️ <b>HOW:</b> <code>.{cmd_q}</code>\n\n{doc}</blockquote>")

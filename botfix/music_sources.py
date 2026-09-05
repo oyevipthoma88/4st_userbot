@@ -2663,7 +2663,7 @@ async def zero_disk_soundcloud_lookup(query: str, logger=None, allow_live: bool 
 # Resolve a playable CDN URL without downloading the whole track.  This is
 # deliberately bounded: a bad YouTube client must never hold .play hostage.
 _DIRECT_STREAM_CLIENTS = ["android", "web", "tv", "web_safari", "default"]
-_DIRECT_STREAM_RETRIES = 3
+_DIRECT_STREAM_RETRIES = 2
 _DIRECT_STREAM_TIMEOUT = 1.8
 
 
@@ -2734,34 +2734,37 @@ async def _direct_stream_is_live(url: str) -> bool:
         return False
 
 async def youtube_direct_stream(query: str, logger=None) -> dict | None:
-    """Return a fresh direct URL quickly; callers retain download fallback."""
+    """Resolve a fresh, validated audio URL with a bounded parallel client race."""
     logger = logger or (lambda *a: None)
     target = query.strip()
     if not target.startswith(("http://", "https://")):
         target = "ytsearch1:" + target
-    # A fresh client rung per attempt avoids retrying the same broken CDN URL.
     for attempt in range(_DIRECT_STREAM_RETRIES):
-        clients = [_DIRECT_STREAM_CLIENTS[(attempt + i) % len(_DIRECT_STREAM_CLIENTS)]
+        clients = [_DIRECT_STREAM_CLIENTS[(attempt * 2 + i) % len(_DIRECT_STREAM_CLIENTS)]
                    for i in range(min(2, len(_DIRECT_STREAM_CLIENTS)))]
         clients = list(dict.fromkeys(clients))
+        async def _one(client_name):
+            try:
+                return await asyncio.wait_for(
+                    asyncio.to_thread(_direct_stream_extract_sync, target, [client_name],
+                                      globals().get("_YTDLP_COOKIE_FILE")),
+                    timeout=_DIRECT_STREAM_TIMEOUT + 0.7)
+            except Exception:
+                return None
+        tasks = [asyncio.create_task(_one(c)) for c in clients]
         try:
-            result = await asyncio.wait_for(
-                asyncio.to_thread(_direct_stream_extract_sync, target, clients, globals().get("_YTDLP_COOKIE_FILE")),
-                timeout=_DIRECT_STREAM_TIMEOUT + 0.9,
-            )
-        except asyncio.TimeoutError:
-            result = None
-        if result and result.get("stream_url"):
-            # Validate the signed URL before handing it to ffmpeg/PyTgCalls.
-            # A successful yt-dlp extraction can still point at an expired CDN
-            # edge or an HTML challenge response.
-            if await _direct_stream_is_live(result["stream_url"]):
-                logger("MUSIC_DIRECT", f"direct stream ready in attempt {attempt + 1}: {result['title'][:60]}")
-                return result
-            logger("MUSIC_DIRECT_REJECT", f"dead/non-media URL on attempt {attempt + 1}")
+            for task in asyncio.as_completed(tasks):
+                result = await task
+                if result and result.get("stream_url") and await _direct_stream_is_live(result["stream_url"]):
+                    logger("MUSIC_DIRECT", f"direct stream ready in race {attempt + 1}: {result.get('title','')[:60]}")
+                    return result
+        finally:
+            for task in tasks:
+                if not task.done(): task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
         if attempt + 1 < _DIRECT_STREAM_RETRIES:
-            await asyncio.sleep(0.25 * (attempt + 1))
-    logger("MUSIC_DIRECT_MISS", f"direct stream unavailable after {_DIRECT_STREAM_RETRIES} bounded attempts: {query[:80]}")
+            await asyncio.sleep(0.15)
+    logger("MUSIC_DIRECT_MISS", f"direct stream unavailable after {_DIRECT_STREAM_RETRIES} bounded races: {query[:80]}")
     return None
 
 async def resolve_zero_disk_stream(query: str, logger=None, allow_live: bool = False) -> dict | None:
