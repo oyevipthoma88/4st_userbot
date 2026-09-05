@@ -2794,7 +2794,8 @@ async def resolve_zero_disk_stream(query: str, logger=None, allow_live: bool = F
     tasks = {
         asyncio.create_task(_safe(fn)): fn.__name__
         for fn in (
-            zero_disk_piped_lookup,      # ① YouTube via Piped frontend (backup)
+            zero_disk_jiosaavn_lookup,  # ① fast Indian music CDN
+            zero_disk_piped_lookup,      # ② YouTube via Piped frontend
         )
     }
     pending = set(tasks)
@@ -3827,12 +3828,41 @@ async def youtube_search_download(query: str, out_tmpl: str, logger=None) -> dic
 
     ts = int(time.time() * 1000)
 
-    # direct-fast: hand PyTgCalls a fresh CDN URL first; full disk download is
-    # retained as a bounded fallback for clients/CDNs that reject direct URLs.
-    direct = await youtube_direct_stream(query, logger=logger)
-    if direct:
-        logger("MUSIC_YT", "✓ [direct-fast] returning zero-disk stream")
-        return direct
+    # FAST SOURCE RACE: YouTube direct + public CDN frontends run together.
+    # The first valid URL wins; a blocked YouTube extractor no longer prevents
+    # a JioSaavn/Piped URL from starting playback inside the 5–10s target.
+    async def _fast_direct():
+        try:
+            return await youtube_direct_stream(query, logger=logger)
+        except Exception as exc:
+            logger("MUSIC_DIRECT_ERR", repr(exc))
+            return None
+    async def _fast_frontends():
+        try:
+            return await resolve_zero_disk_stream(query, logger=logger)
+        except Exception as exc:
+            logger("MUSIC_FAST_SOURCE_ERR", repr(exc))
+            return None
+    _fast_tasks = [asyncio.create_task(_fast_direct()),
+                   asyncio.create_task(_fast_frontends())]
+    _fast_deadline = asyncio.get_running_loop().time() + 6.2
+    try:
+        _pending = set(_fast_tasks)
+        while _pending and asyncio.get_running_loop().time() < _fast_deadline:
+            _left = max(0.1, _fast_deadline - asyncio.get_running_loop().time())
+            _done, _pending = await asyncio.wait(
+                _pending, timeout=_left, return_when=asyncio.FIRST_COMPLETED)
+            for _task in _done:
+                try: _fast_result = _task.result()
+                except Exception: _fast_result = None
+                if (_fast_result and _fast_result.get("stream_url")
+                        and await _direct_stream_is_live(_fast_result["stream_url"])):
+                    logger("MUSIC_YT", f"✓ [fast-cdn-race/{_fast_result.get('source','direct')}] returning zero-disk stream")
+                    return _fast_result
+    finally:
+        for _task in _fast_tasks:
+            if not _task.done(): _task.cancel()
+        await asyncio.gather(*_fast_tasks, return_exceptions=True)
 
     # ─── Phase 0: Cookie-priority fast path ─────────────────────────────
     # When YTDLP_COOKIES is set the user has real YouTube credentials — go
