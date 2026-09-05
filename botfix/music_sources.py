@@ -2662,9 +2662,10 @@ async def zero_disk_soundcloud_lookup(query: str, logger=None, allow_live: bool 
 # ── Fast direct-stream resolver ─────────────────────────────────────────────
 # Resolve a playable CDN URL without downloading the whole track.  This is
 # deliberately bounded: a bad YouTube client must never hold .play hostage.
-_DIRECT_STREAM_CLIENTS = ["web_safari", "web", "android", "tv", "default"]
-_DIRECT_STREAM_RETRIES = 2
+_DIRECT_STREAM_CLIENTS = ["web_safari", "web", "android"]
+_DIRECT_STREAM_RETRIES = 1
 _DIRECT_STREAM_TIMEOUT = 4.2
+_MUSIC_DOWNLOAD_LOCK = asyncio.Lock()
 
 
 def _direct_stream_extract_sync(target: str, clients: list, cookiefile=None):
@@ -3840,7 +3841,7 @@ async def youtube_search_download(query: str, out_tmpl: str, logger=None) -> dic
     async def _parallel_download():
         for round_no in (1, 2):
             # Direct CDN winners remain immediate; preserve valid local files.
-            try: result=await asyncio.wait_for(_parallel_round(round_no), timeout=17.5)
+            try: result=await asyncio.wait_for(_parallel_round(round_no), timeout=8.5)
             except Exception as exc:
                 logger("MUSIC_PARALLEL_ERR", f"round={round_no}: {type(exc).__name__}: {exc!r}"); result=None
             if result: return result
@@ -3860,9 +3861,9 @@ async def youtube_search_download(query: str, out_tmpl: str, logger=None) -> dic
             for task in (direct_task, download_task):
                 if not task.done(): task.cancel()
             await asyncio.gather(direct_task, download_task, return_exceptions=True)
-    try: result=await asyncio.wait_for(_race(), timeout=18.5)
+    try: result=await asyncio.wait_for(_race(), timeout=9.5)
     except asyncio.TimeoutError:
-        logger("MUSIC_RACE_TIMEOUT", f"bounded 18.5s deadline: {query!r}"); result=None
+        logger("MUSIC_RACE_TIMEOUT", f"bounded 9.5s deadline: {query!r}"); result=None
     except Exception as exc:
         logger("MUSIC_RACE_ERR", repr(exc)); result=None
     if result: return result

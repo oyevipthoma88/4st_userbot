@@ -775,6 +775,12 @@ async def send_module_log(text: str):
 # PER-SESSION PYROGRAM HELPERS
 # ══════════════════════════════════════════
 
+try:
+    MAX_MUSIC_SESSIONS = max(1, int(os.environ.get("MAX_MUSIC_SESSIONS", "1")))
+except (TypeError, ValueError):
+    MAX_MUSIC_SESSIONS = 1
+
+
 def _get_session_pyro(user_id: int):
     """Return the Pyrogram client for this userbot session (None if not set up).
 
@@ -784,9 +790,13 @@ def _get_session_pyro(user_id: int):
     the per-account "Music Setup" flow once."""
     if user_id in pyro_apps and pyro_apps[user_id] is not None:
         return pyro_apps[user_id]
-    # Fallback: owner's primary session
-    if user_id == cfg.get("OWNER_ID", 0) and pyro_app:
-        return pyro_apps.setdefault(user_id, pyro_app)  # cache for future calls
+    # Fallback: use the owner's/first active engine so every Telethon core
+    # can issue .play without forcing another heavy Pyrogram connection.
+    for fallback_id in (cfg.get("OWNER_ID", 0), *tuple(pyro_apps.keys())):
+        if fallback_id in pyro_apps and pyro_apps[fallback_id] is not None:
+            return pyro_apps[fallback_id]
+    if pyro_app:
+        return pyro_app
     return None
 
 
@@ -820,8 +830,11 @@ def _get_session_pytgcalls(user_id: int):
     """Return the PyTgCalls instance for this userbot session (None if not set up)."""
     if user_id in pytgcalls_apps and pytgcalls_apps[user_id] is not None:
         return pytgcalls_apps[user_id]
-    if user_id == cfg.get("OWNER_ID", 0) and pytgcalls_app:
-        return pytgcalls_apps.setdefault(user_id, pytgcalls_app)
+    for fallback_id in (cfg.get("OWNER_ID", 0), *tuple(pytgcalls_apps.keys())):
+        if fallback_id in pytgcalls_apps and pytgcalls_apps[fallback_id] is not None:
+            return pytgcalls_apps[fallback_id]
+    if pytgcalls_app:
+        return pytgcalls_app
     return None
 
 # ══════════════════════════════════════════
@@ -2149,8 +2162,23 @@ async def _try_create_group_call(chat_id: int, session_user_id: int) -> bool:
         return False
 
 
+def _resolve_music_session_id(requested_id: int):
+    """Return a live bounded music engine, preferring the requested account."""
+    if requested_id in pytgcalls_apps and requested_id in pyro_apps:
+        return requested_id
+    owner_id = cfg.get("OWNER_ID", 0)
+    if owner_id in pytgcalls_apps and owner_id in pyro_apps:
+        return owner_id
+    for candidate in pytgcalls_apps:
+        if candidate in pyro_apps:
+            return candidate
+    return None
+
 async def music_play_track(chat_id: int, track: MusicTrack, session_user_id: int,
                            _retry: bool = True, _attempt: int = 0):
+    session_user_id = _resolve_music_session_id(session_user_id)
+    if session_user_id is None:
+        return False, "not_ready"
     """Starts streaming `track` into the chat's voice call using the
     PyTgCalls instance belonging to `session_user_id` (per-account music —
     each userbot plays through its own Pyrogram session).
@@ -7347,18 +7375,31 @@ async def main():
     # shared one. cfg["PYRO_SESSIONS"] is {user_id_str: session_string}.
     _pyro_sessions = cfg.get("PYRO_SESSIONS", {})
     if _pyro_sessions:
-        for _uid_str in list(_pyro_sessions.keys()):
+        # Do not start one Pyrogram/PyTgCalls pair per saved core. That
+        # multiplies Telegram receivers, ffmpeg state, and native buffers;
+        # the supplied log reached 1.48 GB before the first song could play.
+        # Prefer OWNER_ID and keep the rest lazy/on-demand.
+        _music_ids = []
+        _owner_music_id = cfg.get("OWNER_ID")
+        if _owner_music_id is not None and str(_owner_music_id) in _pyro_sessions:
+            _music_ids.append(str(_owner_music_id))
+        _music_ids.extend(k for k in _pyro_sessions if k not in _music_ids)
+        _started_music = 0
+        for _uid_str in _music_ids:
+            if _started_music >= MAX_MUSIC_SESSIONS:
+                break
             try:
                 _uid = int(_uid_str)
-            except ValueError:
+            except (TypeError, ValueError):
                 continue
             if init_pyrogram(_uid):
-                asyncio.create_task(_start_music_engine(_uid))
+                _started_music += 1
+                await _start_music_engine(_uid)
             else:
                 bot_logger("MUSIC", f"Failed to init Pyrogram for {_uid} — check its session string.")
+        bot_logger("MUSIC", f"Started {_started_music}/{len(_pyro_sessions)} music engines (MAX_MUSIC_SESSIONS={MAX_MUSIC_SESSIONS}).")
     else:
-        bot_logger("MUSIC",
-                      "No Pyrogram sessions. Use bot /start → 🎵 Music Setup to login.")
+        bot_logger("MUSIC", "No Pyrogram sessions. Use bot /start → 🎵 Music Setup to login.")
 
     # Start primary userbot
     userbot_started = False
