@@ -1958,7 +1958,7 @@ async def search_and_download_audio(query: str):
         bot_logger("MUSIC_CACHE_HIT", f"Reusing cached file for: {query}")
         return MusicTrack(
             title=cached["title"], file_path=cached["file_path"],
-            duration=cached["duration"], is_video=cached["is_video"],
+            duration=cached["duration"], is_video=False,
             thumbnail=cached.get("thumbnail"), source=cached["source"],
         )
 
@@ -4388,6 +4388,9 @@ def create_event_handler(client):
         # If the user typed an alias (e.g. .oye → .ow), remap text/text_lower
         # so all downstream handlers see the canonical command name.
         _user_aliases = cfg.get("CMD_ALIASES", {}).get(my_id_str, {})
+        _reserved_media_cmd = text_lower.lstrip(".").split(None, 1)[0]
+        if _reserved_media_cmd in {"play", "vplay", "playforce"}:
+            _user_aliases = {}
         if text_lower in _user_aliases:
             # Remap: replace the alias text with the real command
             _real_cmd = _user_aliases[text_lower]
@@ -4396,6 +4399,8 @@ def create_event_handler(client):
 
         # Custom text commands — works with or without dot, message NOT deleted
         _custom_cmds_user = cfg.get("CUSTOM_CMDS", {}).get(my_id_str, {})
+        if text_lower.lstrip(".").split(None, 1)[0] in {"play", "vplay", "playforce"}:
+            _custom_cmds_user = {}
         _cmd_key_check = (
             text_lower if text_lower in _custom_cmds_user else
             ("." + text_lower.lstrip(".") if ("." + text_lower.lstrip(".")) in _custom_cmds_user else None)
@@ -4552,6 +4557,9 @@ def create_event_handler(client):
                     track.is_video = True
             if not track and query:
                 track = await search_and_download_video(query)
+            if track:
+                track.is_video = True
+                bot_logger("MUSIC_ROUTE", f"video .vplay selected: {track.title[:70]}")
 
             if not track:
                 if proc_msg:
@@ -4625,6 +4633,9 @@ def create_event_handler(client):
                 track = await download_tagged_media(event)
             if not track and query:
                 track = await search_and_download_audio(query)
+            if track:
+                track.is_video = False
+                bot_logger("MUSIC_ROUTE", f"audio resolver enforced: {track.title[:70]}")
             if not track:
                 if proc_msg:
                     try: await proc_msg.edit(
@@ -4806,6 +4817,9 @@ def create_event_handler(client):
                 track = await search_and_download_video(query)
             else:
                 track = await search_and_download_audio(query)
+            if track:
+                track.is_video = False
+                bot_logger("MUSIC_ROUTE", f"audio resolver enforced: {track.title[:70]}")
             if not track:
                 if proc_msg:
                     try: await proc_msg.edit(

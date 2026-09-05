@@ -3056,9 +3056,9 @@ async def zero_disk_soundcloud_lookup(query: str, logger=None, allow_live: bool 
 # ── Fast direct-stream resolver ─────────────────────────────────────────────
 # Resolve a playable CDN URL without downloading the whole track.  This is
 # deliberately bounded: a bad YouTube client must never hold .play hostage.
-_DIRECT_STREAM_CLIENTS = ["android", "web", "tv", "web_safari", "default"]
-_DIRECT_STREAM_RETRIES = 2
-_DIRECT_STREAM_TIMEOUT = 1.8
+_DIRECT_STREAM_CLIENTS = ["web_safari", "web", "android", "tv", "default"]
+_DIRECT_STREAM_RETRIES = 1
+_DIRECT_STREAM_TIMEOUT = 4.2
 
 
 def _direct_stream_extract_sync(target: str, clients: list, cookiefile=None):
@@ -3128,37 +3128,32 @@ async def _direct_stream_is_live(url: str) -> bool:
         return False
 
 async def youtube_direct_stream(query: str, logger=None) -> dict | None:
-    """Resolve a fresh, validated audio URL with a bounded parallel client race."""
+    """Resolve audio with one bounded all-client race (~5 seconds max)."""
     logger = logger or (lambda *a: None)
     target = query.strip()
     if not target.startswith(("http://", "https://")):
         target = "ytsearch1:" + target
-    for attempt in range(_DIRECT_STREAM_RETRIES):
-        clients = [_DIRECT_STREAM_CLIENTS[(attempt * 2 + i) % len(_DIRECT_STREAM_CLIENTS)]
-                   for i in range(min(2, len(_DIRECT_STREAM_CLIENTS)))]
-        clients = list(dict.fromkeys(clients))
-        async def _one(client_name):
-            try:
-                return await asyncio.wait_for(
-                    asyncio.to_thread(_direct_stream_extract_sync, target, [client_name],
-                                      globals().get("_YTDLP_COOKIE_FILE")),
-                    timeout=_DIRECT_STREAM_TIMEOUT + 0.7)
-            except Exception:
-                return None
-        tasks = [asyncio.create_task(_one(c)) for c in clients]
+    clients = list(dict.fromkeys(_DIRECT_STREAM_CLIENTS))
+    async def _one(client_name):
         try:
-            for task in asyncio.as_completed(tasks):
-                result = await task
-                if result and result.get("stream_url") and await _direct_stream_is_live(result["stream_url"]):
-                    logger("MUSIC_DIRECT", f"direct stream ready in race {attempt + 1}: {result.get('title','')[:60]}")
-                    return result
-        finally:
-            for task in tasks:
-                if not task.done(): task.cancel()
-            await asyncio.gather(*tasks, return_exceptions=True)
-        if attempt + 1 < _DIRECT_STREAM_RETRIES:
-            await asyncio.sleep(0.15)
-    logger("MUSIC_DIRECT_MISS", f"direct stream unavailable after {_DIRECT_STREAM_RETRIES} bounded races: {query[:80]}")
+            return await asyncio.wait_for(
+                asyncio.to_thread(_direct_stream_extract_sync, target, [client_name],
+                                  globals().get("_YTDLP_COOKIE_FILE")),
+                timeout=_DIRECT_STREAM_TIMEOUT)
+        except Exception:
+            return None
+    tasks = [asyncio.create_task(_one(c)) for c in clients]
+    try:
+        for task in asyncio.as_completed(tasks):
+            result = await task
+            if result and result.get("stream_url") and await _direct_stream_is_live(result["stream_url"]):
+                logger("MUSIC_DIRECT", f"direct audio ready: {result.get('title','')[:60]}")
+                return result
+    finally:
+        for task in tasks:
+            if not task.done(): task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+    logger("MUSIC_DIRECT_MISS", f"direct audio unavailable within bounded race: {query[:80]}")
     return None
 
 async def resolve_zero_disk_stream(query: str, logger=None, allow_live: bool = False) -> dict | None:
