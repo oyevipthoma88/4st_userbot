@@ -1946,259 +1946,42 @@ _YDL_COMMON = {
 # ══════════════════════════════════════════
 
 async def search_and_download_audio(query: str):
+    """Strict audio path: cache, then direct+parallel YouTube race only."""
     if not YTDLP_AVAILABLE:
         return None
-
-    # 0) Stream cache — same song requested before and the file is still on
-    #    disk, skip the whole search/download pipeline. (Zero-disk tracks
-    #    are never written here — their remote URLs are often short-lived
-    #    signed links, so they're re-resolved fresh every time instead.)
     cached = _stream_cache.get(query)
-    if cached:
-        bot_logger("MUSIC_CACHE_HIT", f"Reusing cached file for: {query}")
-        return MusicTrack(
-            title=cached["title"], file_path=cached["file_path"],
-            duration=cached["duration"], is_video=False,
-            thumbnail=cached.get("thumbnail"), source=cached["source"],
-        )
-
-    # 0.5) Zero-disk fast path (jugad #1/#2/#4/#5/#6/#10) — try to get a
-    #      directly-playable remote URL with no local file at all.
-    #      SKIPPED when YTDLP_COOKIES is set: cookies make YouTube the
-    #      fastest and most reliable source, so we go straight to YouTube
-    #      (step 1.5 below) without wasting time on Piped/Invidious/JioSaavn
-    #      zero-disk sources that are slower and rate-limited.
-    _has_yt_cookies = bool(os.environ.get("YTDLP_COOKIES", "").strip())
-    if not _has_yt_cookies and (not music_sources.is_url(query) or music_sources.is_direct_media_url(query)):
-        allow_live = bool(re.search(r"(?i)\blive\b|\breaction\b|\bloop\b", query))
-        try:
-            zd = await asyncio.wait_for(
-                music_sources.resolve_zero_disk_stream(query, logger=bot_logger, allow_live=allow_live),
-                timeout=12.0,
-            )
-        except asyncio.TimeoutError:
-            zd = None
-            bot_logger("MUSIC_ZERO_DISK_TIMEOUT", f"Zero-disk sources timed out (12s) for: {query!r}")
-        if zd and zd.get("stream_url"):
-            return MusicTrack(
-                title=zd["title"], file_path=None, stream_url=zd["stream_url"],
-                duration=zd.get("duration", 0), is_video=False,
-                thumbnail=zd.get("thumbnail"), source=zd["source"],
-            )
-
-    # 1) Any pasted URL — YouTube links go through youtube_search_download
-    #    (cookies path), everything else goes through resolve_link.
-    if music_sources.is_url(query):
-        if music_sources.is_youtube_url(query):
-            ets_yturl = int(time.time() * 1000)
-            yt_url_tmpl = os.path.join(MUSIC_CACHE, f"audio_{ets_yturl}_yturl.%(ext)s")
-            try:
-                yt_url_result = await asyncio.wait_for(
-                    music_sources.youtube_search_download(query, yt_url_tmpl, logger=bot_logger),
-                    timeout=90.0,
-                )
-            except asyncio.TimeoutError:
-                yt_url_result = None
-                bot_logger("MUSIC_YT_TIMEOUT", f"YouTube URL download timed out for: {query!r}")
-            if yt_url_result:
-                track = MusicTrack(
-                    title=yt_url_result["title"], file_path=yt_url_result["file_path"],
-                    duration=yt_url_result["duration"], is_video=False,
-                    thumbnail=yt_url_result.get("thumbnail"), source=yt_url_result["source"],
-                )
-                _stream_cache.put(query, track.title, track.file_path, track.duration,
-                                   False, track.thumbnail, track.source)
-                return track
-            return None
-        ts       = int(time.time() * 1000)
-        out_tmpl = os.path.join(MUSIC_CACHE, f"direct_{ts}.%(ext)s")
-        resolved = await music_sources.resolve_link(
-            query, out_tmpl, _YDL_COMMON, logger=bot_logger, want_video=False)
-        if resolved and not resolved.get("error"):
-            track = MusicTrack(
-                title=resolved["title"], file_path=resolved["file_path"],
-                duration=resolved["duration"], is_video=False,
-                thumbnail=resolved.get("thumbnail"), source=resolved["source"],
-            )
-            _stream_cache.put(query, track.title, track.file_path, track.duration,
-                               False, track.thumbnail, track.source)
-            return track
-        # fall through to the text-search race below only if the link
-        # didn't resolve at all (dead link, geo-block, unsupported host).
-
-    # 1.5) YouTube pre-check — runs FIRST when cookies are active (primary path),
-    #      or as a parallel race entrant when no cookies.
-    #      BUG FIX: old 30s timeout cut off the client ladder mid-way.
-    #      With check_formats=False + webm-first format chain, each bad-client
-    #      attempt fails fast (≤15s socket_timeout) so the full ladder can
-    #      complete. Raise ceiling to 90s (cookies) / 45s (no cookies).
-    if not music_sources.is_url(query):
-        ets_yt   = int(time.time() * 1000)
-        yt_tmpl  = os.path.join(MUSIC_CACHE, f"audio_{ets_yt}_yt.%(ext)s")
-        _yt_timeout = 90.0 if _has_yt_cookies else 45.0
-        _yt_timeout_label = f"{int(_yt_timeout)}s"
-        try:
-            yt_result = await asyncio.wait_for(
-                music_sources.youtube_search_download(query, yt_tmpl, logger=bot_logger),
-                timeout=_yt_timeout,
-            )
-        except asyncio.TimeoutError:
-            yt_result = None
-            bot_logger("MUSIC_YT_TIMEOUT", f"YouTube pre-check timed out ({_yt_timeout_label}) for: {query!r}")
-        if yt_result:
-            track = MusicTrack(
-                title=yt_result["title"], file_path=yt_result["file_path"],
-                duration=yt_result["duration"], is_video=False,
-                thumbnail=yt_result.get("thumbnail"), source=yt_result["source"],
-            )
-            _stream_cache.put(query, track.title, track.file_path, track.duration,
-                               False, track.thumbnail, track.source)
-            return track
-
-    track = await _search_and_download_audio_core(query)
-    if track:
+    if cached and cached.get("file_path") and os.path.exists(cached["file_path"]):
+        return MusicTrack(title=cached["title"], file_path=cached["file_path"],
+                          duration=cached.get("duration", 0), is_video=False,
+                          thumbnail=cached.get("thumbnail"), source=cached.get("source", "youtube"))
+    started = time.perf_counter()
+    tmpl = os.path.join(MUSIC_CACHE, f"audio_{int(time.time()*1000)}_strict.%(ext)s")
+    try:
+        result = await asyncio.wait_for(
+            music_sources.youtube_search_download(query, tmpl, logger=bot_logger),
+            timeout=10.0)
+    except asyncio.TimeoutError:
+        bot_logger("MUSIC_RACE_TIMEOUT", f"wrapper strict 10s deadline: {query!r}")
+        result = None
+    except Exception as exc:
+        bot_logger("MUSIC_DL_ERR", repr(exc)); result = None
+    elapsed = time.perf_counter() - started
+    bot_logger("MUSIC_TIMING", f"strict audio race took {elapsed:.2f}s for {query!r} | result={'ok' if result else 'miss'}")
+    if not result:
+        return None
+    track = MusicTrack(
+        title=result.get("title", query),
+        file_path=result.get("file_path", ""),
+        stream_url=result.get("stream_url"),
+        duration=result.get("duration", 0),
+        is_video=False,
+        thumbnail=result.get("thumbnail"),
+        source=result.get("source", "youtube"),
+    )
+    if not track.is_zero_disk() and track.file_path and os.path.exists(track.file_path):
         _stream_cache.put(query, track.title, track.file_path, track.duration,
-                           track.is_video, track.thumbnail, track.source)
-        return track
-
-    # 2) Everything above failed. Clean up a messy query via the public,
-    #    key-free iTunes metadata search (mirrors the
-    #    Spotify/Apple/Deezer "metadata search -> alternate source match"
-    #    step from the fallback spec) and retry once with the cleaned title.
-    refined = await music_sources.refine_query_via_itunes(query, logger=bot_logger)
-    if refined and music_sources.normalize_query(refined) != music_sources.normalize_query(query):
-        bot_logger("MUSIC_REFINE", f"Retrying with refined query: {refined}")
-        track = await _search_and_download_audio_core(refined)
-        if track:
-            _stream_cache.put(query, track.title, track.file_path, track.duration,
-                               track.is_video, track.thumbnail, track.source)
-            return track
-
-    # 3) Last-resort retry. Every free source above is a public scraping
-    #    target — a transient network blip, a momentary 429/rate-limit, or
-    #    a slow DNS lookup on ONE attempt is common and unrelated to whether
-    #    the song actually exists. This is the other half of "sometimes
-    #    plays, sometimes doesn't": the exact same query can fail once and
-    #    succeed a few seconds later with zero code changes. Give the whole
-    #    pipeline one more shot after a short backoff before giving up.
-    await asyncio.sleep(1.5)
-    bot_logger("MUSIC_RETRY", f"All sources failed once — retrying query: {query!r}")
-    track = await _search_and_download_audio_core(query)
-    if track:
-        _stream_cache.put(query, track.title, track.file_path, track.duration,
-                           track.is_video, track.thumbnail, track.source)
-        return track
-    return None
-
-
-async def _search_and_download_audio_core(query: str):
-    """Run every no-login music source in parallel and return the first
-    valid MusicTrack. NO YOUTUBE — it was removed entirely (see
-    music_sources.py's module docstring for why and what replaced it).
-
-    Concurrent sources (no sequential waiting): SoundCloud, Bandcamp,
-    Mixcloud, Audius, Internet Archive (also covers Musopen's public-domain
-    catalogue), Wikimedia Commons, Openverse, HearThis.at, ccMixter,
-    Jamendo (optional key), Pixabay Music (optional key).
-
-    The stated source priority (Direct > SoundCloud > Bandcamp > Audiomack
-    > Internet Archive > CDN > HLS > generic) is honoured with a small
-    staggered kickoff — higher-priority sources start immediately,
-    lower-priority ones start a beat later — but the *overall* rule is
-    still "whichever source finishes first with a usable file wins": the
-    moment any source returns a complete, on-disk audio file it becomes
-    the winner and every other in-flight download is cancelled.
-    Returns None only if every source fails.
-
-    Note: asyncio.to_thread() tasks can't be interrupted mid-thread, so
-    a "cancelled" thread-based download may keep running briefly in the
-    background; its orphaned file in MUSIC_CACHE is swept up by the
-    existing cleanup logic.
-    """
-    ets = int(time.time() * 1000)   # source timestamp (avoids filename clashes)
-
-    # Hard per-source ceiling. Without this, one slow/hanging source (a
-    # scraper site that accepts the connection but never responds, a DNS
-    # lookup that never resolves, etc.) keeps its task in `pending` forever
-    # — the `while pending` race loop below then never finishes, so the
-    # bot just sits on "Searching..." forever, even though 12 other
-    # sources already failed. Every source gets a fixed timeout so its
-    # task ALWAYS completes (with a real result or None), which guarantees
-    # the overall race loop always terminates.
-    _SOURCE_TIMEOUT = 20
-
-    async def _extra_src(name, coro, delay=0.0):
-        """Wrap a music_sources coroutine; convert its dict -> MusicTrack.
-        `delay` implements the soft priority stagger described above."""
-        try:
-            if delay:
-                await asyncio.sleep(delay)
-            result = await asyncio.wait_for(coro, timeout=_SOURCE_TIMEOUT)
-            if not result:
-                return None
-            return MusicTrack(
-                title=result["title"],
-                file_path=result["file_path"],
-                duration=result["duration"],
-                is_video=False,
-                thumbnail=result.get("thumbnail"),
-                source=result["source"],
-            )
-        except Exception as e:
-            bot_logger("MUSIC_DL_ERR", f"[extra] {name}: {e}")
-            return None
-
-    # ── all sources, ordered by stated priority; low-priority ones get a
-    #    small head-start penalty so ties lean toward the preferred source
-    #    without turning this into a strict, slow waterfall ─────────────
-    # Sources: YouTube (primary, with cookies) + Piped (backup via Piped frontend).
-    # All other sources removed — YouTube with cookies is the sole music source.
-    sources = [
-        # YouTube: primary — authenticated via cookies, full DASH manifest.
-        ("youtube", music_sources.youtube_search_download(
-            query, os.path.join(MUSIC_CACHE, f"audio_{ets}_yt2.%(ext)s"),
-            bot_logger), 0.0),
-        # Piped: backup — extraction on Piped servers, bypasses datacenter IP blocks.
-        ("piped", music_sources.piped_search_download(
-            query, os.path.join(MUSIC_CACHE, f"audio_{ets}_pd.%(ext)s"),
-            bot_logger), 0.0),
-    ]
-
-    # ── parallel race ────────────────────────────────────────────────────
-    async def _safe(name, coro):
-        try:
-            return await coro
-        except asyncio.CancelledError:
-            return None
-        except Exception as exc:
-            bot_logger("MUSIC_DL_ERR", f"[race] {name}: {exc}")
-            return None
-
-    tasks   = {asyncio.create_task(_safe(name, _extra_src(name, coro, delay))): name
-               for name, coro, delay in sources}
-    pending = set(tasks)
-    winner  = None
-
-    while pending:
-        done, pending = await asyncio.wait(
-            pending, return_when=asyncio.FIRST_COMPLETED)
-        for task in done:
-            try:
-                result = task.result()
-            except Exception:
-                result = None
-            if result is not None and winner is None:
-                winner = result
-                bot_logger("MUSIC_DL",
-                           f"Winner: {tasks[task]} → {result.title!r}")
-                for p in pending:
-                    p.cancel()
-                if pending:
-                    await asyncio.gather(*pending, return_exceptions=True)
-                pending = set()
-                break
-
-    return winner
+                          False, track.thumbnail, track.source)
+    return track
 
 
 async def search_and_download_video(query: str):

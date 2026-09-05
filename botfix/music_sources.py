@@ -2680,6 +2680,7 @@ def _direct_stream_extract_sync(target: str, clients: list, cookiefile=None):
         "check_formats": False, "geo_bypass": True,
         "format": "bestaudio[protocol^=http]/bestaudio/best[protocol^=http]/best",
         "extractor_args": ext_args,
+        "plugin_dirs": [],
         "http_headers": {"User-Agent": random_ua(), "Referer": "https://www.youtube.com/"},
         **(_get_js_runtime_opts() if "_get_js_runtime_opts" in globals() else {}),
         **(_get_impersonate_opt() if "_get_impersonate_opt" in globals() else {}),
@@ -3416,6 +3417,7 @@ def _yt_base_opts(out_tmpl: str, client: str, fmt: str) -> dict:
         "extractor_args": {
             "youtube": ext_args_yt,
         },
+        "plugin_dirs": [],
         # Cookie support — auto-injected if YTDLP_COOKIES env var is set.
         # Enables age-restricted / geo-locked / bot-checked video playback.
         **_cookie_opts(),
@@ -3811,48 +3813,59 @@ async def _yt_search_via_invidious(query: str, out_tmpl: str, logger=None) -> di
 
 
 async def youtube_search_download(query: str, out_tmpl: str, logger=None) -> dict | None:
-    """Minimal audio pipeline: direct stream, retry, then parallel downloads."""
+    """Strict bounded audio race: direct CDN and parallel download together."""
     logger = logger or (lambda *a: None)
     if yt_dlp is None:
         return None
-    try:
-        direct = await youtube_direct_stream(query, logger=logger)
-    except Exception as exc:
-        logger("MUSIC_DIRECT_ERR", repr(exc))
-        direct = None
-    if direct and direct.get("stream_url"):
-        logger("MUSIC_YT", "✓ [direct-only] zero-disk audio stream")
-        return direct
     target = query if query.startswith(("http://", "https://")) else "ytsearch1:" + query
     clients = list(dict.fromkeys(yt_clients(_YT_CLIENTS[:3])))
-    try:
-        fmt = _yt_build_format_chain()[0]
-    except Exception:
-        fmt = "bestaudio/best"
-    async def _round(round_no: int):
+    try: fmt=_yt_build_format_chain()[0]
+    except Exception: fmt="bestaudio/best"
+    async def _parallel_round(round_no: int):
         tasks=[]
         for client in clients:
-            tmpl = out_tmpl.replace("%(ext)s", f"_parallel{round_no}_{client}.%(ext)s")
-            tasks.append(asyncio.create_task(
-                _yt_try_download(target, tmpl, client, fmt, logger)))
+            tmpl=out_tmpl.replace("%(ext)s", f"_parallel{round_no}_{client}.%(ext)s")
+            tasks.append(asyncio.create_task(_yt_try_download(target, tmpl, client, fmt, logger)))
         try:
             for task in asyncio.as_completed(tasks):
-                try: result = await task
-                except Exception: result = None
+                try: result=await task
+                except Exception: result=None
                 if result and result.get("file_path") and os.path.exists(result["file_path"]):
-                    for other in tasks:
-                        if not other.done(): other.cancel()
                     return result
         finally:
+            for task in tasks:
+                if not task.done(): task.cancel()
             await asyncio.gather(*tasks, return_exceptions=True)
         return None
-    for round_no in (1, 2):
-        try: result = await asyncio.wait_for(_round(round_no), timeout=12.0)
-        except Exception as exc:
-            logger("MUSIC_PARALLEL_ERR", f"round={round_no}: {exc}"); result = None
-        if result: return result
-        if round_no == 1: await asyncio.sleep(0.15)
-    logger("MUSIC_YT_FAIL", f"Direct stream and parallel audio retries failed: {query!r}")
+    async def _parallel_download():
+        for round_no in (1, 2):
+            try: result=await asyncio.wait_for(_parallel_round(round_no), timeout=8.5)
+            except Exception as exc:
+                logger("MUSIC_PARALLEL_ERR", f"round={round_no}: {exc}"); result=None
+            if result: return result
+            if round_no == 1: await asyncio.sleep(0.1)
+        return None
+    async def _race():
+        direct_task=asyncio.create_task(youtube_direct_stream(query, logger=logger))
+        download_task=asyncio.create_task(_parallel_download())
+        try:
+            for task in asyncio.as_completed((direct_task, download_task)):
+                try: result=await task
+                except Exception as exc:
+                    logger("MUSIC_RACE_ERR", repr(exc)); result=None
+                if result: return result
+            return None
+        finally:
+            for task in (direct_task, download_task):
+                if not task.done(): task.cancel()
+            await asyncio.gather(direct_task, download_task, return_exceptions=True)
+    try: result=await asyncio.wait_for(_race(), timeout=9.5)
+    except asyncio.TimeoutError:
+        logger("MUSIC_RACE_TIMEOUT", f"strict 9.5s deadline: {query!r}"); result=None
+    except Exception as exc:
+        logger("MUSIC_RACE_ERR", repr(exc)); result=None
+    if result: return result
+    logger("MUSIC_YT_FAIL", f"Direct+parallel race failed within strict deadline: {query!r}")
     return None
 async def youtube_video_download(query: str, out_tmpl: str, logger=None) -> dict | None:
     """YouTube VIDEO download — same 40-jugad client chain, returns mp4.

@@ -2460,85 +2460,42 @@ _YDL_COMMON = {
 # ══════════════════════════════════════════
 
 async def search_and_download_audio(query: str):
-    """Download audio from YouTube using cookies (YTDLP_COOKIES env var).
-
-    Strictly YouTube-only — no JioSaavn, SoundCloud, Deezer, or any other
-    source. Mirrors the working Musicbot pattern: yt-dlp + cookies + local
-    download. YTDLP_COOKIES must be set on Heroku (Netscape format cookie file
-    content) — without cookies, cloud IPs get IP-blocked by YouTube.
-
-    Flow:
-      1. Stream cache (avoid re-downloading the same song)
-      2. YouTube download via music_sources.youtube_search_download()
-         — On Heroku/_ON_CLOUD_HOST: Phase H (local download, cookies, bgutil)
-         — Direct URL: just download that video
-         — Text query: ytsearch1: → download top result
-      3. One retry after 2 s if the first attempt fails (transient errors)
-    """
+    """Strict audio path: cache, then direct+parallel YouTube race only."""
     if not YTDLP_AVAILABLE:
         return None
-
-    # 1) Stream cache — same song, file still on disk → reuse immediately
     cached = _stream_cache.get(query)
-    if cached:
-        bot_logger("MUSIC_CACHE_HIT", f"Reusing cached file for: {query}")
-        return MusicTrack(
-            title=cached["title"], file_path=cached["file_path"],
-            duration=cached["duration"], is_video=False,
-            thumbnail=cached.get("thumbnail"), source=cached["source"],
-        )
-
-    async def _yt_download(suffix: str) -> MusicTrack | None:
-        ets     = int(time.time() * 1000)
-        tmpl    = os.path.join(MUSIC_CACHE, f"audio_{ets}_{suffix}.%(ext)s")
-        _download_started = time.perf_counter()
-        try:
-            result = await asyncio.wait_for(
-                music_sources.youtube_search_download(query, tmpl, logger=bot_logger),
-                timeout=300.0,
-            )
-            bot_logger(
-                "MUSIC_TIMING",
-                f"YouTube resolve/download took {time.perf_counter() - _download_started:.2f}s "
-                f"for {query!r} | result={'ok' if result else 'miss'}",
-            )
-        except asyncio.TimeoutError:
-            # 120s bahut kam tha: Heroku par client-ladder + mirrors 150s+ le
-            # lete the, timeout hit hone se successful download beech me hi
-            # cancel ho jaata tha aur kuch play nahi hota tha.
-            bot_logger("MUSIC_YT_TIMEOUT", f"YouTube timed out (300s) for: {query!r}")
-            return None
-        if not result:
-            return None
-        return MusicTrack(
-            title=result["title"], file_path=result.get("file_path", ""),
-            duration=result.get("duration", 0), is_video=False,
-            thumbnail=result.get("thumbnail"), source=result["source"],
-            stream_url=result.get("stream_url"),
-        )
-
-    # 2) First attempt
-    track = await _yt_download("yt")
-    if track:
-        # CDN URLs are short-lived; cache only durable local files.
-        if not track.is_zero_disk():
-            _stream_cache.put(query, track.title, track.file_path, track.duration,
-                               False, track.thumbnail, track.source)
-        return track
-
-    # 3) One retry after brief backoff (handles transient network blips)
-    bot_logger("MUSIC_RETRY", f"YouTube attempt 1 failed — retrying in 2s for: {query!r}")
-    await asyncio.sleep(2.0)
-    track = await _yt_download("yt2")
-    if track:
-        # CDN URLs are short-lived; cache only durable local files.
-        if not track.is_zero_disk():
-            _stream_cache.put(query, track.title, track.file_path, track.duration,
-                               False, track.thumbnail, track.source)
-        return track
-
-    bot_logger("MUSIC_DL_FAIL", f"YouTube failed for: {query!r}. Check YTDLP_COOKIES.")
-    return None
+    if cached and cached.get("file_path") and os.path.exists(cached["file_path"]):
+        return MusicTrack(title=cached["title"], file_path=cached["file_path"],
+                          duration=cached.get("duration", 0), is_video=False,
+                          thumbnail=cached.get("thumbnail"), source=cached.get("source", "youtube"))
+    started = time.perf_counter()
+    tmpl = os.path.join(MUSIC_CACHE, f"audio_{int(time.time()*1000)}_strict.%(ext)s")
+    try:
+        result = await asyncio.wait_for(
+            music_sources.youtube_search_download(query, tmpl, logger=bot_logger),
+            timeout=10.0)
+    except asyncio.TimeoutError:
+        bot_logger("MUSIC_RACE_TIMEOUT", f"wrapper strict 10s deadline: {query!r}")
+        result = None
+    except Exception as exc:
+        bot_logger("MUSIC_DL_ERR", repr(exc)); result = None
+    elapsed = time.perf_counter() - started
+    bot_logger("MUSIC_TIMING", f"strict audio race took {elapsed:.2f}s for {query!r} | result={'ok' if result else 'miss'}")
+    if not result:
+        return None
+    track = MusicTrack(
+        title=result.get("title", query),
+        file_path=result.get("file_path", ""),
+        stream_url=result.get("stream_url"),
+        duration=result.get("duration", 0),
+        is_video=False,
+        thumbnail=result.get("thumbnail"),
+        source=result.get("source", "youtube"),
+    )
+    if not track.is_zero_disk() and track.file_path and os.path.exists(track.file_path):
+        _stream_cache.put(query, track.title, track.file_path, track.duration,
+                          False, track.thumbnail, track.source)
+    return track
 
 
 async def _search_and_download_audio_core(query: str):
@@ -9827,15 +9784,7 @@ async def _start_music_engine(user_id: int):
         me = await client.get_me()
         bot_logger("MUSIC_ENGINE", f"Pyrogram ready for {user_id}: {me.first_name} (@{me.username})")
         bot_logger("MUSIC_ENGINE", f"PyTgCalls started for {user_id}. Music commands active!")
-        # Warm the bgutil PO-token HTTP server so the very first /play does
-        # not pay the cold Deno/BotGuard startup cost (and does not fall back
-        # to un-tokened formats that YouTube answers with 403).
-        try:
-            import music_sources as _ms_warm
-            if getattr(_ms_warm, "_BGUTIL_ACTIVE", False) and not getattr(_ms_warm, "_BGUTIL_HTTP_READY", False):
-                asyncio.create_task(_ms_warm.warm_up_bgutil_server())
-        except Exception:
-            pass
+
     except Exception as e:
         bot_logger("MUSIC_ENGINE_ERR", f"Failed to start for {user_id}: {e}")
         # BUG FIX: a revoked/unregistered Pyrogram string used to stay in
