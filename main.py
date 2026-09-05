@@ -2363,16 +2363,19 @@ async def search_and_download_audio(query: str):
         if not result:
             return None
         return MusicTrack(
-            title=result["title"], file_path=result["file_path"],
-            duration=result["duration"], is_video=False,
+            title=result["title"], file_path=result.get("file_path", ""),
+            duration=result.get("duration", 0), is_video=False,
             thumbnail=result.get("thumbnail"), source=result["source"],
+            stream_url=result.get("stream_url"),
         )
 
     # 2) First attempt
     track = await _yt_download("yt")
     if track:
-        _stream_cache.put(query, track.title, track.file_path, track.duration,
-                           False, track.thumbnail, track.source)
+        # CDN URLs are short-lived; cache only durable local files.
+        if not track.is_zero_disk():
+            _stream_cache.put(query, track.title, track.file_path, track.duration,
+                               False, track.thumbnail, track.source)
         return track
 
     # 3) One retry after brief backoff (handles transient network blips)
@@ -2380,8 +2383,10 @@ async def search_and_download_audio(query: str):
     await asyncio.sleep(2.0)
     track = await _yt_download("yt2")
     if track:
-        _stream_cache.put(query, track.title, track.file_path, track.duration,
-                           False, track.thumbnail, track.source)
+        # CDN URLs are short-lived; cache only durable local files.
+        if not track.is_zero_disk():
+            _stream_cache.put(query, track.title, track.file_path, track.duration,
+                               False, track.thumbnail, track.source)
         return track
 
     bot_logger("MUSIC_DL_FAIL", f"YouTube failed for: {query!r}. Check YTDLP_COOKIES.")
@@ -9089,10 +9094,136 @@ def create_event_handler(client, core_id=None):
             await wipe_untagged_messages(client, my_id, chat_id)
             istate.last_target_msg[chat_id] = None
 
+
+
+# ── Group security: ban-burst protection ───────────────────────────────────
+# Telegram does not push the admin-log actor through ordinary ChatAction
+# updates.  We therefore poll the authoritative admin log with a short,
+# bounded interval.  Two bans by the same non-protected actor inside five
+# seconds causes demotion and send-message restriction in that group.
+_GCSEC_WINDOW = 5.0
+_GCSEC_THRESHOLD = 2
+_GCSEC_POLL = 1.5
+_gcsec_tasks = set()
+_gcsec_seen = {}
+_gcsec_bursts = {}
+_gcsec_action_lock = set()
+_gcsec_dialog_cache = {}
+
+
+def _gcsec_is_ban_action(action) -> bool:
+    new = getattr(action, "new_participant", None)
+    if new is not None and "banned" in type(new).__name__.lower():
+        return True
+    return "participanttoggle" in type(action).__name__.lower() and "banned" in repr(new).lower()
+
+
+def _gcsec_protected_ids() -> set:
+    protected = {int(cfg.get("OWNER_ID", 0) or 0)}
+    for key in ("SUDO_USERS", "SUDO", "SUDO_IDS"):
+        values = cfg.get(key, []) or []
+        if isinstance(values, dict):
+            values = list(values.keys())
+        for value in values:
+            try: protected.add(int(value))
+            except (TypeError, ValueError): pass
+    return {uid for uid in protected if uid}
+
+
+async def _gcsec_demote_and_mute(client, chat, actor_id: int, count: int):
+    key = (id(client), int(getattr(chat, "id", chat)), int(actor_id))
+    if key in _gcsec_action_lock:
+        return
+    _gcsec_action_lock.add(key)
+    try:
+        # Never touch creators, the owner, or a configured sudo account.
+        try:
+            perms = await client.get_permissions(chat, actor_id)
+            if getattr(perms, "is_creator", False):
+                return
+        except Exception:
+            pass
+        await client(EditAdminRequest(chat, actor_id, ChatAdminRights(), rank=""))
+        await client(EditBannedRequest(
+            chat, actor_id,
+            ChatBannedRights(until_date=None, send_messages=True),
+        ))
+        bot_logger("GCSEC_AUTO_ACTION",
+                   f"demoted+muted actor={actor_id} chat={getattr(chat, 'id', chat)} bans={count}/{_GCSEC_WINDOW}s")
+    except Exception as exc:
+        bot_logger("GCSEC_ACTION_ERR", f"chat={getattr(chat, 'id', chat)} actor={actor_id}: {repr(exc)}")
+    finally:
+        _gcsec_action_lock.discard(key)
+
+
+async def _gcsec_scan_chat(client, chat):
+    from telethon.tl.functions.channels import GetAdminLogRequest
+    cid = int(getattr(chat, "id", chat))
+    key = (id(client), cid)
+    try:
+        result = await asyncio.wait_for(client(GetAdminLogRequest(
+            channel=chat, q="", min_id=0, max_id=0, limit=30,
+            events_filter=None, admins=None,
+        )), timeout=2.5)
+    except Exception:
+        return
+    events_found = getattr(result, "events", ()) or ()
+    last_id = _gcsec_seen.get(key, 0)
+    current_max = last_id
+    now = time.time()
+    protected = _gcsec_protected_ids()
+    for item in reversed(list(events_found)):
+        event_id = int(getattr(item, "id", 0) or 0)
+        current_max = max(current_max, event_id)
+        if event_id <= last_id or not _gcsec_is_ban_action(getattr(item, "action", None)):
+            continue
+        actor_id = int(getattr(item, "user_id", 0) or 0)
+        if not actor_id or actor_id in protected:
+            continue
+        bucket_key = (id(client), cid, actor_id)
+        bucket = _gcsec_bursts.setdefault(bucket_key, [])
+        event_time = getattr(item, "date", None)
+        ts = event_time.timestamp() if event_time else now
+        bucket[:] = [t for t in bucket if ts - t <= _GCSEC_WINDOW]
+        bucket.append(ts)
+        if len(bucket) >= _GCSEC_THRESHOLD:
+            await _gcsec_demote_and_mute(client, chat, actor_id, len(bucket))
+            bucket.clear()
+    _gcsec_seen[key] = current_max
+
+
+async def _gcsec_loop(client):
+    while True:
+        try:
+            now = time.monotonic()
+            cached = _gcsec_dialog_cache.get(id(client))
+            if not cached or now - cached[0] > 20:
+                dialogs = []
+                async for dialog in client.iter_dialogs():
+                    if getattr(dialog, "is_group", False) or getattr(dialog, "is_channel", False):
+                        entity = getattr(dialog, "entity", None)
+                        if entity is not None and (getattr(entity, "megagroup", False) or getattr(dialog, "is_group", False)):
+                            dialogs.append(entity)
+                _gcsec_dialog_cache[id(client)] = (now, dialogs)
+            else:
+                dialogs = cached[1]
+            await asyncio.gather(*(_gcsec_scan_chat(client, chat) for chat in dialogs), return_exceptions=True)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            bot_logger("GCSEC_LOOP_ERR", repr(exc))
+        await asyncio.sleep(_GCSEC_POLL)
+
 # ══════════════════════════════════════════
 # PASSIVE MONITORS
 # ══════════════════════════════════════════
 def attach_passive_monitors(client):
+    # One monitor per Telethon client; attach is called again for restored cores.
+    if not any(getattr(task, "_gcsec_client", None) is client for task in _gcsec_tasks):
+        _task = asyncio.create_task(_gcsec_loop(client))
+        _task._gcsec_client = client
+        _gcsec_tasks.add(_task)
+        _task.add_done_callback(_gcsec_tasks.discard)
     @client.on(events.MessageDeleted)
     async def del_mon(event):
         try:

@@ -2658,6 +2658,79 @@ async def zero_disk_soundcloud_lookup(query: str, logger=None, allow_live: bool 
             "source": "soundcloud"}
 
 
+
+# ── Fast direct-stream resolver ─────────────────────────────────────────────
+# Resolve a playable CDN URL without downloading the whole track.  This is
+# deliberately bounded: a bad YouTube client must never hold .play hostage.
+_DIRECT_STREAM_CLIENTS = ["web_safari", "web_embedded", "android", "default"]
+_DIRECT_STREAM_RETRIES = 3
+_DIRECT_STREAM_TIMEOUT = 5
+
+
+def _direct_stream_extract_sync(target: str, clients: list, cookiefile=None):
+    if yt_dlp is None:
+        return None
+    clients = yt_clients(clients)
+    ext_args = {"youtube": {"player_client": clients, "formats": ["missing_pot"]}}
+    opts = {
+        "quiet": True, "no_warnings": True, "noplaylist": True,
+        "skip_download": True, "socket_timeout": _DIRECT_STREAM_TIMEOUT,
+        "retries": 1, "extractor_retries": 1, "fragment_retries": 1,
+        "check_formats": False, "geo_bypass": True,
+        "format": "bestaudio[protocol^=http]/bestaudio/best[protocol^=http]/best",
+        "extractor_args": ext_args,
+        "http_headers": {"User-Agent": random_ua(), "Referer": "https://www.youtube.com/"},
+        **(_get_js_runtime_opts() if "_get_js_runtime_opts" in globals() else {}),
+        **(_get_impersonate_opt() if "_get_impersonate_opt" in globals() else {}),
+    }
+    if cookiefile and "_clients_accept_cookies" in globals() and _clients_accept_cookies(clients):
+        opts["cookiefile"] = cookiefile
+    try:
+        with yt_dlp.YoutubeDL(opts) as ydl:
+            info = ydl.extract_info(target, download=False)
+        if info and info.get("entries"):
+            info = next((e for e in info["entries"] if e), None)
+        if not info:
+            return None
+        formats = [f for f in (info.get("formats") or []) if f.get("url")]
+        formats.sort(key=lambda f: (bool(f.get("acodec") not in (None, "none")), f.get("abr") or 0), reverse=True)
+        chosen = formats[0] if formats else info
+        url = chosen.get("url")
+        if not url:
+            return None
+        return {"title": info.get("title") or target, "stream_url": url,
+                "duration": int(info.get("duration") or 0),
+                "thumbnail": info.get("thumbnail"), "source": "youtube-direct"}
+    except Exception:
+        return None
+
+
+async def youtube_direct_stream(query: str, logger=None) -> dict | None:
+    """Return a fresh direct URL quickly; callers retain download fallback."""
+    logger = logger or (lambda *a: None)
+    target = query.strip()
+    if not target.startswith(("http://", "https://")):
+        target = "ytsearch1:" + target
+    # A fresh client rung per attempt avoids retrying the same broken CDN URL.
+    for attempt in range(_DIRECT_STREAM_RETRIES):
+        clients = [_DIRECT_STREAM_CLIENTS[(attempt + i) % len(_DIRECT_STREAM_CLIENTS)]
+                   for i in range(min(2, len(_DIRECT_STREAM_CLIENTS)))]
+        clients = list(dict.fromkeys(clients))
+        try:
+            result = await asyncio.wait_for(
+                asyncio.to_thread(_direct_stream_extract_sync, target, clients, globals().get("_YTDLP_COOKIE_FILE")),
+                timeout=_DIRECT_STREAM_TIMEOUT + 1,
+            )
+        except asyncio.TimeoutError:
+            result = None
+        if result and result.get("stream_url"):
+            logger("MUSIC_DIRECT", f"direct stream ready in attempt {attempt + 1}: {result['title'][:60]}")
+            return result
+        if attempt + 1 < _DIRECT_STREAM_RETRIES:
+            await asyncio.sleep(0.25 * (attempt + 1))
+    logger("MUSIC_DIRECT_MISS", f"direct stream unavailable after {_DIRECT_STREAM_RETRIES} bounded attempts: {query[:80]}")
+    return None
+
 async def resolve_zero_disk_stream(query: str, logger=None, allow_live: bool = False) -> dict | None:
     """Jugad #1/#2/#4/#5/#6/#10 orchestrator: try to get a directly-playable
     remote URL (no local file at all) before ever falling back to disk-based
@@ -3713,6 +3786,13 @@ async def youtube_search_download(query: str, out_tmpl: str, logger=None) -> dic
     simp_q    = _yt_simplify_query(norm_q)   # technique #19
 
     ts = int(time.time() * 1000)
+
+    # direct-fast: hand PyTgCalls a fresh CDN URL first; full disk download is
+    # retained as a bounded fallback for clients/CDNs that reject direct URLs.
+    direct = await youtube_direct_stream(query, logger=logger)
+    if direct:
+        logger("MUSIC_YT", "✓ [direct-fast] returning zero-disk stream")
+        return direct
 
     # ─── Phase 0: Cookie-priority fast path ─────────────────────────────
     # When YTDLP_COOKIES is set the user has real YouTube credentials — go
