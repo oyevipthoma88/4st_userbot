@@ -3058,7 +3058,7 @@ async def zero_disk_soundcloud_lookup(query: str, logger=None, allow_live: bool 
 # deliberately bounded: a bad YouTube client must never hold .play hostage.
 _DIRECT_STREAM_CLIENTS = ["web_safari", "web_embedded", "android", "default"]
 _DIRECT_STREAM_RETRIES = 3
-_DIRECT_STREAM_TIMEOUT = 2.5
+_DIRECT_STREAM_TIMEOUT = 1.8
 
 
 def _direct_stream_extract_sync(target: str, clients: list, cookiefile=None):
@@ -3099,6 +3099,26 @@ def _direct_stream_extract_sync(target: str, clients: list, cookiefile=None):
         return None
 
 
+
+async def _direct_stream_is_live(url: str) -> bool:
+    """Cheap preflight so PyTgCalls never receives a dead/HTML CDN URL."""
+    try:
+        import aiohttp as _ah
+        timeout = _ah.ClientTimeout(total=0.8, connect=0.6, sock_read=0.6)
+        headers = {"Range": "bytes=0-1", "User-Agent": random_ua(),
+                   "Accept": "*/*", "Icy-MetaData": "1"}
+        async with _ah.ClientSession(timeout=timeout, headers=headers) as sess:
+            async with sess.get(url, allow_redirects=True) as resp:
+                if resp.status not in (200, 206):
+                    return False
+                ctype = (resp.headers.get("Content-Type") or "").lower()
+                if "text/html" in ctype or "application/json" in ctype:
+                    return False
+                chunk = await resp.content.read(2)
+                return bool(chunk) or resp.headers.get("Content-Length") not in (None, "0")
+    except Exception:
+        return False
+
 async def youtube_direct_stream(query: str, logger=None) -> dict | None:
     """Return a fresh direct URL quickly; callers retain download fallback."""
     logger = logger or (lambda *a: None)
@@ -3113,13 +3133,18 @@ async def youtube_direct_stream(query: str, logger=None) -> dict | None:
         try:
             result = await asyncio.wait_for(
                 asyncio.to_thread(_direct_stream_extract_sync, target, clients, globals().get("_YTDLP_COOKIE_FILE")),
-                timeout=_DIRECT_STREAM_TIMEOUT + 0.5,
+                timeout=_DIRECT_STREAM_TIMEOUT + 0.9,
             )
         except asyncio.TimeoutError:
             result = None
         if result and result.get("stream_url"):
-            logger("MUSIC_DIRECT", f"direct stream ready in attempt {attempt + 1}: {result['title'][:60]}")
-            return result
+            # Validate the signed URL before handing it to ffmpeg/PyTgCalls.
+            # A successful yt-dlp extraction can still point at an expired CDN
+            # edge or an HTML challenge response.
+            if await _direct_stream_is_live(result["stream_url"]):
+                logger("MUSIC_DIRECT", f"direct stream ready in attempt {attempt + 1}: {result['title'][:60]}")
+                return result
+            logger("MUSIC_DIRECT_REJECT", f"dead/non-media URL on attempt {attempt + 1}")
         if attempt + 1 < _DIRECT_STREAM_RETRIES:
             await asyncio.sleep(0.25 * (attempt + 1))
     logger("MUSIC_DIRECT_MISS", f"direct stream unavailable after {_DIRECT_STREAM_RETRIES} bounded attempts: {query[:80]}")
@@ -3139,9 +3164,12 @@ async def resolve_zero_disk_stream(query: str, logger=None, allow_live: bool = F
 
     # Direct .mp3/.mp4/.m3u8/etc links skip search entirely (jugad #4).
     if is_direct_media_url(query):
-        logger("MUSIC_DL", f"Direct media URL (zero-disk) ✓ {query[:80]}")
-        return {"title": query.rsplit("/", 1)[-1][:60] or query, "stream_url": query,
-                "duration": 0, "thumbnail": None, "source": "direct"}
+        if await _direct_stream_is_live(query):
+            logger("MUSIC_DL", f"Direct media URL (zero-disk) ✓ {query[:80]}")
+            return {"title": query.rsplit("/", 1)[-1][:60] or query, "stream_url": query,
+                    "duration": 0, "thumbnail": None, "source": "direct"}
+        logger("MUSIC_DL_ERR", f"Direct media URL failed preflight: {query[:80]}")
+        return None
 
     async def _safe(fn):
         try:

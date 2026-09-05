@@ -2425,7 +2425,27 @@ async def music_play_track(chat_id: int, track: MusicTrack, session_user_id: int
                                               _retry=False, _attempt=_attempt + 1)
         bot_logger("MUSIC_PLAY_ERR", f"[attempt {_attempt}] {err_repr}")
 
-        # ── Strategy 3: Zero-disk URL failed → force disk download ────────
+        # ── Strategy 3: Refresh direct URL before abandoning playback ─────
+        # Signed CDN URLs expire and edges can reject one IP/connection.
+        # Re-extract a fresh URL and retry the same track without leaving VC.
+        if track.is_zero_disk() and _attempt < 3:
+            try:
+                fresh = await asyncio.wait_for(
+                    music_sources.youtube_direct_stream(track.title, logger=bot_logger),
+                    timeout=8.0,
+                )
+            except Exception as _refresh_err:
+                fresh = None
+                bot_logger("MUSIC_DIRECT_REFRESH_ERR", repr(_refresh_err))
+            if fresh and fresh.get("stream_url") and fresh["stream_url"] != track.stream_url:
+                track.stream_url = fresh["stream_url"]
+                track.duration = fresh.get("duration") or track.duration
+                track.thumbnail = fresh.get("thumbnail") or track.thumbnail
+                bot_logger("MUSIC_DIRECT_REFRESH", f"fresh CDN URL acquired for {track.title[:60]}")
+                return await music_play_track(chat_id, track, session_user_id,
+                                              _retry=False, _attempt=_attempt + 1)
+
+        # ── Strategy 3b: Zero-disk URL failed → force disk download ────────
         if track.is_zero_disk() and _attempt < 3:
             bot_logger("MUSIC_PLAY_ERR",
                        f"Zero-disk URL failed ({err_repr[:60]}) — falling back to disk download.")
@@ -6866,14 +6886,31 @@ _gcsec_tasks = set()
 _gcsec_seen = {}
 _gcsec_bursts = {}
 _gcsec_action_lock = set()
+_gcsec_scan_locks = {}
 _gcsec_dialog_cache = {}
 
 
-def _gcsec_is_ban_action(action) -> bool:
+def _gcsec_action_kind(action):
+    """Return destructive participant action kind or None.
+
+    Telegram represents ban, kick and admin removal as participant-toggle
+    events whose new participant is banned.  Some older Telethon versions
+    expose a leave participant type instead, so retain that compatibility
+    path but never count ordinary voluntary leave events.
+    """
+    if action is None:
+        return None
     new = getattr(action, "new_participant", None)
-    if new is not None and "banned" in type(new).__name__.lower():
-        return True
-    return "participanttoggle" in type(action).__name__.lower() and "banned" in repr(new).lower()
+    name = type(new).__name__.lower() if new is not None else ""
+    action_name = type(action).__name__.lower()
+    if "participanttoggle" not in action_name and "participant" not in action_name:
+        return None
+    if "banned" in name or "kicked" in name:
+        return "ban/kick/remove"
+    # A few Telethon forks use a generic participant object plus a kicked flag.
+    if bool(getattr(new, "kicked", False)) or bool(getattr(new, "banned", False)):
+        return "ban/kick/remove"
+    return None
 
 
 def _gcsec_protected_ids() -> set:
@@ -6888,7 +6925,7 @@ def _gcsec_protected_ids() -> set:
     return {uid for uid in protected if uid}
 
 
-async def _gcsec_demote_and_mute(client, chat, actor_id: int, count: int):
+async def _gcsec_demote_and_mute(client, chat, actor_id: int, count: int, action_kind="ban/kick/remove"):
     key = (id(client), int(getattr(chat, "id", chat)), int(actor_id))
     if key in _gcsec_action_lock:
         return
@@ -6907,7 +6944,8 @@ async def _gcsec_demote_and_mute(client, chat, actor_id: int, count: int):
             ChatBannedRights(until_date=None, send_messages=True),
         ))
         bot_logger("GCSEC_AUTO_ACTION",
-                   f"demoted+muted actor={actor_id} chat={getattr(chat, 'id', chat)} bans={count}/{_GCSEC_WINDOW}s")
+                   f"demoted+muted actor={actor_id} chat={getattr(chat, 'id', chat)} "
+                   f"actions={count}/{_GCSEC_WINDOW}s kind={action_kind}")
     except Exception as exc:
         bot_logger("GCSEC_ACTION_ERR", f"chat={getattr(chat, 'id', chat)} actor={actor_id}: {repr(exc)}")
     finally:
@@ -6933,7 +6971,10 @@ async def _gcsec_scan_chat(client, chat):
     for item in reversed(list(events_found)):
         event_id = int(getattr(item, "id", 0) or 0)
         current_max = max(current_max, event_id)
-        if event_id <= last_id or not _gcsec_is_ban_action(getattr(item, "action", None)):
+        if event_id <= last_id:
+            continue
+        action_kind = _gcsec_action_kind(getattr(item, "action", None))
+        if not action_kind:
             continue
         actor_id = int(getattr(item, "user_id", 0) or 0)
         if not actor_id or actor_id in protected:
@@ -6945,7 +6986,7 @@ async def _gcsec_scan_chat(client, chat):
         bucket[:] = [t for t in bucket if ts - t <= _GCSEC_WINDOW]
         bucket.append(ts)
         if len(bucket) >= _GCSEC_THRESHOLD:
-            await _gcsec_demote_and_mute(client, chat, actor_id, len(bucket))
+            await _gcsec_demote_and_mute(client, chat, actor_id, len(bucket), action_kind)
             bucket.clear()
     _gcsec_seen[key] = current_max
 
