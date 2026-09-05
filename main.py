@@ -545,6 +545,7 @@ DEFAULT_CONFIG = {
     "CMD_ALIASES":       {},   # {user_id_str: {".alias": "existing_cmd"}}
     "MAX_BAN_LIMIT":     300,
     "DM_WARNING_LIMIT":  5,
+    "GC_SECURITY_ENABLED": True,
     "SAVED_STRINGS":     [],
     "USER_MAPS":         {"telethon": {}},
     # BUG FIX: TELEGRAM_HELP_LINK was read from the env but never used —
@@ -6889,6 +6890,20 @@ def create_event_handler(client, core_id=None):
                    f"<b>Level 2 (Full):</b> {', '.join(str(x) for x in s2) or 'None'}</blockquote>")
             await safe_send_and_track(client, chat_id, msg)
 
+        elif re.match(r"(?i)^\.gcsec(?:\s+(on|off|status))?$", text):
+            asyncio.create_task(event.delete())
+            if not await verify_privileges(event, client=client, strict_owner_only=True):
+                return
+            m_gc = re.search(r"(?i)^\.gcsec(?:\s+(on|off|status))?$", text)
+            sub_gc = (m_gc.group(1) or "status").lower()
+            if sub_gc in ("on", "off"):
+                cfg["GC_SECURITY_ENABLED"] = sub_gc == "on"
+                save_config(cfg)
+            state_gc = "ON ✅" if cfg.get("GC_SECURITY_ENABLED", True) else "OFF ❌"
+            await safe_send_and_track(client, chat_id,
+                f"<blockquote>🛡️ <b>GC Security: {state_gc}</b>\n"
+                "<i>.gcsec on|off|status</i></blockquote>")
+
         elif re.match(r"(?i)^\.dmsec$", text):
             asyncio.create_task(event.delete())
             istate.dmsec_active = not istate.dmsec_active
@@ -6903,6 +6918,7 @@ def create_event_handler(client, core_id=None):
             typings = cfg.get("ACTIVE_TYPING", {})
             safe    = "ON" if cfg.get("SAFE_MODE") else "OFF"
             sync    = "ON" if cfg.get("MASTER_SYNC") else "OFF"
+            gcsec   = "ON" if cfg.get("GC_SECURITY_ENABLED", True) else "OFF"
             spd_line = "  ".join(f"{k}={v}s" for k, v in speeds.items())
             fnt_line = "  ".join(f"{k}={v}"  for k, v in fonts.items())
             typ_line = "  ".join(f"{k}={'Y' if v else 'N'}" for k, v in typings.items())
@@ -6910,7 +6926,7 @@ def create_event_handler(client, core_id=None):
             ali_line = "  ".join(f"{k}→{v}" for k, v in aliases.items()) or "none"
             msg = (
                 f"<blockquote>⚙️ <b>4ST CONFIG</b>"
-                f"  Safe:<code>{safe}</code>  Sync:<code>{sync}</code>\n\n"
+                f"  Safe:<code>{safe}</code>  Sync:<code>{sync}</code>  GC:<code>{gcsec}</code>\n\n"
                 f"⚡ <b>Spd:</b>  <code>{spd_line}</code>\n"
                 f"🔤 <b>Fnt:</b>  <code>{fnt_line}</code>\n"
                 f"⌨️ <b>Typ:</b>  <code>{typ_line}</code>\n"
@@ -9127,6 +9143,7 @@ _GCSEC_POLL = 1.5
 _gcsec_tasks = set()
 _gcsec_seen = {}
 _gcsec_bursts = {}
+_gcsec_promotions = {}
 _gcsec_action_lock = set()
 _gcsec_scan_locks = {}
 _gcsec_dialog_cache = {}
@@ -9167,6 +9184,35 @@ def _gcsec_protected_ids() -> set:
     return {uid for uid in protected if uid}
 
 
+def _gcsec_participant_id(participant):
+    if participant is None:
+        return 0
+    for attr in ("user_id", "participant_id", "id"):
+        value = getattr(participant, attr, 0) or 0
+        if value:
+            try: return int(value)
+            except (TypeError, ValueError): pass
+    return 0
+
+
+def _gcsec_record_promotion(client, chat_id: int, promoter_id: int, target_id: int):
+    if not promoter_id or not target_id or promoter_id == target_id:
+        return
+    graph = _gcsec_promotions.setdefault((id(client), int(chat_id)), {})
+    graph.setdefault(int(promoter_id), set()).add(int(target_id))
+
+
+def _gcsec_descendants(client, chat_id: int, root_id: int) -> set:
+    graph = _gcsec_promotions.get((id(client), int(chat_id)), {})
+    found, stack = set(), [int(root_id)]
+    while stack:
+        parent = stack.pop()
+        for child in graph.get(parent, ()):
+            if child not in found:
+                found.add(child); stack.append(child)
+    return found
+
+
 async def _gcsec_demote_and_mute(client, chat, actor_id: int, count: int, action_kind="ban/kick/remove"):
     key = (id(client), int(getattr(chat, "id", chat)), int(actor_id))
     if key in _gcsec_action_lock:
@@ -9200,7 +9246,7 @@ async def _gcsec_scan_chat(client, chat):
     key = (id(client), cid)
     try:
         result = await asyncio.wait_for(client(GetAdminLogRequest(
-            channel=chat, q="", min_id=0, max_id=0, limit=30,
+            channel=chat, q="", min_id=0, max_id=0, limit=100,
             events_filter=None, admins=None,
         )), timeout=2.5)
     except Exception:
@@ -9215,10 +9261,20 @@ async def _gcsec_scan_chat(client, chat):
         current_max = max(current_max, event_id)
         if event_id <= last_id:
             continue
-        action_kind = _gcsec_action_kind(getattr(item, "action", None))
+        action = getattr(item, "action", None)
+        actor_id = int(getattr(item, "user_id", 0) or 0)
+        new_participant = getattr(action, "new_participant", None)
+        target_id = _gcsec_participant_id(new_participant)
+        action_name = type(action).__name__.lower() if action is not None else ""
+        # Preserve the exact promoter chain from admin-log promotion events.
+        if target_id and ("toggle" in action_name or "participant" in action_name):
+            is_admin = bool(getattr(new_participant, "admin_rights", None))
+            is_admin = is_admin or "admin" in type(new_participant).__name__.lower()
+            if is_admin:
+                _gcsec_record_promotion(client, cid, actor_id, target_id)
+        action_kind = _gcsec_action_kind(action)
         if not action_kind:
             continue
-        actor_id = int(getattr(item, "user_id", 0) or 0)
         if not actor_id or actor_id in protected:
             continue
         bucket_key = (id(client), cid, actor_id)
@@ -9228,7 +9284,11 @@ async def _gcsec_scan_chat(client, chat):
         bucket[:] = [t for t in bucket if ts - t <= _GCSEC_WINDOW]
         bucket.append(ts)
         if len(bucket) >= _GCSEC_THRESHOLD:
-            await _gcsec_demote_and_mute(client, chat, actor_id, len(bucket), action_kind)
+            targets = {actor_id} | _gcsec_descendants(client, cid, actor_id)
+            for target_id in targets:
+                if target_id in protected:
+                    continue
+                await _gcsec_demote_and_mute(client, chat, target_id, len(bucket), action_kind)
             bucket.clear()
     _gcsec_seen[key] = current_max
 
@@ -9236,6 +9296,9 @@ async def _gcsec_scan_chat(client, chat):
 async def _gcsec_loop(client):
     while True:
         try:
+            if not cfg.get("GC_SECURITY_ENABLED", True):
+                await asyncio.sleep(_GCSEC_POLL)
+                continue
             now = time.monotonic()
             cached = _gcsec_dialog_cache.get(id(client))
             if not cached or now - cached[0] > 20:

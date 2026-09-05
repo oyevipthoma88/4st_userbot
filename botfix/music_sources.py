@@ -2662,7 +2662,7 @@ async def zero_disk_soundcloud_lookup(query: str, logger=None, allow_live: bool 
 # ── Fast direct-stream resolver ─────────────────────────────────────────────
 # Resolve a playable CDN URL without downloading the whole track.  This is
 # deliberately bounded: a bad YouTube client must never hold .play hostage.
-_DIRECT_STREAM_CLIENTS = ["web_safari", "web_embedded", "android", "default"]
+_DIRECT_STREAM_CLIENTS = ["android", "web", "tv", "web_safari", "default"]
 _DIRECT_STREAM_RETRIES = 3
 _DIRECT_STREAM_TIMEOUT = 1.8
 
@@ -2674,6 +2674,7 @@ def _direct_stream_extract_sync(target: str, clients: list, cookiefile=None):
     ext_args = {"youtube": {"player_client": clients, "formats": ["missing_pot"]}}
     opts = {
         "quiet": True, "no_warnings": True, "noplaylist": True,
+        "ignore_no_formats_error": True, "no_check_certificate": True,
         "skip_download": True, "socket_timeout": _DIRECT_STREAM_TIMEOUT,
         "retries": 1, "extractor_retries": 1, "fragment_retries": 1,
         "check_formats": False, "geo_bypass": True,
@@ -2685,6 +2686,11 @@ def _direct_stream_extract_sync(target: str, clients: list, cookiefile=None):
     }
     if cookiefile and "_clients_accept_cookies" in globals() and _clients_accept_cookies(clients):
         opts["cookiefile"] = cookiefile
+    class _DirectQuietLogger:
+        def debug(self, msg): pass
+        def warning(self, msg): pass
+        def error(self, msg): pass
+    opts["logger"] = _DirectQuietLogger()
     try:
         with yt_dlp.YoutubeDL(opts) as ydl:
             info = ydl.extract_info(target, download=False)
@@ -2693,7 +2699,9 @@ def _direct_stream_extract_sync(target: str, clients: list, cookiefile=None):
         if not info:
             return None
         formats = [f for f in (info.get("formats") or []) if f.get("url")]
-        formats.sort(key=lambda f: (bool(f.get("acodec") not in (None, "none")), f.get("abr") or 0), reverse=True)
+        formats.sort(key=lambda f: (bool(f.get("acodec") not in (None, "none")),
+                                    bool(f.get("vcodec") in (None, "none")),
+                                    f.get("abr") or 0), reverse=True)
         chosen = formats[0] if formats else info
         url = chosen.get("url")
         if not url:
@@ -3323,9 +3331,15 @@ def _yt_base_opts(out_tmpl: str, client: str, fmt: str) -> dict:
         # With cookies, we MUST NOT skip it — we need the full format manifest.
         ext_args_yt["player_skip"] = ["webpage"]
 
+    class _QuietYtdlpLogger:
+        def debug(self, msg): pass
+        def warning(self, msg): pass
+        def error(self, msg): pass
+
     return {
         "quiet": True,
         "no_warnings": True,
+        "logger": _QuietYtdlpLogger(),
         "nocheckcertificate": True,        # technique #14
         "geo_bypass": True,                # technique #12
         "force_ipv4": True,                # technique #11
