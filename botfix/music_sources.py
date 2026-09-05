@@ -3841,7 +3841,7 @@ async def youtube_search_download(query: str, out_tmpl: str, logger=None) -> dic
         for round_no in (1, 2):
             try: result=await asyncio.wait_for(_parallel_round(round_no), timeout=8.5)
             except Exception as exc:
-                logger("MUSIC_PARALLEL_ERR", f"round={round_no}: {exc}"); result=None
+                logger("MUSIC_PARALLEL_ERR", f"round={round_no}: {type(exc).__name__}: {exc!r}"); result=None
             if result: return result
             if round_no == 1: await asyncio.sleep(0.1)
         return None

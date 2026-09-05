@@ -59,16 +59,10 @@ import json
 import os
 import sys as _sys_top
 
-# ── bgutil PO-token provider plugin discovery ────────────────────────────────
-# bin/post_compile installs this under vendor/ at Heroku build time.
-# Add to sys.path before yt-dlp is imported so plugin discovery works.
-_BGUTIL_PLUGIN_DIR = os.path.join(
-    os.path.dirname(os.path.abspath(__file__)),
-    "vendor", "bgutil-ytdlp-pot-provider", "plugin",
-)
-if os.path.isdir(_BGUTIL_PLUGIN_DIR) and _BGUTIL_PLUGIN_DIR not in _sys_top.path:
-    _sys_top.path.insert(0, _BGUTIL_PLUGIN_DIR)
-# ─────────────────────────────────────────────────────────────────────────────
+# bgutil is intentionally disabled. Heroku yt-dlp already discovers a provider
+# from site-packages; injecting the bundled copy caused duplicate provider
+# registration ("BgUtilHTTP already registered") on every music request.
+_BGUTIL_PLUGIN_DIR = ""
 
 # ── Cloud-host / IP-block detection (ported from Musicbot helpers/youtube.py) ──
 # On Heroku/Railway/Render the YouTube CDN (googlevideo.com) is IP-blocked.
@@ -5205,26 +5199,43 @@ async def youtube_search_download(query: str, out_tmpl: str, logger=None) -> dic
             try:
                 result=await asyncio.wait_for(_parallel_round(round_no), timeout=8.5)
             except Exception as exc:
-                logger("MUSIC_PARALLEL_ERR", f"round={round_no}: {exc}"); result=None
+                logger("MUSIC_PARALLEL_ERR", f"round={round_no}: {type(exc).__name__}: {exc!r}"); result=None
             if result: return result
             if round_no == 1: await asyncio.sleep(0.1)
         return None
 
-    async def _race():
-        direct_task=asyncio.create_task(youtube_direct_stream(query, logger=logger))
-        download_task=asyncio.create_task(_parallel_download())
+    async def _direct_provider(fn):
         try:
-            for task in asyncio.as_completed((direct_task, download_task)):
+            result = await fn(query, logger=logger, allow_live=False)
+            url = (result or {}).get("stream_url") if result else None
+            if result and url and await _direct_stream_is_live(url):
+                return result
+        except Exception as exc:
+            logger("MUSIC_DIRECT_PROVIDER_ERR", f"{getattr(fn, '__name__', 'provider')}: {type(exc).__name__}: {exc!r}")
+        return None
+
+    async def _race():
+        # Existing direct CDN providers are genuine zero-disk streams. Race
+        # them with yt-dlp direct extraction and the local parallel download;
+        # the first live URL/file wins, so a YouTube bot-check cannot turn into
+        # a guaranteed miss when a CDN mirror is healthy.
+        direct_tasks = [asyncio.create_task(youtube_direct_stream(query, logger=logger))]
+        for provider in (zero_disk_piped_lookup, zero_disk_invidious_lookup, zero_disk_jiosaavn_lookup):
+            direct_tasks.append(asyncio.create_task(_direct_provider(provider)))
+        download_task = asyncio.create_task(_parallel_download())
+        all_tasks = tuple(direct_tasks + [download_task])
+        try:
+            for task in asyncio.as_completed(all_tasks):
                 try: result=await task
                 except Exception as exc:
-                    logger("MUSIC_RACE_ERR", repr(exc)); result=None
+                    logger("MUSIC_RACE_ERR", f"{type(exc).__name__}: {exc!r}"); result=None
                 if result:
                     return result
             return None
         finally:
-            for task in (direct_task, download_task):
+            for task in all_tasks:
                 if not task.done(): task.cancel()
-            await asyncio.gather(direct_task, download_task, return_exceptions=True)
+            await asyncio.gather(*all_tasks, return_exceptions=True)
 
     try:
         result=await asyncio.wait_for(_race(), timeout=9.5)
