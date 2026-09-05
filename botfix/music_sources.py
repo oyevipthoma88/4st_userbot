@@ -2664,7 +2664,7 @@ async def zero_disk_soundcloud_lookup(query: str, logger=None, allow_live: bool 
 # deliberately bounded: a bad YouTube client must never hold .play hostage.
 _DIRECT_STREAM_CLIENTS = ["web_safari", "web_embedded", "android", "default"]
 _DIRECT_STREAM_RETRIES = 3
-_DIRECT_STREAM_TIMEOUT = 5
+_DIRECT_STREAM_TIMEOUT = 2.5
 
 
 def _direct_stream_extract_sync(target: str, clients: list, cookiefile=None):
@@ -2719,7 +2719,7 @@ async def youtube_direct_stream(query: str, logger=None) -> dict | None:
         try:
             result = await asyncio.wait_for(
                 asyncio.to_thread(_direct_stream_extract_sync, target, clients, globals().get("_YTDLP_COOKIE_FILE")),
-                timeout=_DIRECT_STREAM_TIMEOUT + 1,
+                timeout=_DIRECT_STREAM_TIMEOUT + 0.5,
             )
         except asyncio.TimeoutError:
             result = None
