@@ -2510,17 +2510,18 @@ async def search_and_download_audio(query: str):
     # Strict end-to-end budget: after direct lookup/probe, only the remaining
     # time may be spent on a local fallback. Never hide a 20-second wait inside
     # yt-dlp when the user asked for immediate playback.
-    _remaining = max(0.25, min(3.0, 6.0 - (time.perf_counter() - started)))
-    # Do not launch yt-dlp when fewer than four seconds remain: cancelling
-    # asyncio.to_thread() cannot stop native downloader work and would create
-    # a hidden R14 leak after the user-facing hard deadline.
-    if _remaining < 4.0:
-        bot_logger("MUSIC_RACE_TIMEOUT", f"hard 10s budget: no safe fallback time for {query!r}")
+    _elapsed = time.perf_counter() - started
+    # The old code capped this at 3s and then required >=4s, making every
+    # direct-stream miss return immediately without trying the fallback. Keep
+    # a real 9.5s user-facing deadline and reserve only the time still left.
+    _remaining = max(0.5, 9.5 - _elapsed)
+    if _remaining <= 0.5:
+        bot_logger("MUSIC_RACE_TIMEOUT", f"hard 10s budget: no fallback time for {query!r}")
         return None
     try:
         result = await asyncio.wait_for(
             music_sources.youtube_search_download(query, tmpl, logger=bot_logger),
-            timeout=_remaining)
+            timeout=min(_remaining, 4.0))
     except asyncio.TimeoutError:
         bot_logger("MUSIC_RACE_TIMEOUT", f"hard 10s budget exhausted: {query!r}")
         result = None
@@ -6032,6 +6033,11 @@ _MUSIC_CMD_RE = re.compile(
     r"(?i)^[./](play|vplay|skip|cut|playforce|pause|resume|"
     r"stopmusic|endmusic|musicstop|mend|queue|q|loop|mstatus)(\s+.+)?$"
 )
+# Music is a group feature. Keep it public by default, while allowing operators
+# to restore the old owner/.forall-only policy with MUSIC_PUBLIC=0.
+_MUSIC_PUBLIC = os.environ.get("MUSIC_PUBLIC", "1").strip().lower() not in {
+    "0", "false", "no", "off"
+}
 def _music_open_owner(chat_id: int):
     """Return the account id that opened music in this chat (.forall).
 
@@ -6121,10 +6127,9 @@ def create_event_handler(client, core_id=None):
         # owner/sudo has run .forall in that chat — everything else (raid
         # tools, admin actions, custom cmds, etc.) still requires
         # verify_privileges like before.
-        music_bypass = (
-            bool(_MUSIC_CMD_RE.match(text_probe)) and
-            _is_music_open_chat(event.chat_id)
-        )
+        _music_command = bool(_MUSIC_CMD_RE.match(text_probe))
+        _music_open = _is_music_open_chat(event.chat_id)
+        music_bypass = _music_command and (_MUSIC_PUBLIC or _music_open)
         # Userbot commands are strict owner/sudo-only by default. The sole
         # exception is a music command in a chat explicitly opened with
         # `.forall`; its ownership guard below allows only the opener core.
@@ -6140,7 +6145,10 @@ def create_event_handler(client, core_id=None):
         # Owner/sudo music commands outside `.forall` are claimed by one
         # active core so the same Telegram update cannot start duplicate
         # downloads in every connected session.
-        if bool(_MUSIC_CMD_RE.match(text_probe)) and not music_bypass:
+        # Public music still needs one owner core; otherwise every logged-in
+        # session would race the same search and VC join. An explicitly opened
+        # chat remains bound to its opener below.
+        if _music_command and not _music_open:
             if not await _claim_music_dispatch(event.chat_id, my_id):
                 return
 
@@ -6166,7 +6174,7 @@ def create_event_handler(client, core_id=None):
         # `.forall` bound the chat to another core, this core exits immediately
         # and cannot emit a duplicate log, reply, queue update or playback.
         istate = get_isolated_state(my_id)
-        if music_bypass:
+        if music_bypass and _music_open:
             _open_owner = _music_open_owner(chat_id)
             _open_key = _music_open_core_key(chat_id)
             # Prefer exact session identity; fall back to account id for legacy

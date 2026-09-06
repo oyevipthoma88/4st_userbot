@@ -3219,15 +3219,17 @@ async def resolve_zero_disk_stream(query: str, logger=None, allow_live: bool = F
             logger("MUSIC_DL_ERR", f"resolve_zero_disk_stream/{fn.__name__}: {exc}")
             return None
 
-    # Only Piped zero-disk — YouTube (with cookies) is the primary source.
-    tasks = {
+    # Race independent zero-disk CDNs. The first valid URL wins; a slow or
+    # dead mirror cannot block the other providers from starting immediately.
+    direct_tasks = {
         asyncio.create_task(_safe(fn)): fn.__name__
         for fn in (
-            zero_disk_jiosaavn_lookup,  # ① fast Indian music CDN
-            zero_disk_piped_lookup,      # ② YouTube via Piped frontend
+            zero_disk_jiosaavn_lookup,   # ① fast Indian music CDN
+            zero_disk_piped_lookup,       # ② YouTube via Piped frontend
+            zero_disk_invidious_lookup,   # ③ YouTube via Invidious frontend
         )
     }
-    pending = set(tasks)
+    pending = set(direct_tasks)
     try:
         while pending:
             done, pending = await asyncio.wait(pending, return_when=asyncio.FIRST_COMPLETED)
