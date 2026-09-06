@@ -2732,8 +2732,12 @@ async def _seed_music_peer_cache(chat_id: int, session_user_id: int) -> None:
         from telethon.tl.types import InputPeerChannel, InputPeerChat, InputPeerUser
         peer = await telethon_cl.get_input_entity(chat_id)
         if isinstance(peer, InputPeerChannel):
+            # Pyrofork stores channel peers under Telegram's marked -100… ID,
+            # not the raw positive channel_id. Storing the raw ID makes
+            # resolve_peer(-100…) miss the cache and fall through to
+            # channels.GetChannels(access_hash=0), which returns CHANNEL_INVALID.
             await pyro.storage.update_peers(
-                [(peer.channel_id, peer.access_hash, "channel", None, None)]
+                [(int(chat_id), peer.access_hash, "channel", None, None)]
             )
         elif isinstance(peer, InputPeerChat):
             await pyro.storage.update_peers(
@@ -6136,6 +6140,7 @@ def create_event_handler(client, core_id=None):
         try:
             me = await client.get_me()
             my_id = int(me.id)
+            my_name = getattr(me, "first_name", None) or str(my_id)
             if core_id is not None and int(core_id) != my_id:
                 bot_logger("CORE_IDENTITY_MISMATCH",
                            f"bound={core_id} actual={my_id}; command ignored")
@@ -6899,7 +6904,7 @@ def create_event_handler(client, core_id=None):
                     "┃ ⚡ <b>ଇଞ୍ଜିନ</b>   ⟶ <code>Telethon + PyTgCalls</code>\n"
                     "┃ 💠 <b>ସ୍ଥିତି</b>    ⟶ <code>ସମ୍ପୂର୍ଣ୍ଣ ସିଙ୍କ</code>\n"
                     f"┃ 🎵 <b>ସଙ୍ଗୀତ</b>   ⟶ <code>{'🟢 ସକ୍ରିୟ' if _music_state.startswith('🟢') else '🔴 ଲଗଇନ ବାକି'}</code>\n"
-                    f"┃ 👤 <b>ମାଲିକ</b>    ⟶ <a href='tg://user?id={my_id}'>{me.first_name}</a>\n"
+                    f"┃ 👤 <b>ମାଲିକ</b>    ⟶ <a href='tg://user?id={my_id}'>{my_name}</a>\n"
                     "┗━━━━━━━━━━━━━━━━━━━━┛"
                     "</blockquote>"
                 )
@@ -6913,7 +6918,7 @@ def create_event_handler(client, core_id=None):
                     "┃ ⚡ <b>Engine</b>   ⟶ <code>Telethon + PyTgCalls</code>\n"
                     "┃ 💠 <b>Status</b>   ⟶ <code>Perfect Sync</code>\n"
                     f"┃ 🎵 <b>Music</b>    ⟶ <code>{_music_state}</code>\n"
-                    f"┃ 👤 <b>Master</b>   ⟶ <a href='tg://user?id={my_id}'>{me.first_name}</a>\n"
+                    f"┃ 👤 <b>Master</b>   ⟶ <a href='tg://user?id={my_id}'>{my_name}</a>\n"
                     "┗━━━━━━━━━━━━━━━━━━━━┛"
                     "</blockquote>"
                 )

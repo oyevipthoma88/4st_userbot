@@ -3225,12 +3225,17 @@ async def resolve_zero_disk_stream(query: str, logger=None, allow_live: bool = F
         except Exception as exc:
             logger("MUSIC_DL_ERR", f"resolve_zero_disk_stream/{fn.__name__}: {exc}")
             return None
+    async def _youtube_direct(q, logger=None, allow_live=False):
+        # yt-dlp direct extraction is slower than a public mirror, but it is
+        # the authoritative fallback for normal YouTube song searches.
+        return await youtube_direct_stream(q, logger=logger)
 
     # Race independent zero-disk CDNs. The first valid URL wins; a slow or
     # dead mirror cannot block the other providers from starting immediately.
     direct_tasks = {
         asyncio.create_task(_safe(fn)): fn.__name__
         for fn in (
+            _youtube_direct,           # ① authoritative YouTube CDN
             zero_disk_jiosaavn_lookup,   # ① fast Indian music CDN
             zero_disk_piped_lookup,       # ② YouTube via Piped frontend
             zero_disk_invidious_lookup,   # ③ YouTube via Invidious frontend
