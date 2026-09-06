@@ -111,6 +111,15 @@ try:
 except ImportError:
     requests = None
 
+# Load dotenv before importing music_sources: that module snapshots
+# YTDLP_COOKIES and YOUTUBE_API_KEY during import. Loading it later made local
+# `.env` credentials silently invisible to the music resolver.
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    pass
+
 # Extra no-cookie/no-login fallback sources (SoundCloud, Audius, Internet
 # Archive, Jamendo, direct media URLs, iTunes metadata refine) + a small
 # on-disk stream cache and queue-dedupe helper. See music_sources.py.
@@ -440,12 +449,6 @@ setup_fun_txt()
 #   TELEGRAM_OWNER_ID, GEMINI_API_KEY (optional)
 # Non-secret: TELEGRAM_LOG_CHANNEL_ID (optional)
 # ══════════════════════════════════════════
-try:
-    from dotenv import load_dotenv
-    load_dotenv()
-except ImportError:
-    pass
-
 _API_ID_RAW  = os.environ.get("TELEGRAM_API_ID", "")
 _API_HASH    = os.environ.get("TELEGRAM_API_HASH", "")
 _PRIMARY_SES = os.environ.get("TELEGRAM_PRIMARY_SESSION", "")

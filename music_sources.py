@@ -5212,24 +5212,39 @@ async def _yt_search_via_invidious(query: str, out_tmpl: str, logger=None) -> di
 
 
 async def youtube_search_download(query: str, out_tmpl: str, logger=None) -> dict | None:
-    """Strict bounded audio race: direct CDN and parallel download together."""
+    """Resolve and download audio using the complete resilient client ladder.
+
+    The old fast path forced ``player_client=["web"]`` here. That bypassed
+    the cookie-aware Android/Safari/TV ladder below and reliably failed on
+    cloud IPs with YouTube's bot-check page, even when cookies and a Data API
+    key were configured.
+    """
     logger = logger or (lambda *a: None)
     if yt_dlp is None:
         return None
 
+    # The Data API selects a stable video URL; yt-dlp still performs the
+    # authenticated media download through the full client ladder.
+    download_target = query
+    if not (query.startswith("http://") or query.startswith("https://")) and yt_api_enabled():
+        try:
+            api_hit = await yt_api_search(query, logger=logger, video=False)
+            if api_hit and api_hit.get("url"):
+                download_target = api_hit["url"]
+                logger("MUSIC_YT_API", f"selected {api_hit.get('video_id', '?')} for {query!r}")
+        except Exception as exc:
+            logger("MUSIC_YT_API_ERR", f"{type(exc).__name__}: {exc}")
+
     async def _parallel_round(round_no: int):
-        # One native yt-dlp worker at a time. Parallel fallback workers were
-        # the memory multiplier, and cancelling to_thread() does not stop
-        # native work already running in the executor.
-        workers = [
-            ("web", "bestaudio[ext=m4a]/bestaudio/best"),
-        ]
+        # One native yt-dlp worker at a time. The downloader itself walks the
+        # complete cookie-aware client ladder; do not override it with a
+        # single web client, which is bot-gated on hosted/cloud IPs.
+        workers = [(None, None)]
         tasks=[]
         for client, fmt in workers:
-            target=out_tmpl.replace("%(ext)s", f"_parallel{round_no}_{client}.%(ext)s")
+            target=out_tmpl.replace("%(ext)s", f"_parallel{round_no}_ladder.%(ext)s")
             tasks.append(asyncio.create_task(asyncio.to_thread(
-                _cloud_download_sync, query, target, True, logger,
-                [(fmt, [client], False)])))
+                _cloud_download_sync, download_target, target, True, logger)))
         try:
             for task in asyncio.as_completed(tasks):
                 try: result=await task
