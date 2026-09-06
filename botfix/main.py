@@ -1968,6 +1968,30 @@ async def search_and_download_audio(query: str):
                           duration=cached.get("duration", 0), is_video=False,
                           thumbnail=cached.get("thumbnail"), source=cached.get("source", "youtube"))
     started = time.perf_counter()
+    # Fast direct path: only return a remote URL after live + FFmpeg decode
+    # validation. PyTgCalls gets a stable stream or the safe local fallback;
+    # dead/HTML/unsupported CDN URLs never enter the voice process.
+    if os.environ.get("MUSIC_DIRECT_FAST", "1").lower() not in {"0", "false", "no"}:
+        try:
+            direct = await asyncio.wait_for(
+                music_sources.resolve_zero_disk_stream(query, logger=bot_logger),
+                timeout=6.0)
+        except Exception as exc:
+            direct = None
+            bot_logger("MUSIC_DIRECT_FAST_MISS", repr(exc))
+        if direct and direct.get("stream_url"):
+            try:
+                playable = await asyncio.wait_for(
+                    music_sources._direct_stream_is_playable(direct["stream_url"]),
+                    timeout=2.5)
+            except Exception:
+                playable = False
+            if playable:
+                bot_logger("MUSIC_DIRECT_FAST", f"validated direct stream: {direct.get('title', query)!r}")
+                return MusicTrack(title=direct.get("title", query),
+                                  stream_url=direct["stream_url"],
+                                  duration=direct.get("duration", 0), is_video=False,
+                                  thumbnail=direct.get("thumbnail"), source=direct.get("source", "direct"))
     tmpl = os.path.join(MUSIC_CACHE, f"audio_{int(time.time()*1000)}_strict.%(ext)s")
     try:
         # yt-dlp/cloud fallback can legitimately take 10–20 seconds after

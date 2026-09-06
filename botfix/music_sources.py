@@ -2735,6 +2735,29 @@ async def _direct_stream_is_live(url: str) -> bool:
     except Exception:
         return False
 
+async def _direct_stream_is_playable(url: str) -> bool:
+    """Validate that FFmpeg can decode real audio before PyTgCalls sees it."""
+    if not url or not await _direct_stream_is_live(url):
+        return False
+    proc = None
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            "ffmpeg", "-nostdin", "-v", "error", "-t", "0.35",
+            "-i", url, "-map", "0:a:0?", "-f", "null", "-",
+            stdout=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        await asyncio.wait_for(proc.communicate(), timeout=2.2)
+        return proc.returncode == 0
+    except Exception:
+        if proc is not None:
+            try:
+                proc.kill()
+                await proc.wait()
+            except Exception:
+                pass
+        return False
+
 async def youtube_direct_stream(query: str, logger=None) -> dict | None:
     """Resolve a fresh audio CDN URL with real bounded retries.
 
@@ -2765,7 +2788,7 @@ async def youtube_direct_stream(query: str, logger=None) -> dict | None:
             for task in asyncio.as_completed(tasks):
                 result = await task
                 if (result and result.get("stream_url")
-                        and await _direct_stream_is_live(result["stream_url"])):
+                        and await _direct_stream_is_playable(result["stream_url"])):
                     logger("MUSIC_DIRECT",
                            f"direct audio ready on retry {attempt}: {result.get('title','')[:60]}")
                     return result
