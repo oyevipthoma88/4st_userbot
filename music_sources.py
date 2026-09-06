@@ -5219,15 +5219,12 @@ async def youtube_search_download(query: str, out_tmpl: str, logger=None) -> dic
         return None
 
     async def _race():
-        # Existing direct CDN providers are genuine zero-disk streams. Race
-        # them with yt-dlp direct extraction and the local parallel download;
-        # the first live URL/file wins, so a YouTube bot-check cannot turn into
-        # a guaranteed miss when a CDN mirror is healthy.
-        direct_tasks = [asyncio.create_task(youtube_direct_stream(query, logger=logger))]
-        for provider in (zero_disk_piped_lookup, zero_disk_invidious_lookup, zero_disk_jiosaavn_lookup):
-            direct_tasks.append(asyncio.create_task(_direct_provider(provider)))
+        # Audio playback policy: use a completed local file, not a live CDN
+        # URL. The fresh log proved that the Piped zero-disk winner reached
+        # PyTgCalls and immediately caused repeated ProcessLookupError while
+        # the same song was available as a valid local yt-dlp file.
         download_task = asyncio.create_task(_parallel_download())
-        all_tasks = tuple(direct_tasks + [download_task])
+        all_tasks = (download_task,)
         try:
             for task in asyncio.as_completed(all_tasks):
                 try: result=await task

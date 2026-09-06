@@ -3848,19 +3848,14 @@ async def youtube_search_download(query: str, out_tmpl: str, logger=None) -> dic
             if round_no == 1: await asyncio.sleep(0.1)
         return None
     async def _race():
-        direct_task=asyncio.create_task(youtube_direct_stream(query, logger=logger))
+        # Audio playback policy: use a completed local file, not a live CDN
+        # URL. This avoids unstable remote stream process handles in PyTgCalls.
         download_task=asyncio.create_task(_parallel_download())
         try:
-            for task in asyncio.as_completed((direct_task, download_task)):
-                try: result=await task
-                except Exception as exc:
-                    logger("MUSIC_RACE_ERR", repr(exc)); result=None
-                if result: return result
+            return await download_task
+        except Exception as exc:
+            logger("MUSIC_RACE_ERR", repr(exc))
             return None
-        finally:
-            for task in (direct_task, download_task):
-                if not task.done(): task.cancel()
-            await asyncio.gather(direct_task, download_task, return_exceptions=True)
     try: result=await asyncio.wait_for(_race(), timeout=40.0)
     except asyncio.TimeoutError:
         logger("MUSIC_RACE_TIMEOUT", f"bounded 40s deadline: {query!r}"); result=None
