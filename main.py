@@ -1445,6 +1445,8 @@ extra_clients    = []
 # retained for compatibility, while this mapping makes active/duplicate checks
 # reflect actual connected clients instead of stale saved-session metadata.
 active_core_clients: dict[int, object] = {}
+# Serializes the check-and-register section of dynamic core deployment.
+_CORE_REGISTRY_LOCK = asyncio.Lock()
 background_tasks = set()
 _play_in_progress: set[int] = set()   # chats currently processing a .play download — dedup guard for multi-account setups
 
@@ -2547,9 +2549,38 @@ async def search_and_download_audio(query: str):
 
 
 async def _search_and_download_audio_core(query: str):
-    """Removed — bot now uses YouTube-only via search_and_download_audio.
-    Kept as a stub so any lingering call sites return None gracefully."""
-    return None
+    """Force a fresh local audio download for playback recovery.
+
+    This path is intentionally separate from the latency-sensitive first
+    attempt: it is used only after a remote stream has failed in PyTgCalls or
+    when a cached local file is suspected to be stale.
+    """
+    if not YTDLP_AVAILABLE:
+        return None
+    tmpl = os.path.join(
+        MUSIC_CACHE, f"audio_recovery_{int(time.time() * 1000)}_%(id)s.%(ext)s"
+    )
+    try:
+        result = await asyncio.wait_for(
+            music_sources.youtube_search_download(query, tmpl, logger=bot_logger),
+            timeout=30.0,
+        )
+    except asyncio.TimeoutError:
+        bot_logger("MUSIC_RECOVERY_TIMEOUT", f"disk recovery timed out: {query!r}")
+        return None
+    except Exception as exc:
+        bot_logger("MUSIC_RECOVERY_ERR", repr(exc))
+        return None
+    if not result or not result.get("file_path"):
+        return None
+    return MusicTrack(
+        title=result.get("title", query),
+        file_path=result["file_path"],
+        duration=result.get("duration", 0),
+        is_video=False,
+        thumbnail=result.get("thumbnail"),
+        source=result.get("source", "youtube-recovery"),
+    )
 
 
 async def search_and_download_video(query: str):
@@ -3126,6 +3157,14 @@ async def music_play_next(chat_id: int, client=None, session_user_id: int = None
             return False
         ok, reason = await music_play_track(chat_id, track, session_user_id)
         mstate.last_error = reason
+        if not ok:
+            # The previous track has already ended. Do not leave the chat in a
+            # phantom playing state when the replacement stream cannot start.
+            mstate.is_playing = False
+            mstate.is_paused = False
+            mstate.current = None
+            mstate.owner_uid = None
+            _stop_progress_animator(mstate)
     if not ok and client:
         await safe_send_and_track(client, chat_id, _play_failure_text(track.title, reason))
     return ok
@@ -6104,30 +6143,32 @@ async def _claim_music_dispatch(chat_id: int, core_id: int) -> bool:
 
 
 def create_event_handler(client, core_id=None):
-    """Attach the command router to one authenticated Telethon core."""
+    """Attach the command router to one authenticated Telethon core.
+
+    The account ID is resolved once during registration. Calling get_me() for
+    every Telegram update added avoidable network/API pressure and could make
+    otherwise valid music commands miss their latency window.
+    """
+    bound_core_id = int(core_id) if core_id is not None else None
     @client.on(events.NewMessage)
     async def global_handler(event):
         text_probe = (event.text or "").strip()
-        # Resolve the authenticated account before any command gate. Every
-        # deployed core passes its own ID; the fallback is only for legacy
-        # callers. This prevents a missing/late sender_id from dropping the
-        # core account's own outgoing commands before routing starts.
-        try:
-            me = await client.get_me()
-            my_id = int(me.id)
-            if core_id is not None and int(core_id) != my_id:
-                bot_logger("CORE_IDENTITY_MISMATCH",
-                           f"bound={core_id} actual={my_id}; command ignored")
+        if bound_core_id is not None:
+            my_id = bound_core_id
+        else:
+            try:
+                my_id = int((await client.get_me()).id)
+            except Exception as _identity_err:
+                if text_probe.startswith((".", "/")):
+                    bot_logger("CORE_IDENTITY_ERR", repr(_identity_err))
                 return
-        except Exception as _identity_err:
-            if text_probe.startswith((".", "/")):
-                bot_logger("CORE_IDENTITY_ERR", repr(_identity_err))
-            return
         # Music playback commands are opened up to every group member once an
         # owner/sudo has run .forall in that chat — everything else (raid
         # tools, admin actions, custom cmds, etc.) still requires
         # verify_privileges like before.
-        _music_command = bool(_MUSIC_CMD_RE.match(text_probe))
+        _music_command = (
+            not event.is_private and bool(_MUSIC_CMD_RE.match(text_probe))
+        )
         _music_open = _is_music_open_chat(event.chat_id)
         music_bypass = _music_command and (_MUSIC_PUBLIC or _music_open)
         # Userbot commands are strict owner/sudo-only by default. The sole
@@ -9776,20 +9817,21 @@ async def deploy_new_session_string(session_str: str, is_startup: bool = False,
         # account. Do not attach a second event handler for that user: duplicate
         # account sessions are the direct cause of repeated `.alive`/`.play`
         # replies and unnecessary MTProto memory/tasks.
-        if me.id in active_core_clients or me.id in active_user_ids:
-            bot_logger("DEPLOY_DUPLICATE",
-                       f"Account {me.id} already active — skipping duplicate session core.")
-            try:
-                await new_client.disconnect()
-            except Exception:
-                pass
-            return True
-        active_user_ids.add(me.id)
-        get_isolated_state(me.id)
-        create_event_handler(new_client, core_id=me.id)
-        attach_passive_monitors(new_client)
-        extra_clients.append(new_client)
-        active_core_clients[int(me.id)] = new_client
+        async with _CORE_REGISTRY_LOCK:
+            if me.id in active_core_clients or me.id in active_user_ids:
+                bot_logger("DEPLOY_DUPLICATE",
+                           f"Account {me.id} already active — skipping duplicate session core.")
+                try:
+                    await new_client.disconnect()
+                except Exception:
+                    pass
+                return True
+            active_user_ids.add(me.id)
+            get_isolated_state(me.id)
+            create_event_handler(new_client, core_id=me.id)
+            attach_passive_monitors(new_client)
+            extra_clients.append(new_client)
+            active_core_clients[int(me.id)] = new_client
         bot_logger("CORE_HANDLER_READY",
                    f"Core {me.id} registered; live_extras={len(active_core_clients)}")
         if not is_startup:
@@ -9799,7 +9841,9 @@ async def deploy_new_session_string(session_str: str, is_startup: bool = False,
             except Exception:
                 pass
         bot_logger("DEPLOY_OK", f"Core: {me.first_name} ({me.id})")
-        background_tasks.add(asyncio.create_task(_run_extra_core(new_client, int(me.id))))
+        _core_task = asyncio.create_task(_run_extra_core(new_client, int(me.id)))
+        background_tasks.add(_core_task)
+        _core_task.add_done_callback(background_tasks.discard)
         return True
     except Exception as e:
         # Always close partially connected clients. AuthKeyDuplicated and
