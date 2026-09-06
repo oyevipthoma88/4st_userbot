@@ -1975,7 +1975,7 @@ async def search_and_download_audio(query: str):
         try:
             direct = await asyncio.wait_for(
                 music_sources.resolve_zero_disk_stream(query, logger=bot_logger),
-                timeout=6.0)
+                timeout=4.5)
         except Exception as exc:
             direct = None
             bot_logger("MUSIC_DIRECT_FAST_MISS", repr(exc))
@@ -1983,7 +1983,7 @@ async def search_and_download_audio(query: str):
             try:
                 playable = await asyncio.wait_for(
                     music_sources._direct_stream_is_playable(direct["stream_url"]),
-                    timeout=2.5)
+                    timeout=1.5)
             except Exception:
                 playable = False
             if playable:
@@ -1993,15 +1993,22 @@ async def search_and_download_audio(query: str):
                                   duration=direct.get("duration", 0), is_video=False,
                                   thumbnail=direct.get("thumbnail"), source=direct.get("source", "direct"))
     tmpl = os.path.join(MUSIC_CACHE, f"audio_{int(time.time()*1000)}_strict.%(ext)s")
+    # Strict end-to-end budget: after direct lookup/probe, only the remaining
+    # time may be spent on a local fallback. Never hide a 20-second wait inside
+    # yt-dlp when the user asked for immediate playback.
+    _remaining = max(0.25, min(3.0, 6.0 - (time.perf_counter() - started)))
+    # Do not launch yt-dlp when fewer than four seconds remain: cancelling
+    # asyncio.to_thread() cannot stop native downloader work and would create
+    # a hidden R14 leak after the user-facing hard deadline.
+    if _remaining < 4.0:
+        bot_logger("MUSIC_RACE_TIMEOUT", f"hard 10s budget: no safe fallback time for {query!r}")
+        return None
     try:
-        # yt-dlp/cloud fallback can legitimately take 10–20 seconds after
-        # direct providers fail. Do not report a false miss while the only
-        # bounded fallback worker is still finishing a valid audio file.
         result = await asyncio.wait_for(
             music_sources.youtube_search_download(query, tmpl, logger=bot_logger),
-            timeout=40.0)
+            timeout=_remaining)
     except asyncio.TimeoutError:
-        bot_logger("MUSIC_RACE_TIMEOUT", f"wrapper strict 40s deadline: {query!r}")
+        bot_logger("MUSIC_RACE_TIMEOUT", f"hard 10s budget exhausted: {query!r}")
         result = None
     except Exception as exc:
         bot_logger("MUSIC_DL_ERR", repr(exc)); result = None

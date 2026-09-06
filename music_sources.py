@@ -3602,6 +3602,13 @@ async def _get_piped_apis() -> list:
     now = time.time()
     if _piped_apis_cache["apis"] is not None and (now - _piped_apis_cache["ts"]) < _PIPED_APIS_CACHE_TTL:
         return _piped_apis_cache["apis"]
+    # Hard-play latency fix: never spend the first .play request waiting for
+    # the optional instance-directory service. The static list is already
+    # ordered with known-good APIs; refresh is deferred until the cache TTL.
+    if _piped_apis_cache["apis"] is None:
+        _piped_apis_cache["apis"] = list(_PIPED_APIS)
+        _piped_apis_cache["ts"] = now
+        return _piped_apis_cache["apis"]
 
     live = []
     if _aiohttp is not None:
