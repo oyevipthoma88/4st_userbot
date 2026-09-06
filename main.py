@@ -6058,9 +6058,10 @@ _MUSIC_CMD_RE = re.compile(
     r"(?i)^[./](play|vplay|skip|cut|playforce|pause|resume|"
     r"stopmusic|endmusic|musicstop|mend|queue|q|loop|mstatus)(\s+.+)?$"
 )
-# Music is a group feature. Keep it public by default, while allowing operators
-# to restore the old owner/.forall-only policy with MUSIC_PUBLIC=0.
-_MUSIC_PUBLIC = os.environ.get("MUSIC_PUBLIC", "1").strip().lower() not in {
+# Music is owner/sudo-only by default. A chat can explicitly opt in with
+# `.forall`; deployments that intentionally want public music everywhere may
+# still set MUSIC_PUBLIC=1. Do not make a new deployment public accidentally.
+_MUSIC_PUBLIC = os.environ.get("MUSIC_PUBLIC", "0").strip().lower() not in {
     "0", "false", "no", "off"
 }
 def _music_open_owner(chat_id: int):

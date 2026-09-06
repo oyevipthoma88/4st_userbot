@@ -19,3 +19,17 @@ def test_direct_cdns_race_with_download_fallback():
 def test_parallel_errors_are_actionable():
     s=(ROOT/"music_sources.py").read_text()
     assert 'type(exc).__name__' in s
+
+
+def test_music_is_not_public_by_default():
+    s = (ROOT / "main.py").read_text()
+    assert 'os.environ.get("MUSIC_PUBLIC", "0")' in s
+    assert "music_bypass = _music_command and (_MUSIC_PUBLIC or _music_open)" in s
+    # The only per-chat opt-in is the persisted .forall map.
+    assert 'open_chats[str(chat_id)]' in s
+
+
+def test_music_public_override_is_documented_as_explicit():
+    for path in (ROOT / ".env.example", ROOT / "botfix" / ".env.example"):
+        assert "MUSIC_PUBLIC=0" in path.read_text()
+    assert "MUSIC_PUBLIC=1" in (ROOT / "README.md").read_text()

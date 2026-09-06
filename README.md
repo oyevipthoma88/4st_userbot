@@ -37,6 +37,10 @@ A powerful Python-based Telegram Userbot & Bot framework with music streaming, a
 | `.forall` | Allow everyone in chat to use `.play` |
 | `.me` | Restrict `.play` to owner/sudo only |
 
+Music is **restricted to the owner/sudo by default**. Use `.forall` in a
+specific chat to opt that chat into member requests. `MUSIC_PUBLIC=1` is an
+explicit deployment-wide override; it is `0` by default.
+
 ### 🍪 YouTube Cookies Setup (for better quality & age-restricted videos)
 
 1. Log into YouTube in Chrome or Firefox
