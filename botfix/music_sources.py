@@ -3847,15 +3847,51 @@ async def youtube_search_download(query: str, out_tmpl: str, logger=None) -> dic
             if result: return result
             if round_no == 1: await asyncio.sleep(0.1)
         return None
-    async def _race():
-        # Audio playback policy: use a completed local file, not a live CDN
-        # URL. This avoids unstable remote stream process handles in PyTgCalls.
-        download_task=asyncio.create_task(_parallel_download())
+    async def _piped_to_local_fast():
+        """Convert a fast Piped audio URL to a local file before playback."""
         try:
-            return await download_task
+            hit = await asyncio.wait_for(
+                zero_disk_piped_lookup(query, logger=logger), timeout=7.0)
+            url = (hit or {}).get("stream_url") if hit else None
+            if not url:
+                return None
+            fast_path = out_tmpl.replace("%(ext)s", "piped_fast.mp3")
+            proc = await asyncio.create_subprocess_exec(
+                "ffmpeg", "-nostdin", "-y", "-loglevel", "error",
+                "-i", url, "-vn", "-ac", "2", "-ar", "44100",
+                "-c:a", "libmp3lame", "-b:a", "128k", fast_path,
+                stdout=asyncio.subprocess.DEVNULL,
+                stderr=asyncio.subprocess.DEVNULL,
+            )
+            await asyncio.wait_for(proc.wait(), timeout=8.0)
+            if proc.returncode == 0 and os.path.exists(fast_path) and os.path.getsize(fast_path) > 4096:
+                logger("MUSIC_FAST_PATH", f"Piped-to-local ✓ {hit.get('title', query)!r}")
+                return {"title": hit.get("title", query), "file_path": fast_path,
+                        "duration": hit.get("duration", 0),
+                        "thumbnail": hit.get("thumbnail"), "source": "piped-local"}
         except Exception as exc:
-            logger("MUSIC_RACE_ERR", repr(exc))
+            logger("MUSIC_FAST_PATH_MISS", f"{type(exc).__name__}: {exc}")
+        return None
+    async def _race():
+        # Both candidates produce local files. The Piped conversion is bounded;
+        # yt-dlp remains the deterministic fallback.
+        fast_task = asyncio.create_task(_piped_to_local_fast())
+        download_task = asyncio.create_task(_parallel_download())
+        all_tasks = (fast_task, download_task)
+        try:
+            for task in asyncio.as_completed(all_tasks):
+                try:
+                    result = await task
+                except Exception as exc:
+                    logger("MUSIC_RACE_ERR", f"{type(exc).__name__}: {exc!r}"); result = None
+                if result:
+                    return result
             return None
+        finally:
+            for task in all_tasks:
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(*all_tasks, return_exceptions=True)
     try: result=await asyncio.wait_for(_race(), timeout=40.0)
     except asyncio.TimeoutError:
         logger("MUSIC_RACE_TIMEOUT", f"bounded 40s deadline: {query!r}"); result=None
