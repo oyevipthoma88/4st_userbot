@@ -2482,9 +2482,9 @@ async def search_and_download_audio(query: str):
                           duration=cached.get("duration", 0), is_video=False,
                           thumbnail=cached.get("thumbnail"), source=cached.get("source", "youtube"))
     started = time.perf_counter()
-    # Fast direct path: only return a remote URL after live + FFmpeg decode
-    # validation. PyTgCalls gets a stable stream or the safe local fallback;
-    # dead/HTML/unsupported CDN URLs never enter the voice process.
+    # Fast direct path: resolve_zero_disk_stream already performs a bounded
+    # HTTP liveness check. A second header-less FFmpeg probe falsely rejects
+    # some valid CDN URLs and burns the playback budget.
     if os.environ.get("MUSIC_DIRECT_FAST", "1").lower() not in {"0", "false", "no"}:
         try:
             direct = await asyncio.wait_for(
@@ -2494,18 +2494,11 @@ async def search_and_download_audio(query: str):
             direct = None
             bot_logger("MUSIC_DIRECT_FAST_MISS", repr(exc))
         if direct and direct.get("stream_url"):
-            try:
-                playable = await asyncio.wait_for(
-                    music_sources._direct_stream_is_playable(direct["stream_url"]),
-                    timeout=1.5)
-            except Exception:
-                playable = False
-            if playable:
-                bot_logger("MUSIC_DIRECT_FAST", f"validated direct stream: {direct.get('title', query)!r}")
-                return MusicTrack(title=direct.get("title", query),
-                                  stream_url=direct["stream_url"],
-                                  duration=direct.get("duration", 0), is_video=False,
-                                  thumbnail=direct.get("thumbnail"), source=direct.get("source", "direct"))
+            bot_logger("MUSIC_DIRECT_FAST", f"live direct stream ready: {direct.get('title', query)!r}")
+            return MusicTrack(title=direct.get("title", query),
+                              stream_url=direct["stream_url"],
+                              duration=direct.get("duration", 0), is_video=False,
+                              thumbnail=direct.get("thumbnail"), source=direct.get("source", "direct"))
     tmpl = os.path.join(MUSIC_CACHE, f"audio_{int(time.time()*1000)}_strict.%(ext)s")
     # Strict end-to-end budget: after direct lookup/probe, only the remaining
     # time may be spent on a local fallback. Never hide a 20-second wait inside
@@ -2547,9 +2540,37 @@ async def search_and_download_audio(query: str):
 
 
 async def _search_and_download_audio_core(query: str):
-    """Removed — bot now uses YouTube-only via search_and_download_audio.
-    Kept as a stub so any lingering call sites return None gracefully."""
-    return None
+    """Bounded local recovery used when a remote stream dies in PyTgCalls.
+
+    The backup build left this function as a stub, making every retry after a
+    CDN failure a guaranteed miss.
+    """
+    if not YTDLP_AVAILABLE:
+        return None
+    tmpl = os.path.join(
+        MUSIC_CACHE, f"audio_recovery_{int(time.time() * 1000)}_%(id)s.%(ext)s"
+    )
+    try:
+        result = await asyncio.wait_for(
+            music_sources.youtube_search_download(query, tmpl, logger=bot_logger),
+            timeout=4.0,
+        )
+    except asyncio.TimeoutError:
+        bot_logger("MUSIC_RECOVERY_TIMEOUT", f"disk recovery timed out: {query!r}")
+        return None
+    except Exception as exc:
+        bot_logger("MUSIC_RECOVERY_ERR", repr(exc))
+        return None
+    if not result or not result.get("file_path"):
+        return None
+    return MusicTrack(
+        title=result.get("title", query),
+        file_path=result["file_path"],
+        duration=result.get("duration", 0),
+        is_video=False,
+        thumbnail=result.get("thumbnail"),
+        source=result.get("source", "youtube-recovery"),
+    )
 
 
 async def search_and_download_video(query: str):

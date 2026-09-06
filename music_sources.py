@@ -2923,7 +2923,7 @@ async def zero_disk_jiosaavn_lookup(query: str, logger=None, allow_live: bool = 
         for host in _JIOSAAVN_API_HOSTS:
             try:
                 resp = requests.get(f"{host}/search/songs", params={"query": query, "limit": 3},
-                                     headers={"User-Agent": random_ua()}, timeout=10)
+                                     headers={"User-Agent": random_ua()}, timeout=3)
                 if resp.status_code in (429, 403):
                     logger("MUSIC_DL_ERR", f"JioSaavn host {host} blocked ({resp.status_code})")
                     continue
@@ -3214,7 +3214,14 @@ async def resolve_zero_disk_stream(query: str, logger=None, allow_live: bool = F
 
     async def _safe(fn):
         try:
-            return await fn(query, logger=logger, allow_live=allow_live)
+            result = await fn(query, logger=logger, allow_live=allow_live)
+            url = (result or {}).get("stream_url") if result else None
+            # Every provider must pass the same cheap HTTP preflight. This
+            # prevents a dead CDN URL from reaching PyTgCalls and gives the
+            # caller a real fallback within the ten-second budget.
+            if result and url and await _direct_stream_is_live(url):
+                return result
+            return None
         except Exception as exc:
             logger("MUSIC_DL_ERR", f"resolve_zero_disk_stream/{fn.__name__}: {exc}")
             return None
@@ -3242,6 +3249,8 @@ async def resolve_zero_disk_stream(query: str, logger=None, allow_live: bool = F
     finally:
         for t in pending:
             t.cancel()
+        if pending:
+            await asyncio.gather(*pending, return_exceptions=True)
     return None
 
 
