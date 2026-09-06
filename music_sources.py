@@ -683,13 +683,8 @@ class StreamCache:
         entry = self._index.get(key)
         if not entry:
             return None
-        cached_path = entry.get("file_path", "")
-        try:
-            valid_file = os.path.exists(cached_path) and os.path.getsize(cached_path) > 4096
-        except OSError:
-            valid_file = False
-        if not valid_file:
-            # Cached file was cleaned up or truncated on disk — drop the stale entry.
+        if not os.path.exists(entry.get("file_path", "")):
+            # Cached file was cleaned up on disk — drop the stale entry.
             self._index.pop(key, None)
             self._save()
             return None
@@ -2928,7 +2923,7 @@ async def zero_disk_jiosaavn_lookup(query: str, logger=None, allow_live: bool = 
         for host in _JIOSAAVN_API_HOSTS:
             try:
                 resp = requests.get(f"{host}/search/songs", params={"query": query, "limit": 3},
-                                     headers={"User-Agent": random_ua()}, timeout=3.0)
+                                     headers={"User-Agent": random_ua()}, timeout=10)
                 if resp.status_code in (429, 403):
                     logger("MUSIC_DL_ERR", f"JioSaavn host {host} blocked ({resp.status_code})")
                     continue
@@ -3247,8 +3242,6 @@ async def resolve_zero_disk_stream(query: str, logger=None, allow_live: bool = F
     finally:
         for t in pending:
             t.cancel()
-        if pending:
-            await asyncio.gather(*pending, return_exceptions=True)
     return None
 
 
