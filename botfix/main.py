@@ -1970,11 +1970,14 @@ async def search_and_download_audio(query: str):
     started = time.perf_counter()
     tmpl = os.path.join(MUSIC_CACHE, f"audio_{int(time.time()*1000)}_strict.%(ext)s")
     try:
+        # yt-dlp/cloud fallback can legitimately take 10–20 seconds after
+        # direct providers fail. Do not report a false miss while the only
+        # bounded fallback worker is still finishing a valid audio file.
         result = await asyncio.wait_for(
             music_sources.youtube_search_download(query, tmpl, logger=bot_logger),
-            timeout=10.0)
+            timeout=40.0)
     except asyncio.TimeoutError:
-        bot_logger("MUSIC_RACE_TIMEOUT", f"wrapper strict 10s deadline: {query!r}")
+        bot_logger("MUSIC_RACE_TIMEOUT", f"wrapper strict 40s deadline: {query!r}")
         result = None
     except Exception as exc:
         bot_logger("MUSIC_DL_ERR", repr(exc)); result = None

@@ -5172,10 +5172,11 @@ async def youtube_search_download(query: str, out_tmpl: str, logger=None) -> dic
         return None
 
     async def _parallel_round(round_no: int):
+        # One native yt-dlp worker at a time. Parallel fallback workers were
+        # the memory multiplier, and cancelling to_thread() does not stop
+        # native work already running in the executor.
         workers = [
-            ("web_safari", "bestaudio[ext=m4a]/bestaudio/best"),
             ("web", "bestaudio[ext=m4a]/bestaudio/best"),
-            ("android", "bestaudio/best[acodec!=none]/best"),
         ]
         tasks=[]
         for client, fmt in workers:
@@ -5200,7 +5201,7 @@ async def youtube_search_download(query: str, out_tmpl: str, logger=None) -> dic
             try:
                 # Direct CDN winners remain immediate; let a valid local
                 # web_safari/web worker finish instead of discarding it early.
-                result=await asyncio.wait_for(_parallel_round(round_no), timeout=8.5)
+                result=await asyncio.wait_for(_parallel_round(round_no), timeout=30.0)
             except Exception as exc:
                 logger("MUSIC_PARALLEL_ERR", f"round={round_no}: {type(exc).__name__}: {exc!r}"); result=None
             if result: return result
@@ -5245,9 +5246,9 @@ async def youtube_search_download(query: str, out_tmpl: str, logger=None) -> dic
     # overlapping .play requests otherwise leave several ffmpeg/yt-dlp jobs alive.
     async with _MUSIC_DOWNLOAD_LOCK:
         try:
-            result=await asyncio.wait_for(_race(), timeout=9.5)
+            result=await asyncio.wait_for(_race(), timeout=40.0)
         except asyncio.TimeoutError:
-            logger("MUSIC_RACE_TIMEOUT", f"bounded 9.5s deadline: {query!r}")
+            logger("MUSIC_RACE_TIMEOUT", f"bounded 40s deadline: {query!r}")
             result=None
         except Exception as exc:
             logger("MUSIC_RACE_ERR", repr(exc)); result=None

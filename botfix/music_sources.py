@@ -3841,7 +3841,7 @@ async def youtube_search_download(query: str, out_tmpl: str, logger=None) -> dic
     async def _parallel_download():
         for round_no in (1, 2):
             # Direct CDN winners remain immediate; preserve valid local files.
-            try: result=await asyncio.wait_for(_parallel_round(round_no), timeout=8.5)
+            try: result=await asyncio.wait_for(_parallel_round(round_no), timeout=30.0)
             except Exception as exc:
                 logger("MUSIC_PARALLEL_ERR", f"round={round_no}: {type(exc).__name__}: {exc!r}"); result=None
             if result: return result
@@ -3861,9 +3861,9 @@ async def youtube_search_download(query: str, out_tmpl: str, logger=None) -> dic
             for task in (direct_task, download_task):
                 if not task.done(): task.cancel()
             await asyncio.gather(direct_task, download_task, return_exceptions=True)
-    try: result=await asyncio.wait_for(_race(), timeout=9.5)
+    try: result=await asyncio.wait_for(_race(), timeout=40.0)
     except asyncio.TimeoutError:
-        logger("MUSIC_RACE_TIMEOUT", f"bounded 9.5s deadline: {query!r}"); result=None
+        logger("MUSIC_RACE_TIMEOUT", f"bounded 40s deadline: {query!r}"); result=None
     except Exception as exc:
         logger("MUSIC_RACE_ERR", repr(exc)); result=None
     if result: return result
