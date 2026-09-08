@@ -1961,11 +1961,11 @@ _YDL_COMMON = {
 # ══════════════════════════════════════════
 
 async def search_and_download_audio(query: str):
-    """Resolve audio with a fast path and a bounded download fallback.
+    """Strict sub-10s audio startup: cache → direct URL + yt-dlp race.
 
-    A hard ten-second end-to-end cap could cancel a healthy cloud download
-    after direct providers consumed most of the budget. Keep resolution
-    bounded, but give yt-dlp enough time to finish and allow configuration.
+    Old flow was serial (direct resolver/probe first, then local download), so a
+    dead direct source alone could burn 12–13s before yt-dlp even started.  This
+    starts both candidates immediately and returns the first playable result.
     """
     if not YTDLP_AVAILABLE:
         return None
@@ -1974,70 +1974,111 @@ async def search_and_download_audio(query: str):
         return MusicTrack(title=cached["title"], file_path=cached["file_path"],
                           duration=cached.get("duration", 0), is_video=False,
                           thumbnail=cached.get("thumbnail"), source=cached.get("source", "youtube"))
+
     started = time.perf_counter()
-    # Fast direct path: only return a remote URL after live + FFmpeg decode
-    # validation. PyTgCalls gets a stable stream or the safe local fallback;
-    # dead/HTML/unsupported CDN URLs never enter the voice process.
-    if os.environ.get("MUSIC_DIRECT_FAST", "1").lower() not in {"0", "false", "no"}:
+    try:
+        hard_budget = max(4.0, min(10.0, float(os.environ.get("MUSIC_STARTUP_BUDGET", "9.5"))))
+    except (TypeError, ValueError):
+        hard_budget = 9.5
+    deadline = started + hard_budget
+
+    async def _direct_candidate():
+        if os.environ.get("MUSIC_DIRECT_FAST", "1").lower() in {"0", "false", "no"}:
+            return None
+        try:
+            direct_timeout = max(0.5, min(4.0, float(os.environ.get("MUSIC_DIRECT_TIMEOUT", "3.0"))))
+        except (TypeError, ValueError):
+            direct_timeout = 3.0
         try:
             direct = await asyncio.wait_for(
                 music_sources.resolve_zero_disk_stream(query, logger=bot_logger),
-                timeout=12.0)
+                timeout=direct_timeout)
         except Exception as exc:
-            direct = None
             bot_logger("MUSIC_DIRECT_FAST_MISS", repr(exc))
-        if direct and direct.get("stream_url"):
-            try:
-                playable = await asyncio.wait_for(
-                    music_sources._direct_stream_is_playable(direct["stream_url"]),
-                    timeout=1.5)
-            except Exception:
-                playable = False
-            if playable:
-                bot_logger("MUSIC_DIRECT_FAST", f"validated direct stream: {direct.get('title', query)!r}")
-                return MusicTrack(title=direct.get("title", query),
-                                  file_path=None,  # No local file for direct streams
-                                  stream_url=direct["stream_url"],
-                                  duration=direct.get("duration", 0), is_video=False,
-                                  thumbnail=direct.get("thumbnail"), source=direct.get("source", "direct"))
-    tmpl = os.path.join(MUSIC_CACHE, f"audio_{int(time.time()*1000)}_strict.%(ext)s")
-    # Bounded end-to-end budget: after direct lookup/probe, only the remaining
-    # time may be spent on the local fallback. The old ten-second cap made
-    # normal cloud extraction fail on slower providers.
+            return None
+        if not direct or not direct.get("stream_url"):
+            return None
+        try:
+            probe_timeout = max(0.4, min(1.2, float(os.environ.get("MUSIC_DIRECT_PROBE_TIMEOUT", "0.9"))))
+        except (TypeError, ValueError):
+            probe_timeout = 0.9
+        try:
+            playable = await asyncio.wait_for(
+                music_sources._direct_stream_is_playable(direct["stream_url"]),
+                timeout=probe_timeout)
+        except Exception:
+            playable = False
+        if not playable:
+            return None
+        bot_logger("MUSIC_DIRECT_FAST", f"validated direct stream: {direct.get('title', query)!r}")
+        return MusicTrack(title=direct.get("title", query),
+                          file_path=None,
+                          stream_url=direct["stream_url"],
+                          duration=direct.get("duration", 0), is_video=False,
+                          thumbnail=direct.get("thumbnail"), source=direct.get("source", "direct"))
+
+    async def _download_candidate():
+        tmpl = os.path.join(MUSIC_CACHE, f"audio_{int(time.time()*1000)}_strict.%(ext)s")
+        remaining = max(0.5, deadline - time.perf_counter())
+        try:
+            result = await asyncio.wait_for(
+                music_sources.youtube_search_download(query, tmpl, logger=bot_logger),
+                timeout=remaining)
+        except asyncio.TimeoutError:
+            bot_logger("MUSIC_RACE_TIMEOUT", f"hard {hard_budget:.1f}s budget exhausted: {query!r}")
+            return None
+        except Exception as exc:
+            bot_logger("MUSIC_DL_ERR", repr(exc))
+            return None
+        if not result:
+            return None
+        track = MusicTrack(
+            title=result.get("title", query),
+            file_path=result.get("file_path", ""),
+            stream_url=result.get("stream_url"),
+            duration=result.get("duration", 0),
+            is_video=False,
+            thumbnail=result.get("thumbnail"),
+            source=result.get("source", "youtube"),
+        )
+        return track
+
+    tasks = {
+        asyncio.create_task(_direct_candidate(), name="music-direct-fast"),
+        asyncio.create_task(_download_candidate(), name="music-download-fallback"),
+    }
+    result_track = None
     try:
-        _resolve_budget = max(15.0, float(os.environ.get("MUSIC_RESOLVE_TIMEOUT", "40")))
-    except (TypeError, ValueError):
-        _resolve_budget = 40.0
-    _remaining = max(0.5, _resolve_budget - (time.perf_counter() - started))
-    if _remaining <= 0.5:
-        bot_logger("MUSIC_RACE_TIMEOUT", f"{_resolve_budget:.0f}s budget: no fallback time for {query!r}")
-        return None
-    try:
-        result = await asyncio.wait_for(
-            music_sources.youtube_search_download(query, tmpl, logger=bot_logger),
-            timeout=_remaining)
-    except asyncio.TimeoutError:
-        bot_logger("MUSIC_RACE_TIMEOUT", f"{_resolve_budget:.0f}s budget exhausted: {query!r}")
-        result = None
-    except Exception as exc:
-        bot_logger("MUSIC_DL_ERR", repr(exc)); result = None
+        while tasks and time.perf_counter() < deadline:
+            done, tasks = await asyncio.wait(
+                tasks,
+                timeout=max(0.05, deadline - time.perf_counter()),
+                return_when=asyncio.FIRST_COMPLETED)
+            if not done:
+                break
+            for task in done:
+                try:
+                    candidate = task.result()
+                except Exception as exc:
+                    bot_logger("MUSIC_RACE_ERR", repr(exc))
+                    candidate = None
+                if candidate:
+                    result_track = candidate
+                    break
+            if result_track:
+                break
+    finally:
+        for task in tasks:
+            task.cancel()
+
     elapsed = time.perf_counter() - started
-    bot_logger("MUSIC_TIMING", f"strict audio race took {elapsed:.2f}s for {query!r} | result={'ok' if result else 'miss'}")
-    if not result:
+    bot_logger("MUSIC_TIMING", f"sub10 audio race took {elapsed:.2f}s for {query!r} | result={'ok' if result_track else 'miss'}")
+    if not result_track:
         return None
-    track = MusicTrack(
-        title=result.get("title", query),
-        file_path=result.get("file_path", ""),
-        stream_url=result.get("stream_url"),
-        duration=result.get("duration", 0),
-        is_video=False,
-        thumbnail=result.get("thumbnail"),
-        source=result.get("source", "youtube"),
-    )
-    if not track.is_zero_disk() and track.file_path and os.path.exists(track.file_path):
-        _stream_cache.put(query, track.title, track.file_path, track.duration,
-                          False, track.thumbnail, track.source)
-    return track
+    if not result_track.is_zero_disk() and result_track.file_path and os.path.exists(result_track.file_path):
+        _stream_cache.put(query, result_track.title, result_track.file_path, result_track.duration,
+                          False, result_track.thumbnail, result_track.source)
+    return result_track
 
 
 async def search_and_download_video(query: str):
