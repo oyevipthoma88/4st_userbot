@@ -1996,6 +1996,7 @@ async def search_and_download_audio(query: str):
             if playable:
                 bot_logger("MUSIC_DIRECT_FAST", f"validated direct stream: {direct.get('title', query)!r}")
                 return MusicTrack(title=direct.get("title", query),
+                                  file_path=None,  # No local file for direct streams
                                   stream_url=direct["stream_url"],
                                   duration=direct.get("duration", 0), is_video=False,
                                   thumbnail=direct.get("thumbnail"), source=direct.get("source", "direct"))
