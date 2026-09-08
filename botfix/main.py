@@ -1982,7 +1982,7 @@ async def search_and_download_audio(query: str):
         try:
             direct = await asyncio.wait_for(
                 music_sources.resolve_zero_disk_stream(query, logger=bot_logger),
-                timeout=4.5)
+                timeout=12.0)
         except Exception as exc:
             direct = None
             bot_logger("MUSIC_DIRECT_FAST_MISS", repr(exc))
