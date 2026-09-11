@@ -3051,9 +3051,22 @@ async def zero_disk_soundcloud_lookup(query: str, logger=None, allow_live: bool 
 # ── Fast direct-stream resolver ─────────────────────────────────────────────
 # Resolve a playable CDN URL without downloading the whole track.  This is
 # deliberately bounded: a bad YouTube client must never hold .play hostage.
-_DIRECT_STREAM_CLIENTS = ["web_safari", "web", "android"]
+# SPEED FIX (.play must sing within 5s): "web"/"web_safari" clients force
+# yt-dlp to download and execute YouTube's player JS (nsig/sig solving) which
+# alone costs 5-15s on a Heroku dyno — that is exactly why MUSIC_DIRECT_FAST
+# kept timing out and every .play fell back to the 20s disk download.
+# android_vr / ios / android need no JS at all and answer in ~1-2s.
+_DIRECT_STREAM_CLIENTS = [
+    c.strip() for c in os.environ.get(
+        "MUSIC_DIRECT_CLIENTS", "android_vr,ios,android,tv,web_safari").split(",")
+    if c.strip()
+]
 _DIRECT_STREAM_RETRIES = 1
-_DIRECT_STREAM_TIMEOUT = 4.2
+try:
+    _DIRECT_STREAM_TIMEOUT = max(1.5, float(
+        os.environ.get("MUSIC_DIRECT_CLIENT_TIMEOUT", "4.0")))
+except (TypeError, ValueError):
+    _DIRECT_STREAM_TIMEOUT = 4.0
 _MUSIC_DOWNLOAD_LOCK = asyncio.Lock()
 
 
@@ -3149,6 +3162,13 @@ LOCAL_FILE_FFMPEG_FLAGS = "-probesize 5000000 -analyzeduration 5000000"
 
 FFPROBE_GATE_TIMEOUT = float(os.environ.get("MUSIC_PROBE_TIMEOUT", "2.5") or 2.5)
 
+# CDN hosts whose URLs never need the extra local ffprobe gate (see
+# _direct_stream_is_playable) — skipping it is worth ~1-3s per .play.
+_TRUSTED_STREAM_HOSTS = (
+    "googlevideo.com", "saavncdn.com", "aac.saavncdn.com",
+    "sndcdn.com", "jiosaavn.com", "youtube.com",
+)
+
 
 async def ffprobe_stream_ok(source: str, ffmpeg_parameters: str = "",
                             timeout: float | None = None,
@@ -3214,6 +3234,11 @@ async def _direct_stream_is_playable(url: str, ffmpeg_parameters: str = "",
     sees the URL. Cheap HTTP preflight first, then the exact ffprobe gate."""
     if not url or not await _direct_stream_is_live(url):
         return False
+    # SPEED FIX: these CDNs only ever serve real, decodable media. Running a
+    # second ffprobe on them burned 1-3s of the 5-second play budget for
+    # nothing. HTTP liveness above is enough; PyTgCalls probes again anyway.
+    if any(h in url for h in _TRUSTED_STREAM_HOSTS):
+        return True
     ok, reason = await ffprobe_stream_ok(url, ffmpeg_parameters, logger=logger)
     if not ok and logger:
         logger("MUSIC_PROBE_REJECT", f"{reason} | {url[:90]}")
