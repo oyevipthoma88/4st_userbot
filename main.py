@@ -2540,9 +2540,9 @@ async def search_and_download_audio(query: str):
     # ko race karne me jata hai (blocked mirror pe turant dobara try) aur slow
     # yt-dlp disk fallback default me OFF hai.
     try:
-        _direct_budget = max(1.5, float(os.environ.get("MUSIC_DIRECT_BUDGET", "4.2")))
+        _direct_budget = max(1.5, float(os.environ.get("MUSIC_DIRECT_BUDGET", "4.0")))
     except (TypeError, ValueError):
-        _direct_budget = 4.2
+        _direct_budget = 4.0
     _strict_direct = os.environ.get("MUSIC_STRICT_DIRECT", "1").lower() not in {"0", "false", "no"}
     if os.environ.get("MUSIC_DIRECT_FAST", "1").lower() not in {"0", "false", "no"}:
         _attempt = 0
