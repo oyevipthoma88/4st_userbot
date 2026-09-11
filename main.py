@@ -2775,17 +2775,35 @@ async def _has_active_group_call(chat_id: int, session_user_id: int) -> bool:
     try:
         from pyrogram.raw import functions as _raw_functions
         from pyrogram.raw import types as _raw_types
+
+        async def _check_once() -> bool:
+            peer = await pyro.resolve_peer(chat_id)
+            if isinstance(peer, _raw_types.InputPeerChannel):
+                full = await pyro.invoke(_raw_functions.channels.GetFullChannel(
+                    channel=_raw_types.InputChannel(
+                        channel_id=peer.channel_id, access_hash=peer.access_hash)))
+                return getattr(full.full_chat, "call", None) is not None
+            if isinstance(peer, _raw_types.InputPeerChat):
+                full = await pyro.invoke(_raw_functions.messages.GetFullChat(
+                    chat_id=peer.chat_id))
+                return getattr(full.full_chat, "call", None) is not None
+            return False
+
         await _seed_music_peer_cache(chat_id, session_user_id)
-        peer = await pyro.resolve_peer(chat_id)
-        if isinstance(peer, _raw_types.InputPeerChannel):
-            full = await pyro.invoke(_raw_functions.channels.GetFullChannel(
-                channel=_raw_types.InputChannel(
-                    channel_id=peer.channel_id, access_hash=peer.access_hash)))
-            return getattr(full.full_chat, "call", None) is not None
-        if isinstance(peer, _raw_types.InputPeerChat):
-            full = await pyro.invoke(_raw_functions.messages.GetFullChat(
-                chat_id=peer.chat_id))
-            return getattr(full.full_chat, "call", None) is not None
+        try:
+            return await _check_once()
+        except Exception as first_err:
+            # CHANNEL_INVALID = stale access_hash in peer storage. Force a
+            # fresh authoritative resolve via get_chat, then retry once.
+            if "CHANNEL_INVALID" in str(first_err) or "PEER_ID_INVALID" in str(first_err):
+                bot_logger("MUSIC_PLAY_ERR",
+                           f"Stale peer hash for {chat_id} — refreshing and retrying once.")
+                try:
+                    await pyro.get_chat(chat_id)
+                except Exception:
+                    pass
+                return await _check_once()
+            raise
     except Exception as e:
         bot_logger("MUSIC_PLAY_ERR", f"Group call check failed for {chat_id}: {e}")
     return False
