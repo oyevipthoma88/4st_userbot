@@ -3251,6 +3251,9 @@ async def youtube_direct_stream(query: str, logger=None) -> dict | None:
                 if (result and result.get("stream_url")
                         and await _direct_stream_is_playable(
                             result["stream_url"], HTTP_STREAM_FFMPEG_FLAGS, logger)):
+                    # The exact URL already passed the ffprobe gate here.  The
+                    # outer multi-provider race must not probe it a second time.
+                    result["probe_verified"] = True
                     logger("MUSIC_DIRECT",
                            f"direct audio ready on retry {attempt}: {result.get('title','')[:60]}")
                     return result
@@ -3265,7 +3268,8 @@ async def youtube_direct_stream(query: str, logger=None) -> dict | None:
            f"direct audio unavailable after {_DIRECT_STREAM_RETRIES} retries: {query[:80]}")
     return None
 
-async def resolve_zero_disk_stream(query: str, logger=None, allow_live: bool = False) -> dict | None:
+async def resolve_zero_disk_stream(query: str, logger=None, allow_live: bool = False,
+                                   youtube_target: str | None = None) -> dict | None:
     """Jugad #1/#2/#4/#5/#6/#10 orchestrator: try to get a directly-playable
     remote URL (no local file at all) before ever falling back to disk-based
     downloads.
@@ -3297,8 +3301,9 @@ async def resolve_zero_disk_stream(query: str, logger=None, allow_live: bool = F
             # magar undecodable/DRM/HTML stream jeet jaata tha aur PyTgCalls
             # ke andar masked ProcessLookupError deta tha. Ab har provider ko
             # wahi ffprobe gate paas karna padta hai jo PyTgCalls chalata hai.
-            if result and url and await _direct_stream_is_playable(
-                    url, HTTP_STREAM_FFMPEG_FLAGS, logger):
+            if result and url and (result.get("probe_verified") or
+                    await _direct_stream_is_playable(
+                    url, HTTP_STREAM_FFMPEG_FLAGS, logger)):
                 result["probe_verified"] = True
                 return result
             return None
@@ -3306,9 +3311,10 @@ async def resolve_zero_disk_stream(query: str, logger=None, allow_live: bool = F
             logger("MUSIC_DL_ERR", f"resolve_zero_disk_stream/{fn.__name__}: {exc}")
             return None
     async def _youtube_direct(q, logger=None, allow_live=False):
-        # yt-dlp direct extraction is slower than a public mirror, but it is
-        # the authoritative fallback for normal YouTube song searches.
-        return await youtube_direct_stream(q, logger=logger)
+        # Data API v3 already resolved query -> video ID in the caller. Feeding
+        # that exact watch URL to yt-dlp avoids a second ytsearch scrape, which
+        # was the 4.2s timeout seen before every successful disk download.
+        return await youtube_direct_stream(youtube_target or q, logger=logger)
 
     # Race independent zero-disk CDNs. The first valid URL wins; a slow or
     # dead mirror cannot block the other providers from starting immediately.
