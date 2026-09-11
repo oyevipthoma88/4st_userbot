@@ -3589,16 +3589,14 @@ _YT_CLIENTS = yt_clients([
 # runtime and merges it in, so the bot self-heals as instances die/appear
 # without needing a code change + redeploy.
 _PIPED_APIS = [
+    # 2026-09 health-check sweep: only these mirrors answered /search with 200.
+    # Dead ones (orangenet 502, kavin.rocks 502, privacyredirect bad cert,
+    # r4fo/smnz/hostux/leptons DNS-or-refused) were burning the whole 4.6s
+    # direct deadline on connect timeouts — removed.
     "https://pipedapi.wireway.ch",
     "https://api.piped.private.coffee",
-    "https://pipedapi.orangenet.cc",
-    "https://pipedapi.kavin.rocks",
+    "https://pipedapi.ducks.party",
     "https://pipedapi.adminforge.de",
-    "https://api.piped.privacyredirect.com",
-    "https://pipedapi.r4fo.com",
-    "https://pipedapi.smnz.de",
-    "https://piped-api.hostux.net",
-    "https://pipedapi.leptons.xyz",
 ]
 
 _PIPED_INSTANCES_API = "https://piped-instances.kavin.rocks"
@@ -3660,15 +3658,13 @@ async def _get_piped_apis() -> list:
 #  iv.melmac.space — Network unreachable, protokolla.fi + materialio.us
 #  returning empty JSON). Added fresh alternatives.
 _INVIDIOUS = [
-    "https://invidious.private.coffee",       # AT — long-running, reliable
-    "https://invidious.privacyredirect.com",  # EU — active redirect node
-    "https://invidious.nerdvpn.de",           # DE — reliable long-running
-    "https://inv.nadeko.net",                 # CL — active, good uptime
-    "https://invidious.incogniweb.net",       # EU — active
-    "https://iv.ybins.top",                   # AS — active
-    "https://invidious.drgns.space",          # US — stable
-    "https://yt.artemislena.eu",              # EU — active
-    "https://invidious.fdn.fr",               # FR — long-running
+    # 2026-09 sweep: public Invidious API is mostly dead (nadeko 403, fdn /
+    # incogniweb / ybins / drgns DNS-gone, artemislena TLS error). Only
+    # materialio.us answered /api/v1/search with 200; rest kept as last resort.
+    "https://invidious.materialio.us",
+    "https://invidious.private.coffee",
+    "https://invidious.nerdvpn.de",
+    "https://inv.nadeko.net",
 ]
 
 _YT_UPDATE_DONE = False  # technique #39: update once per process
