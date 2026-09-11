@@ -2517,18 +2517,47 @@ async def search_and_download_audio(query: str):
     # video ID before starting the CDN race, then give yt-dlp the exact watch
     # URL instead of making it scrape ytsearch1: all over again.
     _youtube_target = None
-    if (music_sources.yt_api_enabled()
-            and not query.startswith(("http://", "https://"))):
+    if not query.startswith(("http://", "https://")):
+        # Data API v3 aur key-free InnerTube search ko SAATH me race karo.
+        # Quota khatam (HTTP 429) hone par bhi InnerTube ~0.3s me videoId de
+        # deta hai, isliye yt-dlp ko kabhi slow `ytsearch1:` scrape nahi
+        # karna padta — yahi 20s -> sub-5s ka asli fix hai.
+        _target_jobs = [asyncio.create_task(
+            music_sources.youtube_innertube_search(query, logger=bot_logger))]
+        if music_sources.yt_api_enabled():
+            _target_jobs.insert(0, asyncio.create_task(
+                music_sources.yt_api_search(query, logger=bot_logger, video=False)))
         try:
-            _api_hit = await asyncio.wait_for(
-                music_sources.yt_api_search(query, logger=bot_logger, video=False),
-                timeout=1.2,
-            )
-            if _api_hit and _api_hit.get("url"):
-                _youtube_target = _api_hit["url"]
+            _deadline = float(os.environ.get("MUSIC_TARGET_TIMEOUT", "1.6"))
+            _done, _left_jobs = await asyncio.wait(
+                _target_jobs, timeout=_deadline,
+                return_when=asyncio.FIRST_COMPLETED)
+            _hit = None
+            for _job in _target_jobs:          # API result ko preference
+                if _job in _done:
+                    with contextlib.suppress(Exception):
+                        _r = _job.result()
+                        if _r and _r.get("url"):
+                            _hit = _r
+                            break
+            if _hit is None and _left_jobs:
+                _done2, _left_jobs = await asyncio.wait(
+                    _left_jobs, timeout=max(0.2, _deadline / 2),
+                    return_when=asyncio.FIRST_COMPLETED)
+                for _job in _done2:
+                    with contextlib.suppress(Exception):
+                        _r = _job.result()
+                        if _r and _r.get("url"):
+                            _hit = _r
+                            break
+            for _job in _target_jobs:
+                if not _job.done():
+                    _job.cancel()
+            if _hit and _hit.get("url"):
+                _youtube_target = _hit["url"]
                 bot_logger("MUSIC_YT_API_FAST",
                            f"direct target ready in {time.perf_counter() - started:.2f}s: "
-                           f"{_api_hit.get('video_id', '?')}")
+                           f"{_hit.get('video_id', '?')}")
         except Exception as exc:
             bot_logger("MUSIC_YT_API_FAST_MISS", repr(exc))
     # Fast direct path: resolve_zero_disk_stream already performs a bounded
