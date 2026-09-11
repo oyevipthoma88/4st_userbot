@@ -76,6 +76,7 @@ _ON_CLOUD_HOST: bool = bool(
 )
 import random
 import re
+import shlex
 import shutil as _shutil
 import subprocess
 import sys as _sys
@@ -3123,28 +3124,100 @@ async def _direct_stream_is_live(url: str) -> bool:
     except Exception:
         return False
 
-async def _direct_stream_is_playable(url: str) -> bool:
-    """Validate that FFmpeg can decode real audio before PyTgCalls sees it."""
-    if not url or not await _direct_stream_is_live(url):
-        return False
+# ── ROOT FIX: "ProcessLookupError() → gaana bajta hi nahi" ────────────
+# PyTgCalls (pytgcalls/ffmpeg.py check_stream) FIRST runs `ffprobe ... -of json`
+# on whatever source we hand it. Agar ffprobe fail hota hai (403 CDN, HTML
+# error page, encrypted/DRM stream, unsupported container) to uska stdout
+# KHAALI aata hai → json.loads("") → JSONDecodeError → library `ffprobe.kill()`
+# call karti hai → process already dead → asyncio bare `ProcessLookupError()`
+# raise karta hai, jo asli error ko poori tarah CHHUPA deta hai.
+# Isi liye log me sirf ProcessLookupError dikhta tha aur PyTgCalls rebuild
+# karne se kabhi fix nahi hota tha (galti stream URL me thi, process me nahi).
+# Fix: hum WAHI ffprobe khud pehle chalate hain — jo URL ffprobe se paas nahi
+# hota wo PyTgCalls tak pahunchta hi nahi, aur asli reason log hota hai.
+# Shared single source of truth for the FFmpeg input flags used on remote
+# HTTP/CDN streams. main.py imports this so our probe gate and PyTgCalls'
+# internal probe can never drift apart again.
+# probesize/analyzeduration jaan-boojh kar 1M/1.5s rakhe hain: 5M par ffprobe
+# 5 MB tak data kheech leta tha (kai second) — 5-second play budget ka sabse
+# bada hissa wahi kha jaata tha.
+HTTP_STREAM_FFMPEG_FLAGS = (
+    "-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5 "
+    "-probesize 1000000 -analyzeduration 1500000"
+)
+LOCAL_FILE_FFMPEG_FLAGS = "-probesize 5000000 -analyzeduration 5000000"
+
+FFPROBE_GATE_TIMEOUT = float(os.environ.get("MUSIC_PROBE_TIMEOUT", "2.5") or 2.5)
+
+
+async def ffprobe_stream_ok(source: str, ffmpeg_parameters: str = "",
+                            timeout: float | None = None,
+                            logger=None) -> tuple[bool, str]:
+    """Run PyTgCalls' own ffprobe check up-front.
+
+    Returns (ok, reason). ok=True means PyTgCalls' check_stream() will parse
+    valid JSON with at least one audio stream, so play() cannot die with the
+    masked ProcessLookupError anymore.
+    """
+    logger = logger or (lambda *a: None)
+    if not source:
+        return False, "empty source"
+    probe = _ms_find_bin("ffprobe") or "ffprobe"
+    cmd = [probe]
+    if ffmpeg_parameters:
+        try:
+            cmd += shlex.split(ffmpeg_parameters)
+        except Exception:
+            pass
+    cmd += ["-v", "error", "-show_entries",
+            "stream=codec_type,codec_name", "-show_format", "-of", "json",
+            "-i", source]
     proc = None
     try:
         proc = await asyncio.create_subprocess_exec(
-            "ffmpeg", "-nostdin", "-v", "error", "-t", "0.35",
-            "-i", url, "-map", "0:a:0?", "-f", "null", "-",
-            stdout=asyncio.subprocess.DEVNULL,
+            *cmd,
+            stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )
-        await asyncio.wait_for(proc.communicate(), timeout=2.2)
-        return proc.returncode == 0
-    except Exception:
+        stdout, stderr = await asyncio.wait_for(
+            proc.communicate(), timeout=timeout or FFPROBE_GATE_TIMEOUT)
+    except asyncio.TimeoutError:
         if proc is not None:
             try:
                 proc.kill()
                 await proc.wait()
-            except Exception:
+            except Exception:      # includes ProcessLookupError (already dead)
                 pass
+        # A timeout means "slow CDN", NOT "undecodable". Rejecting here would
+        # throw away perfectly playable streams, so we let it through and only
+        # note it — PyTgCalls' own probe has a much longer (20s) budget.
+        return True, "ffprobe slow (allowed through)"
+    except FileNotFoundError:
+        return False, "ffprobe not installed"
+    except Exception as exc:
+        return False, f"ffprobe spawn failed: {exc!r}"
+    try:
+        data = json.loads((stdout or b"").decode("utf-8", "replace") or "{}")
+    except Exception:
+        err = (stderr or b"").decode("utf-8", "replace").strip().splitlines()
+        return False, f"ffprobe gave no JSON: {(err[-1] if err else 'unknown')[:120]}"
+    streams = data.get("streams") or []
+    if not any((s or {}).get("codec_type") == "audio" for s in streams):
+        err = (stderr or b"").decode("utf-8", "replace").strip().splitlines()
+        return False, f"no audio stream: {(err[-1] if err else 'none')[:120]}"
+    return True, "ok"
+
+
+async def _direct_stream_is_playable(url: str, ffmpeg_parameters: str = "",
+                                     logger=None) -> bool:
+    """Validate that FFmpeg/ffprobe can really decode audio before PyTgCalls
+    sees the URL. Cheap HTTP preflight first, then the exact ffprobe gate."""
+    if not url or not await _direct_stream_is_live(url):
         return False
+    ok, reason = await ffprobe_stream_ok(url, ffmpeg_parameters, logger=logger)
+    if not ok and logger:
+        logger("MUSIC_PROBE_REJECT", f"{reason} | {url[:90]}")
+    return ok
 
 async def youtube_direct_stream(query: str, logger=None) -> dict | None:
     """Resolve a fresh audio CDN URL with real bounded retries.
@@ -3176,7 +3249,8 @@ async def youtube_direct_stream(query: str, logger=None) -> dict | None:
             for task in asyncio.as_completed(tasks):
                 result = await task
                 if (result and result.get("stream_url")
-                        and await _direct_stream_is_playable(result["stream_url"])):
+                        and await _direct_stream_is_playable(
+                            result["stream_url"], HTTP_STREAM_FFMPEG_FLAGS, logger)):
                     logger("MUSIC_DIRECT",
                            f"direct audio ready on retry {attempt}: {result.get('title','')[:60]}")
                     return result
@@ -3219,7 +3293,13 @@ async def resolve_zero_disk_stream(query: str, logger=None, allow_live: bool = F
             # Every provider must pass the same cheap HTTP preflight. This
             # prevents a dead CDN URL from reaching PyTgCalls and gives the
             # caller a real fallback within the ten-second budget.
-            if result and url and await _direct_stream_is_live(url):
+            # ROOT FIX: pehle sirf HTTP liveness check hota tha — ek 200 OK
+            # magar undecodable/DRM/HTML stream jeet jaata tha aur PyTgCalls
+            # ke andar masked ProcessLookupError deta tha. Ab har provider ko
+            # wahi ffprobe gate paas karna padta hai jo PyTgCalls chalata hai.
+            if result and url and await _direct_stream_is_playable(
+                    url, HTTP_STREAM_FFMPEG_FLAGS, logger):
+                result["probe_verified"] = True
                 return result
             return None
         except Exception as exc:
