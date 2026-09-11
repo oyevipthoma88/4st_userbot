@@ -1357,7 +1357,7 @@ state = BotAsstState()
 # MUSIC STATE MANAGEMENT
 # ══════════════════════════════════════════
 class MusicTrack:
-    def __init__(self, title, file_path, duration=0, requester=None,
+    def __init__(self, title, file_path="", duration=0, requester=None,
                  is_video=False, thumbnail=None, source="link", stream_url=None):
         self.title      = title
         # `file_path` holds a LOCAL disk path for the long-tail fallback
@@ -2504,6 +2504,7 @@ async def search_and_download_audio(query: str):
         if direct and direct.get("stream_url"):
             bot_logger("MUSIC_DIRECT_FAST", f"live direct stream ready: {direct.get('title', query)!r}")
             return MusicTrack(title=direct.get("title", query),
+                              file_path="",
                               stream_url=direct["stream_url"],
                               duration=direct.get("duration", 0), is_video=False,
                               thumbnail=direct.get("thumbnail"), source=direct.get("source", "direct"))
@@ -6302,7 +6303,8 @@ def create_event_handler(client, core_id=None):
         _custom_cmds_user = cfg.get("CUSTOM_CMDS", {}).get(my_id_str, {})
         if _custom_cmds_user and not _alias_hit:
             _probe = text_lower.lstrip(".").strip()
-            if _probe.split(None, 1)[0] in {"play", "vplay", "playforce"}:
+            _probe_head = _probe.split(None, 1)[0] if _probe.split() else ""
+            if _probe_head in {"play", "vplay", "playforce"}:
                 _custom_cmds_user = {}
             _cmd_key_check = next(
                 (k for k in (_probe, "." + _probe) if k in _custom_cmds_user), None
