@@ -2475,6 +2475,26 @@ _YDL_COMMON = {
 # and unified `resolve_link()` replace all of it.
 # ══════════════════════════════════════════
 
+def _stream_flag(name: str):
+    """MediaStream.Flags.<name> if this PyTgCalls build exposes it, else None."""
+    try:
+        return getattr(MediaStream.Flags, name)
+    except Exception:
+        return None
+
+
+def _audio_only_stream_flags() -> dict:
+    """Kwargs that make PyTgCalls stream AUDIO ONLY (never video)."""
+    flag = _stream_flag("IGNORE")
+    return {"video_flags": flag} if flag is not None else {}
+
+
+def _video_stream_flags() -> dict:
+    """Kwargs used by .vplay so video is actually required."""
+    flag = _stream_flag("AUTO_DETECT")
+    return {"video_flags": flag} if flag is not None else {}
+
+
 async def search_and_download_audio(query: str):
     """Resolve audio with a fast path and a bounded download fallback.
 
@@ -2493,21 +2513,51 @@ async def search_and_download_audio(query: str):
     # Fast direct path: resolve_zero_disk_stream already performs a bounded
     # HTTP liveness check. A second header-less FFmpeg probe falsely rejects
     # some valid CDN URLs and burns the playback budget.
+    # ── STRICT SUB-5s DIRECT-STREAM MODE ───────────────────────
+    # Requirement: .play ko 5 second ke andar bajna hai. Sirf zero-disk direct
+    # CDN stream itni jaldi ready hota hai, isliye pura budget direct providers
+    # ko race karne me jata hai (blocked mirror pe turant dobara try) aur slow
+    # yt-dlp disk fallback default me OFF hai.
+    try:
+        _direct_budget = max(1.5, float(os.environ.get("MUSIC_DIRECT_BUDGET", "4.2")))
+    except (TypeError, ValueError):
+        _direct_budget = 4.2
+    _strict_direct = os.environ.get("MUSIC_STRICT_DIRECT", "1").lower() not in {"0", "false", "no"}
     if os.environ.get("MUSIC_DIRECT_FAST", "1").lower() not in {"0", "false", "no"}:
-        try:
-            direct = await asyncio.wait_for(
-                music_sources.resolve_zero_disk_stream(query, logger=bot_logger),
-                timeout=4.5)
-        except Exception as exc:
-            direct = None
-            bot_logger("MUSIC_DIRECT_FAST_MISS", repr(exc))
-        if direct and direct.get("stream_url"):
-            bot_logger("MUSIC_DIRECT_FAST", f"live direct stream ready: {direct.get('title', query)!r}")
-            return MusicTrack(title=direct.get("title", query),
-                              file_path="",
-                              stream_url=direct["stream_url"],
-                              duration=direct.get("duration", 0), is_video=False,
-                              thumbnail=direct.get("thumbnail"), source=direct.get("source", "direct"))
+        _attempt = 0
+        while True:
+            _attempt += 1
+            _left = _direct_budget - (time.perf_counter() - started)
+            if _left <= 0.6:
+                break
+            try:
+                direct = await asyncio.wait_for(
+                    music_sources.resolve_zero_disk_stream(query, logger=bot_logger),
+                    timeout=_left)
+            except Exception as exc:
+                direct = None
+                bot_logger("MUSIC_DIRECT_FAST_MISS", f"attempt {_attempt}: {exc!r}")
+            if direct and direct.get("stream_url"):
+                bot_logger(
+                    "MUSIC_DIRECT_FAST",
+                    f"live direct stream in {time.perf_counter() - started:.2f}s "
+                    f"(attempt {_attempt}): {direct.get('title', query)!r}",
+                )
+                return MusicTrack(title=direct.get("title", query),
+                                  file_path="",
+                                  stream_url=direct["stream_url"],
+                                  duration=direct.get("duration", 0), is_video=False,
+                                  thumbnail=direct.get("thumbnail"), source=direct.get("source", "direct"))
+    if _strict_direct and os.environ.get(
+            "MUSIC_ALLOW_SLOW_FALLBACK", "0").lower() not in {"1", "true", "yes"}:
+        bot_logger(
+            "MUSIC_STRICT_MISS",
+            f"no direct stream within {_direct_budget:.1f}s for {query!r} — "
+            f"slow disk fallback disabled (MUSIC_ALLOW_SLOW_FALLBACK=1 to allow)",
+        )
+        bot_logger("MUSIC_TIMING",
+                   f"strict audio race took {time.perf_counter() - started:.2f}s for {query!r} | result=miss")
+        return None
     tmpl = os.path.join(MUSIC_CACHE, f"audio_{int(time.time()*1000)}_strict.%(ext)s")
     # Bounded end-to-end budget: after direct lookup/probe, only the remaining
     # time may be spent on the local fallback. The old ten-second cap made
@@ -2938,6 +2988,7 @@ async def music_play_track(chat_id: int, track: MusicTrack, session_user_id: int
                 audio_parameters=AudioQuality.STUDIO,
                 video_parameters=VideoQuality.FHD_1080p,
                 ffmpeg_parameters=_ffmpeg_in_flags,
+                **_video_stream_flags(),
             )
         else:
             # BUG FIX: Audio-only streams MUST NOT include video_parameters.
@@ -2945,10 +2996,16 @@ async def music_play_track(chat_id: int, track: MusicTrack, session_user_id: int
             # a video encoder pipeline that has no frames to consume — it hangs
             # waiting for video data that never arrives, causing the stream to
             # stall silently. STUDIO audio quality is all we need here.
+            # ROOT FIX (".play karne par .vplay jaisa video chalu ho jata tha"):
+            # MediaStream's video_flags defaults to AUTO_DETECT, so any source
+            # that happens to carry a video track (mp4/webm from YouTube or a
+            # CDN mirror) was streamed as VIDEO even for .play. Force IGNORE so
+            # .play is always audio-only and only .vplay streams video.
             stream = MediaStream(
                 source,
                 audio_parameters=AudioQuality.STUDIO,
                 ffmpeg_parameters=_ffmpeg_in_flags,
+                **_audio_only_stream_flags(),
             )
         # ── ROOT FIX: "song play karne par VC band hokar dobara start hoti hai"
         # Purana code har play() se pehle ek SILENCE frame stream karta tha
