@@ -1375,6 +1375,9 @@ class MusicTrack:
         self.source     = source
         self.started_at = None   # set when playback actually begins
         self.paused_at  = None   # set while paused, to freeze elapsed time
+        # True when music_sources already ran the ffprobe gate on this source,
+        # so music_play_track() can skip a second (latency-costing) probe.
+        self.probe_verified = False
 
     def playback_source(self) -> str:
         """The path/URL to actually hand to PyTgCalls' MediaStream."""
@@ -2543,13 +2546,20 @@ async def search_and_download_audio(query: str):
                     f"live direct stream in {time.perf_counter() - started:.2f}s "
                     f"(attempt {_attempt}): {direct.get('title', query)!r}",
                 )
-                return MusicTrack(title=direct.get("title", query),
+                _fast_track = MusicTrack(title=direct.get("title", query),
                                   file_path="",
                                   stream_url=direct["stream_url"],
                                   duration=direct.get("duration", 0), is_video=False,
                                   thumbnail=direct.get("thumbnail"), source=direct.get("source", "direct"))
+                # Provider ne already ffprobe gate paas kiya hai — dobara probe
+                # karke 0.5s barbaad na karo.
+                _fast_track.probe_verified = bool(direct.get("probe_verified"))
+                return _fast_track
+    # Default badla: pehle "0" tha, isliye direct stream miss hone par gaana
+    # BILKUL nahi bajta tha (log me MUSIC_STRICT_MISS). Direct budget (4.2s)
+    # pehle hi try ho chuka hai; uske baad disk se bajana hi sahi hai.
     if _strict_direct and os.environ.get(
-            "MUSIC_ALLOW_SLOW_FALLBACK", "0").lower() not in {"1", "true", "yes"}:
+            "MUSIC_ALLOW_SLOW_FALLBACK", "1").lower() not in {"1", "true", "yes"}:
         bot_logger(
             "MUSIC_STRICT_MISS",
             f"no direct stream within {_direct_budget:.1f}s for {query!r} — "
@@ -2897,7 +2907,30 @@ async def _try_create_group_call(chat_id: int, session_user_id: int) -> bool:
         return False
 
 
-def _resolve_music_session_id(requested_id: int):
+class StreamProbeFailed(Exception):
+    """Raised when our own ffprobe gate rejects a source BEFORE PyTgCalls
+    touches it.
+
+    ROOT CAUSE this replaces: PyTgCalls' check_stream() runs ffprobe first; a
+    403/HTML/DRM/undecodable stream makes ffprobe print nothing, the library
+    then does json.loads("") -> JSONDecodeError -> ffprobe.kill() on an
+    already-dead process -> bare `ProcessLookupError()`. That masked error is
+    exactly what filled the logs, and rebuilding PyTgCalls could never fix it
+    because the fault was in the source URL. Now we detect it ourselves in
+    ~0.5s and fall through to the normal source-switch strategies.
+    """
+
+
+async def _probe_source_playable(source: str, ffmpeg_flags: str) -> tuple[bool, str]:
+    try:
+        return await music_sources.ffprobe_stream_ok(
+            source, ffmpeg_flags, logger=bot_logger)
+    except Exception as exc:            # never let the gate break playback
+        bot_logger("MUSIC_PROBE_ERR", repr(exc))
+        return True, "probe unavailable"
+
+
+async def _resolve_music_session_id(requested_id: int):
     """Return a live bounded music engine, preferring the requested account."""
     if requested_id in pytgcalls_apps and requested_id in pyro_apps:
         return requested_id
@@ -2960,12 +2993,13 @@ async def music_play_track(chat_id: int, track: MusicTrack, session_user_id: int
         # as empty-string exceptions from PyTgCalls.
         if track.is_zero_disk():
             # HTTP/CDN stream: reconnect flags needed; large probesize for format detection
-            _ffmpeg_in_flags = (
-                "-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5 "
-                "-probesize 5000000 -analyzeduration 5000000 "
-                "-headers 'User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36\\r\\n'"
-            )
+            # SPEED + ROOT FIX: probesize/analyzeduration 5M par ffprobe
+            # remote CDN se 5 MB tak kheechta tha — akela yahi 2-4 second kha
+            # jaata tha. 1M/1.5s har normal container detect kar leta hai.
+            # `-headers` bhi hata diya: shlex ke baad literal "\r\n" text
+            # ffmpeg ko malformed header bhejta tha aur kai CDN 400/403 dete
+            # the (wahi masked ProcessLookupError ban jaata tha).
+            _ffmpeg_in_flags = music_sources.HTTP_STREAM_FFMPEG_FLAGS
         else:
             # BUG FIX: LOCAL FILE — do NOT pass -reconnect/-reconnect_streamed.
             # These flags are for HTTP streams only. Passing -reconnect_streamed
@@ -2981,7 +3015,7 @@ async def music_play_track(chat_id: int, track: MusicTrack, session_user_id: int
             # ffprobe "could not find codec parameters" deta hai →
             # NoAudioSourceFound / khaali exception → gaana bajta hi nahi.
             # Local disk file hai, isliye bada probesize latency nahi badhata.
-            _ffmpeg_in_flags = "-probesize 5000000 -analyzeduration 5000000"
+            _ffmpeg_in_flags = music_sources.LOCAL_FILE_FFMPEG_FLAGS
         if track.is_video:
             stream = MediaStream(
                 source,
@@ -3016,6 +3050,19 @@ async def music_play_track(chat_id: int, track: MusicTrack, session_user_id: int
         #   • VC pehle se chal rahi hai  → sirf play() (stream in-place swap,
         #     VC kabhi band nahi hoti — .skip/.play dono isi par chalte hain)
         #   • VC bilkul nahi hai         → pehle CreateGroupCall, phir play()
+        # ── ROOT FIX GATE ────────────────────────────────────────────
+        # PyTgCalls ke andar jaane se pehle wahi ffprobe khud chalao. Fail
+        # hone par ek saaf-saaf reason milta hai aur turant next source par
+        # jump hota hai — 4 bekaar PyTgCalls rebuild (≈9s) khatam.
+        if not getattr(track, "probe_verified", False):
+            _probe_ok, _probe_why = await _probe_source_playable(source, _ffmpeg_in_flags)
+            if not _probe_ok:
+                bot_logger("MUSIC_PROBE_FAIL",
+                           f"source rejected before play ({_probe_why}) — "
+                           f"{track.title[:50]!r} via {track.source}")
+                raise StreamProbeFailed(_probe_why)
+            track.probe_verified = True
+
         mstate.transitioning = False
         if not await _has_active_group_call(chat_id, session_user_id):
             await _try_create_group_call(chat_id, session_user_id)
@@ -3057,14 +3104,21 @@ async def music_play_track(chat_id: int, track: MusicTrack, session_user_id: int
         # < 0.5s → real play() tried to kill that already-dead PID → error.
         # Fix: (a) reset mstate so silence frame is NOT injected on retry,
         #      (b) rebuild PyTgCalls to clear all stale process handles.
+        # ROOT FIX: ProcessLookupError yahan asli process bug NAHI hai — ye
+        # PyTgCalls ke ffprobe check ka masked error hai (dekho
+        # StreamProbeFailed docstring). Isi liye pehle 4 rebuild hote the,
+        # ~9 second jaate the aur gaana kabhi nahi bajta tha. Ab: ek hi
+        # rebuild (asli stale-handle case ke liye), uske baad seedha SOURCE
+        # badlo — kyunki galti stream me hai.
         bot_logger("MUSIC_PLAY_ERR",
-                   f"ProcessLookupError() [attempt {_attempt}] — rebuilding PyTgCalls.")
-        # Clear stale state so silence frame is NOT injected on retry
+                   f"ProcessLookupError() [attempt {_attempt}] — masked ffprobe/source "
+                   f"failure; switching source instead of looping rebuilds.")
         mstate.is_playing = False
         mstate.is_paused  = False
-        if _attempt >= 3:
-            bot_logger("MUSIC_PLAY_ERR", "Max retries reached — giving up.")
-            return False, "generic"
+        if _attempt >= 1:
+            track.probe_verified = False
+            return await _play_via_source_switch(chat_id, track, session_user_id,
+                                                 _attempt, "process_lookup")
         # BUG FIX: yahan pehle leave_call() tha — usse userbot VC chhod deta
         # tha aur rejoin par sabko VC "restart" hoti dikhti thi. Sirf pehli
         # koshish par bina VC chhode rebuild karo; agar phir bhi fail ho to
@@ -3110,6 +3164,11 @@ async def music_play_track(chat_id: int, track: MusicTrack, session_user_id: int
         # No extra backoff — retry immediately
         return await music_play_track(chat_id, track, session_user_id,
                                       _retry=_retry, _attempt=_attempt + 1)
+    except StreamProbeFailed as _probe_err:
+        # Source is undecodable — retrying the same URL is pointless. Get a
+        # fresh CDN URL, else download to disk, and play that instead.
+        return await _play_via_source_switch(chat_id, track, session_user_id,
+                                             _attempt, str(_probe_err) or "probe_failed")
     except Exception as e:
         # Always log the exception TYPE alongside the message — PyTgCalls often
         # throws exceptions whose str() is empty (""), making bare str(e) logs
@@ -3194,6 +3253,55 @@ async def music_play_track(chat_id: int, track: MusicTrack, session_user_id: int
         # so dead ffmpeg process handles and buffers get reclaimed instead
         # of piling up across many .play / .skip calls on a low-RAM dyno.
         gc.collect()
+
+async def _play_via_source_switch(chat_id: int, track: "MusicTrack",
+                                  session_user_id: int, _attempt: int,
+                                  why: str):
+    """One shared, bounded ladder for "source is not playable" failures.
+
+    Order: fresh direct CDN URL (fast, keeps the sub-5s promise) -> local disk
+    download (always works, slower). Both results are re-verified by the same
+    ffprobe gate inside music_play_track(), so a bad URL can never reach
+    PyTgCalls and produce another masked ProcessLookupError.
+    """
+    bot_logger("MUSIC_SOURCE_SWITCH", f"{why} — resolving a different source "
+                                      f"for {track.title[:50]!r}")
+    if _attempt >= 3:
+        bot_logger("MUSIC_PLAY_ERR", "Source switch budget exhausted — giving up.")
+        return False, "generic"
+
+    # (a) fresh direct URL — already probe-verified by music_sources
+    if track.is_zero_disk():
+        try:
+            fresh = await asyncio.wait_for(
+                music_sources.youtube_direct_stream(track.title, logger=bot_logger),
+                timeout=6.0)
+        except Exception as exc:
+            fresh = None
+            bot_logger("MUSIC_DIRECT_REFRESH_ERR", repr(exc))
+        if fresh and fresh.get("stream_url") and fresh["stream_url"] != track.stream_url:
+            track.stream_url = fresh["stream_url"]
+            track.duration = fresh.get("duration") or track.duration
+            track.thumbnail = fresh.get("thumbnail") or track.thumbnail
+            track.probe_verified = bool(fresh.get("probe_verified"))
+            bot_logger("MUSIC_DIRECT_REFRESH", f"fresh verified URL for {track.title[:50]}")
+            return await music_play_track(chat_id, track, session_user_id,
+                                          _retry=False, _attempt=_attempt + 1)
+
+    # (b) disk download — the always-works path
+    try:
+        disk_track = await asyncio.wait_for(
+            _search_and_download_audio_core(track.title), timeout=30.0)
+    except Exception as exc:
+        disk_track = None
+        bot_logger("MUSIC_PLAY_ERR", f"Disk fallback failed: {exc!r}")
+    if disk_track and disk_track.playback_source():
+        disk_track.requester = track.requester
+        bot_logger("MUSIC_DL", f"source switch: disk track via {disk_track.source}")
+        return await music_play_track(chat_id, disk_track, session_user_id,
+                                      _retry=False, _attempt=_attempt + 1)
+    return False, "generic"
+
 
 async def music_play_next(chat_id: int, client=None, session_user_id: int = None) -> bool:
     mstate = get_music_state(chat_id)
