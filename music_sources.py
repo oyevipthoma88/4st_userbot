@@ -578,6 +578,101 @@ async def yt_api_search(query: str, logger=None, video: bool = False) -> dict | 
     return None
 
 
+# ── InnerTube fast search (no API key, no quota) ────────────────────────
+# Data API v3 ki quota khatam ho jaaye (HTTP 429) to search 4s+ le leti thi
+# kyunki yt-dlp ko `ytsearch1:` scrape karna padta tha. YouTube ka apna
+# InnerTube endpoint bina key ke ~200-400ms me videoId de deta hai, aur
+# phir direct watch?v=<id> extract hota hai — yahi sub-5s playback ki key
+# hai. Failure par None, purana rasta chalta rehta hai.
+_YT_IT_CACHE: dict[str, tuple[float, dict]] = {}
+_YT_IT_CACHE_TTL = 1800.0
+_YT_IT_KEY = "AIzaSyA8eiZmM1FaDVjRy-df2KTyQ_vz_yYM39w"  # public InnerTube web key
+
+
+def _yt_it_walk_video(node, out: list):
+    """Collect {videoId,title,duration} dicts from an InnerTube JSON tree."""
+    if isinstance(node, dict):
+        vr = node.get("videoRenderer") or node.get("compactVideoRenderer")
+        if isinstance(vr, dict) and vr.get("videoId"):
+            title = ""
+            with contextlib.suppress(Exception):
+                t = vr.get("title") or {}
+                title = (t.get("simpleText")
+                         or "".join(r.get("text", "") for r in (t.get("runs") or [])))
+            secs = 0
+            with contextlib.suppress(Exception):
+                txt = ((vr.get("lengthText") or {}).get("simpleText") or "")
+                parts = [int(p) for p in txt.split(":") if p.strip().isdigit()]
+                for p in parts:
+                    secs = secs * 60 + p
+            badges = json.dumps(vr.get("badges") or []).lower()
+            out.append({"video_id": vr["videoId"], "title": title or "",
+                        "duration": secs, "live": "live" in badges or secs == 0})
+        for v in node.values():
+            _yt_it_walk_video(v, out)
+    elif isinstance(node, list):
+        for v in node:
+            _yt_it_walk_video(v, out)
+
+
+async def youtube_innertube_search(query: str, logger=None) -> dict | None:
+    """Key-free YouTube search via InnerTube. Returns same shape as
+    yt_api_search() — {"video_id","url","title","duration","alt_ids"} or None."""
+    logger = logger or (lambda *a: None)
+    q = (query or "").strip()
+    if not q or _aiohttp is None or q.startswith(("http://", "https://")):
+        return None
+    ck = q.lower()
+    hit = _YT_IT_CACHE.get(ck)
+    if hit and (time.time() - hit[0]) < _YT_IT_CACHE_TTL:
+        return hit[1]
+    payload = {
+        "context": {"client": {"clientName": "WEB", "clientVersion": "2.20240101.00",
+                               "hl": "en", "gl": "IN"}},
+        "query": q,
+        "params": "EgIQAQ%3D%3D",   # filter: videos only
+    }
+    try:
+        timeout = _aiohttp.ClientTimeout(total=float(
+            os.environ.get("MUSIC_INNERTUBE_TIMEOUT", "2.5")))
+        async with _make_aiohttp_session() as sess:
+            async with sess.post(
+                f"https://www.youtube.com/youtubei/v1/search?key={_YT_IT_KEY}"
+                "&prettyPrint=false",
+                json=payload, timeout=timeout,
+                headers={"Content-Type": "application/json",
+                         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"},
+            ) as resp:
+                if resp.status != 200:
+                    logger("MUSIC_YT_IT", f"HTTP {resp.status}")
+                    return None
+                data = await resp.json(content_type=None)
+    except Exception as exc:
+        logger("MUSIC_YT_IT", f"miss: {exc!r}")
+        return None
+    found: list = []
+    _yt_it_walk_video(data, found)
+    # Live streams / 0-duration entries ko peeche daal do — gaana chahiye.
+    ranked = [v for v in found if not v["live"]] or found
+    if not ranked:
+        return None
+    top = ranked[0]
+    out = {
+        "video_id": top["video_id"],
+        "url": f"https://www.youtube.com/watch?v={top['video_id']}",
+        "title": top["title"] or q,
+        "channel": "",
+        "duration": top["duration"],
+        "alt_ids": [v["video_id"] for v in ranked[1:4]],
+    }
+    _YT_IT_CACHE[ck] = (time.time(), out)
+    logger("MUSIC_YT_IT", f"⚡ {out['title'][:50]!r} → {out['video_id']}")
+    return out
+
+
+
+
+
 # ── Query / title normalization ─────────────────────────────────────────
 
 def normalize_query(text: str) -> str:
