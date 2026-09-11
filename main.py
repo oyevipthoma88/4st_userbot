@@ -2513,6 +2513,24 @@ async def search_and_download_audio(query: str):
                           duration=cached.get("duration", 0), is_video=False,
                           thumbnail=cached.get("thumbnail"), source=cached.get("source", "youtube"))
     started = time.perf_counter()
+    # YouTube Data API v3 is the authoritative fast search path. Resolve the
+    # video ID before starting the CDN race, then give yt-dlp the exact watch
+    # URL instead of making it scrape ytsearch1: all over again.
+    _youtube_target = None
+    if (music_sources.yt_api_enabled()
+            and not query.startswith(("http://", "https://"))):
+        try:
+            _api_hit = await asyncio.wait_for(
+                music_sources.yt_api_search(query, logger=bot_logger, video=False),
+                timeout=1.2,
+            )
+            if _api_hit and _api_hit.get("url"):
+                _youtube_target = _api_hit["url"]
+                bot_logger("MUSIC_YT_API_FAST",
+                           f"direct target ready in {time.perf_counter() - started:.2f}s: "
+                           f"{_api_hit.get('video_id', '?')}")
+        except Exception as exc:
+            bot_logger("MUSIC_YT_API_FAST_MISS", repr(exc))
     # Fast direct path: resolve_zero_disk_stream already performs a bounded
     # HTTP liveness check. A second header-less FFmpeg probe falsely rejects
     # some valid CDN URLs and burns the playback budget.
@@ -2535,7 +2553,8 @@ async def search_and_download_audio(query: str):
                 break
             try:
                 direct = await asyncio.wait_for(
-                    music_sources.resolve_zero_disk_stream(query, logger=bot_logger),
+                    music_sources.resolve_zero_disk_stream(
+                        query, logger=bot_logger, youtube_target=_youtube_target),
                     timeout=_left)
             except Exception as exc:
                 direct = None
