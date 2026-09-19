@@ -791,10 +791,22 @@ def load_words(file_path, fallbacks):
         try:
             with open(file_path, "r", encoding="utf-8") as f:
                 lines = [line.strip() for line in f if line.strip()]
+                if os.path.abspath(file_path) == os.path.abspath(OW_PATH):
+                    lines = [_clean_ow_line(line) for line in lines]
+                    lines = [line for line in lines if line]
                 return lines if lines else fallbacks
         except Exception:
             return fallbacks
     return fallbacks
+
+
+def _clean_ow_line(value: str) -> str:
+    """Keep OW payloads plain by removing the legacy token and emoji."""
+    line = _EMOJI_RE.sub("", str(value))
+    line = re.sub(r"[\U0001F000-\U0001FAFF\u2600-\u27BF\u2B00-\u2BFF]", "", line)
+    line = line.replace("\u200d", "").replace("\ufe0f", "")
+    line = re.sub(r"(?i)(?<!\w)4st(?!\w)", "", line)
+    return re.sub(r"[ \t]{2,}", " ", line).strip()
 
 
 # ── OW personalisation helpers (.owtarget) ──────────────────────────────────
@@ -1185,6 +1197,7 @@ _CODE_COMMAND_INDEX = (
     'bomb',
     'calc',
     'cmnd',
+    'cmndrmall',
     'config',
     'cut',
     'delall',
@@ -1311,9 +1324,30 @@ def _generated_command_doc(cmd: str) -> str:
     else:
         purpose = "Utility, automation, information, or entertainment command implemented by the userbot core."
         flow = "The command is routed by the main event handler, validates its arguments and privileges, then runs its module with guarded error handling."
+    examples = {
+        "cmnd": ".cmnd ow 4st",
+        "cmndrmall": ".cmndrmall",
+        "owtarget": ".owtarget Rahul ki maa",
+        "stop": ".stop",
+        "stopow": ".stopow",
+        "stopfuck": ".stopfuck",
+        "stopraid": ".stopraid",
+        "stoprraid": ".stoprraid",
+        "stopspam": ".stopspam",
+        "stoptagall": ".stoptagall",
+        "stoponetag": ".stoponetag",
+        "play": ".play Faded",
+        "raid": ".raid 10 (reply to a user)",
+        "spam": ".spam 5 hello",
+        "tagall": ".tagall Good morning",
+        "rraid": ".rraid (reply to a user)",
+        "sraid": ".sraid (reply to a message)",
+    }
+    example = examples.get(cmd, f".{cmd}")
     return (f"<b>Purpose:</b> {purpose}\n"
             f"<b>How it works:</b> {flow}\n"
             f"<b>Usage:</b> <code>.{cmd}</code> plus the arguments shown in <code>.help</code>; reply to a user when the command requires a target.\n"
+            f"<b>Example:</b> <code>{example}</code>\n"
             f"<b>Notes:</b> A missing target, permission failure, FloodWait, or unavailable external source is handled without taking down the session.\n"
             f"<b>Related:</b> Use <code>.how {cmd}</code> again for this command and <code>.help</code> for the complete live index.")
 
@@ -2528,7 +2562,9 @@ async def search_and_download_audio(query: str):
             _target_jobs.insert(0, asyncio.create_task(
                 music_sources.yt_api_search(query, logger=bot_logger, video=False)))
         try:
-            _deadline = float(os.environ.get("MUSIC_TARGET_TIMEOUT", "1.6"))
+            # Keep the API/InnerTube target lookup bounded to timeout=1.2s by
+            # default; deployments can still raise it with MUSIC_TARGET_TIMEOUT.
+            _deadline = float(os.environ.get("MUSIC_TARGET_TIMEOUT", "1.2"))
             _done, _left_jobs = await asyncio.wait(
                 _target_jobs, timeout=_deadline,
                 return_when=asyncio.FIRST_COMPLETED)
@@ -7802,6 +7838,15 @@ def create_event_handler(client, core_id=None):
 
             asyncio.create_task(_run_force_join())
 
+        elif re.match(r"(?i)^\.cmndrmall$", text):
+            if not await verify_privileges(event, client=client): return
+            asyncio.create_task(event.delete())
+            cfg.setdefault("CUSTOM_CMDS", {})[my_id_str] = {}
+            cfg.setdefault("CMD_ALIASES", {})[my_id_str] = {}
+            save_config(cfg)
+            await safe_send_and_track(client, chat_id,
+                "<blockquote>🧹 <b>All custom commands and aliases reset.</b></blockquote>")
+
         elif re.match(r"(?i)^\.cmnd\s+(\S+)(?:\s+(.+))?$", text):
             # Two modes, auto-detected:
             #   .cmnd <module> <trigger>   → MODULE ALIAS
@@ -8186,13 +8231,8 @@ def create_event_handler(client, core_id=None):
                 f"<i>OW ab sirf yahi lines fire karega (naam bina).</i></blockquote>")
 
         elif re.match(r"(?i)^\.(?:addow|owtarget)(?:\s+(.*))?$", text):
-            # .owtarget <name / words / comma-or-space separated phrases>
-            # Registers per-chat vocabulary that the OW module mixes into its
-            # replies alongside the target's name and the live clock, so the
-            # target reads a natural, personal argument rather than a script.
-            #   .owtarget rahul, teri aukat, chal nikal   → stored for this chat
-            #   .owtarget                                  → show what's stored
-            #   .owtarget clear                            → wipe for this chat
+            # .owtarget stores the exact text supplied by the user. The text can
+            # contain the target's name; no username/ID lookup is performed.
             if not await verify_privileges(event, client=client): return
             asyncio.create_task(event.delete())
             _m_owt = re.match(r"(?i)^\.(?:addow|owtarget)(?:\s+(.*))?$", text)
@@ -8217,10 +8257,12 @@ def create_event_handler(client, core_id=None):
                     "<blockquote>🧹 <b>OW target words cleared</b> for this chat.</blockquote>")
                 return
 
-            # Comma-separated keeps multi-word phrases intact; falls back to
-            # whitespace splitting when the user typed no commas.
-            parts = [p.strip() for p in _arg.split(",")] if "," in _arg else _arg.split()
-            new_words = [p for p in (w.strip() for w in parts) if p]
+            if not _arg:
+                await safe_send_and_track(client, chat_id,
+                    "<blockquote>❌ Usage: <code>.owtarget target ka naam/text</code></blockquote>")
+                return
+            new_words = [_arg]
+            target_name = _arg
             merged = _store.get(_ckey, []) + new_words
             # de-dupe, preserve order, cap so config.json stays small
             seen, deduped = set(), []
@@ -8235,9 +8277,9 @@ def create_event_handler(client, core_id=None):
                 f"🎯 <b>OW Target Words</b>\nChat: <code>{chat_id}</code>  "
                 f"Added: <code>{len(new_words)}</code>  Total: <code>{len(_store[_ckey])}</code>"))
             await safe_send_and_track(client, chat_id,
-                f"<blockquote>🎯 <b>Added {len(new_words)} OW word(s).</b>  "
+                f"<blockquote>🎯 <b>Added target name:</b> <code>{target_name}</code>  "
                 f"Total: <code>{len(_store[_ckey])}</code>\n"
-                f"<i>These are mixed into .ow with the target's name and the live time.</i></blockquote>")
+                f"<i>Yahi text/name .ow firing me use hoga.</i></blockquote>")
 
 
         elif re.match(r"(?i)^\.mastersync(?:\s+(on|off))?$", text):
@@ -8316,8 +8358,8 @@ def create_event_handler(client, core_id=None):
                     tag_lines = load_words(ODISHA_PATH, DEFAULT_TAGS)
                 else:
                     tag_lines = load_words(TAGALL_PATH, DEFAULT_TAGS)
-                istate.active_tasks["tagall"] = asyncio.current_task()
                 _fkey      = "onetag" if cmd_type == "onetag" else "tagall"
+                istate.active_tasks[_fkey] = asyncio.current_task()
                 f_idx      = cfg["ACTIVE_FONTS"].get(_fkey, 0)
                 batch_size = 1 if cmd_type == "onetag" else 5
 
@@ -8883,11 +8925,10 @@ def create_event_handler(client, core_id=None):
                               "Custom triggers run SILENTLY, the trigger message is never "
                               "deleted, and the alias is never removed after firing.\n"
                               ".cmnd [name] [free text] instead creates a text-reply command.",
-                "owtarget":   ".owtarget [words] — Register personalised OW vocabulary for "
-                              "this chat. OW mixes these words with the target's real name "
-                              "and the live clock (e.g. \"1:20 am\") so replies read like a "
-                              "human argument. .owtarget alone lists them, "
-                              ".owtarget clear wipes them.",
+                "cmndrmall":  ".cmndrmall — Reset every custom text command and module alias for this core.",
+                "owtarget":   ".owtarget [text/name] — Save exactly the text you provide and use it in .ow replies. "
+                              "Username/ID lookup is not used. .owtarget alone lists saved text; "
+                              ".owtarget clear wipes it. <b>Example:</b> <code>.owtarget Rahul ki maa</code>.",
                 "rmcmnd":     ".rmcmnd [name] — Remove a custom TEXT command. "
                               "Module aliases cannot be removed.",
                 "mastersync": ".mastersync [on/off] — Toggle master sync. When ON, owner commands "
@@ -8902,6 +8943,8 @@ def create_event_handler(client, core_id=None):
             }
             doc = HOW_DOCS.get(cmd_q) or (_generated_command_doc(cmd_q) if cmd_q in _CODE_COMMAND_INDEX else None)
             if doc:
+                if "Example:" not in doc:
+                    doc += f"\n<b>Example:</b> <code>.{cmd_q}</code>"
                 await safe_send_and_track(client, chat_id,
                     f"<blockquote>ℹ️ <b>HOW:</b> <code>.{cmd_q}</code>\n\n{doc}</blockquote>")
             else:
@@ -9515,7 +9558,8 @@ def create_event_handler(client, core_id=None):
             r"(?i)^\.(stop|stopm|stopraid|stoprraid|stopspam|stopow|"
             r"stopfuck|stopmulti|stoptagall|stoponetag|stopsraid)$", text):
             asyncio.create_task(event.delete())
-            tgt = text_lower.replace(".", "").replace("/", "").replace("stop", "").strip()
+            stop_cmd = text_lower.lstrip("./").strip()
+            tgt = stop_cmd[4:] if stop_cmd.startswith("stop") else ""
             if tgt == "sraid":
                 istate.sraid_state.pop(chat_id, None)
                 asyncio.create_task(send_module_log(
@@ -9536,11 +9580,12 @@ def create_event_handler(client, core_id=None):
                 return  # skip wipe — target-reply messages stay
             elif tgt in ["tagall", "onetag"]:
                 # tagall/onetag messages stay — only the background task is killed
-                task = istate.active_tasks.get("tagall")
+                task = istate.active_tasks.get(tgt) or istate.active_tasks.get("tagall")
                 if task and not task.done():
                     task.cancel()
                     await asyncio.sleep(0)
                 istate.active_tasks.pop("tagall", None)
+                istate.active_tasks.pop("onetag", None)
                 istate.last_target_msg[chat_id] = None
                 asyncio.create_task(send_module_log(
                     f"🛑 <b>{'Tagall' if tgt == 'tagall' else 'Onetag'} Stopped</b>  Chat: <code>{chat_id}</code>"))
