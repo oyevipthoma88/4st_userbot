@@ -1012,6 +1012,11 @@ def apply_font_transformer(text, font_idx):
 # SPEED / TYPING / SAFE-MODE UTILITIES
 # ══════════════════════════════════════════
 
+# Absolute lower bound for any send delay. Lower than the old 0.05s clamp so
+# high-speed modes are really faster; still non-zero to stay API friendly.
+_MIN_SEND_DELAY = 0.02
+
+
 def _human_typing_dur(speed: float) -> float:
     """Human-like typing duration with a longer, visible indicator window.
 
@@ -1020,13 +1025,99 @@ def _human_typing_dur(speed: float) -> float:
     command delays to show typing for up to 8 seconds.
     """
     if speed < 0.3:
-        return max(0.25, speed * 0.70)
+        # BUG FIX: a 0.25s floor on every message made "fast" speeds slow.
+        return max(0.05, speed * 0.60)
     elif speed < 1.0:
-        return max(0.55, speed * 0.72)
+        return max(0.35, speed * 0.72)
     elif speed < 3.0:
         return max(1.00, min(speed * 0.72, 5.00))
     else:
         return max(1.80, min(speed * 0.65, 8.00))
+
+
+_ME_CACHE = {}
+
+
+async def get_me_cached(client, force: bool = False):
+    """Cached `client.get_me()`.
+
+    PERF BUG FIX: every incoming update and every single sent message used to
+    fire a fresh `GetUsersRequest` to Telegram. During a raid/ow flood that is
+    one extra network round-trip per message, which made modules crawl and made
+    `.stop` feel unresponsive (its handler was queued behind those calls).
+    The self user never changes inside a session, so cache it per client.
+    """
+    key = id(client)
+    if not force:
+        me = _ME_CACHE.get(key)
+        if me is not None:
+            return me
+    me = await client.get_me()
+    if me is not None:
+        _ME_CACHE[key] = me
+    return me
+
+
+# ── Module run/stop bookkeeping ─────────────────────────────────────────────
+# BUG FIX: modules used to be tracked by module name only (`active_tasks["ow"]`),
+# so firing the same module in two chats overwrote the first handle and `.stop`
+# could no longer cancel it (the classic "stop kaam nahi karta" / "raid stuck"
+# report). Tasks are now tracked per module+chat AND every loop also polls a
+# cooperative stop flag, so a module stops even if cancellation is swallowed.
+
+def _mod_key(module: str, chat_id) -> str:
+    return f"{module}:{chat_id}"
+
+
+def _mod_begin(istate, module: str, chat_id, task=None):
+    """Register a running module and clear any stale stop flag."""
+    key = _mod_key(module, chat_id)
+    istate.stopped_modules.discard(key)
+    istate.stopped_modules.discard(module)
+    if task is not None:
+        istate.active_tasks[key] = task
+        istate.active_tasks[module] = task   # back-compat for old lookups
+    return key
+
+
+def _mod_should_stop(istate, module: str, chat_id) -> bool:
+    return (_mod_key(module, chat_id) in istate.stopped_modules
+            or module in istate.stopped_modules)
+
+
+def _mod_finish(istate, module: str, chat_id):
+    key = _mod_key(module, chat_id)
+    istate.active_tasks.pop(key, None)
+    istate.stopped_modules.discard(key)
+
+
+def _mod_stop(istate, module: str, chat_id=None) -> int:
+    """Stop a module. Sets the cooperative flag and cancels matching tasks."""
+    stopped = 0
+    if chat_id is None:
+        istate.stopped_modules.add(module)
+        keys = [k for k in list(istate.active_tasks)
+                if k == module or k.startswith(module + ":")]
+    else:
+        istate.stopped_modules.add(_mod_key(module, chat_id))
+        keys = [_mod_key(module, chat_id), module]
+    for k in keys:
+        task = istate.active_tasks.pop(k, None)
+        if task is not None and not task.done():
+            task.cancel()
+            stopped += 1
+    return stopped
+
+
+def _mod_stop_all(istate) -> int:
+    stopped = 0
+    for k, task in list(istate.active_tasks.items()):
+        istate.stopped_modules.add(k)
+        if task is not None and not task.done():
+            task.cancel()
+            stopped += 1
+    istate.active_tasks.clear()
+    return stopped
 
 
 def _safe_delay(base: float) -> float:
@@ -1034,9 +1125,18 @@ def _safe_delay(base: float) -> float:
     SAFE_MODE ON  → ±20-30% random jitter to prevent Telegram pattern-detection.
     SAFE_MODE OFF → raw speed, no change.
     """
+    try:
+        base = float(base)
+    except Exception:
+        base = 0.1
+    base = max(0.0, base)
     if not cfg.get("SAFE_MODE", False):
-        return base
-    return max(0.05, base * random.uniform(0.78, 1.32))
+        # SAFE_MODE OFF → raw speed. Floor is only the API-friendly minimum so
+        # `.speed raid 0.02` can actually fire ~50 msg/s instead of being
+        # silently clamped to the old 0.05s floor.
+        return max(_MIN_SEND_DELAY, base)
+    jitter = base * random.uniform(0.85, 1.20)
+    return max(_MIN_SEND_DELAY, jitter)
 
 
 # ── Module activity log → LOG_CHANNEL (from config) ─────────────────────
@@ -1400,6 +1500,8 @@ class ClientIsolatedState:
         self.is_afk             = False
         self.afk_reason         = ""
         self.sraid_state        = {}
+        # Cooperative stop flags — "module" or "module:chat_id" keys.
+        self.stopped_modules    = set()
 
 global_cluster_storage = {}
 active_user_ids = set()
@@ -2388,7 +2490,7 @@ async def verify_privileges(event, client, strict_owner_only=False, core_id=None
     core. Normal users never cross this boundary.
     """
     try:
-        my_id  = int(core_id) if core_id else (await client.get_me()).id
+        my_id  = int(core_id) if core_id else (await get_me_cached(client)).id
         # Telethon can expose an outgoing self-message with a missing or
         # non-normalized sender_id. Since this event was emitted by this exact
         # client, it is safe to treat it as the core owner's command.
@@ -2434,13 +2536,15 @@ async def safe_send_and_track(client, chat_id, text, reply_to=None, delay=0.0,
     if delay > 0:
         await asyncio.sleep(delay)
     try:
-        me_id  = (await client.get_me()).id
+        me_id  = (await get_me_cached(client)).id
         istate = get_isolated_state(me_id)
         # BUG FIX: FloodWait ab HAMESHA respect hoga — SAFE_MODE ON/OFF se fark nahi.
         # Pehle SAFE_MODE OFF hone pe FloodWait silently `return None` kar deta tha,
         # jis se .ow/.fuck/.spam/.tagall bich mein band ho jaati thi bina koi error ke.
         # Ab: 300s tak ka FloodWait automatically handle hoga, usse bada hua to skip.
-        _MAX_FLOOD_WAIT = 300  # 5 minute tak wait karo, usse bada hua to skip karo
+        # BUG FIX: 300s ka wait module ko "stuck" dikhata tha. Ab 75s tak wait,
+        # usse bada FloodWait hua to skip + log, module aage badh jaata hai.
+        _MAX_FLOOD_WAIT = 75
         for _attempt in range(5):   # auto-retry up to 5× on FloodWait
             try:
                 if formatting_entities:
@@ -6460,7 +6564,7 @@ def create_event_handler(client, core_id=None):
         # callers. This prevents a missing/late sender_id from dropping the
         # core account's own outgoing commands before routing starts.
         try:
-            me = await client.get_me()
+            me = await get_me_cached(client)
             my_id = int(me.id)
             my_name = getattr(me, "first_name", None) or str(my_id)
             if core_id is not None and int(core_id) != my_id:
@@ -7479,6 +7583,9 @@ def create_event_handler(client, core_id=None):
             m   = re.search(r"(?i)^\.speed\s+(\w+)\s+([\d.]+)$", text)
             cmd = m.group(1).lower()
             spd = float(m.group(2))
+            # Clamp: below _MIN_SEND_DELAY Telegram just floods-waits anyway,
+            # above 60s a module looks frozen.
+            spd = max(_MIN_SEND_DELAY, min(spd, 60.0))
             cfg["DEFAULT_SPEEDS"][cmd] = spd
             save_config(cfg)
             # Silent — log to bot DM only, never visible in group
@@ -8001,8 +8108,15 @@ def create_event_handler(client, core_id=None):
             abuses = load_words(ABUSE_PATH, DEFAULT_ABUSES)
             async def _run_raid(_count=count, _dest=dest, _abuses=abuses,
                                _mention=target_mention, _reply=reply_msg):
+                # BUG FIX: ek message fail hone par pura raid ruk jaata tha
+                # ("raid stuck"). Ab har shot apne try me hai, stop flag har
+                # iteration me check hota hai, aur pehla message bina delay
+                # jaata hai — speed turant dikhti hai.
+                _sent = 0
                 try:
-                    for _ in range(_count):
+                    for _i in range(_count):
+                        if _mod_should_stop(istate, "raid", _dest):
+                            break
                         speed     = _safe_delay(cfg["DEFAULT_SPEEDS"].get("raid", 0.1))
                         is_typing = cfg["ACTIVE_TYPING"].get("raid", False)
                         f_idx     = cfg["ACTIVE_FONTS"].get("raid", 0)
@@ -8012,12 +8126,27 @@ def create_event_handler(client, core_id=None):
                                 async with client.action(_dest, 'typing'):
                                     await asyncio.sleep(_human_typing_dur(speed))
                             except Exception: pass
-                        await safe_send_and_track(client, _dest, word,
-                            reply_to=_reply.id if _reply else None, delay=speed)
+                        try:
+                            await safe_send_and_track(
+                                client, _dest, word,
+                                reply_to=_reply.id if _reply else None,
+                                delay=(0.0 if _i == 0 else speed))
+                            _sent += 1
+                        except asyncio.CancelledError:
+                            raise
+                        except Exception:
+                            # Reply target gone / transient error — keep firing.
+                            await asyncio.sleep(_MIN_SEND_DELAY)
                 except asyncio.CancelledError:
                     pass
+                finally:
+                    _mod_finish(istate, "raid", _dest)
+                    asyncio.create_task(send_module_log(
+                        f"⚔️ <b>Raid Finished</b>\n"
+                        f"Sent: <code>{_sent}</code>/<code>{_count}</code>  "
+                        f"Chat: <code>{_dest}</code>"))
             # Run raid in background so event loop stays free and .stopraid can cancel it
-            istate.active_tasks["raid"] = asyncio.create_task(_run_raid())
+            _mod_begin(istate, "raid", dest, asyncio.create_task(_run_raid()))
             asyncio.create_task(send_module_log(
                 f"⚔️ <b>Raid Started</b>\n"
                 f"Target: <code>{t_id}</code>  ({_t_name})  Count: <code>{count}</code>  Chat: <code>{dest}</code>"))
@@ -8107,9 +8236,11 @@ def create_event_handler(client, core_id=None):
             except Exception:
                 pass
 
-            istate.active_tasks["spam"] = asyncio.current_task()
+            _mod_begin(istate, "spam", dest, asyncio.current_task())
             try:
                 for _ in range(count):
+                    if _mod_should_stop(istate, "spam", dest):
+                        break
                     speed     = _safe_delay(cfg["DEFAULT_SPEEDS"].get("spam", 0.1))
                     is_typing = cfg["ACTIVE_TYPING"].get("spam", False)
                     f_idx     = cfg["ACTIVE_FONTS"].get("spam", 0)
@@ -8133,6 +8264,8 @@ def create_event_handler(client, core_id=None):
                             delay=speed)
             except asyncio.CancelledError:
                 pass
+            finally:
+                _mod_finish(istate, "spam", dest)
 
         elif re.match(r"(?i)^\.(g)?(ow|fuck)(?:\s+(.+?))?(?:\s+(-?\d+))?$", text):
             if not await verify_privileges(event, client=client): return
@@ -8184,20 +8317,26 @@ def create_event_handler(client, core_id=None):
             # .addowline — jo poori line user ne di hai, bilkul waisi hi fire hogi.
             _ow_lines  = list(_get_ow_lines(cfg, my_id_str, dest))
             # BUG FIX: OW ab target ka naam BILKUL mention nahi karta.
-            istate.active_tasks[mode] = asyncio.current_task()
             if mode == "ow":
                 istate.ow_active[dest] = True
             asyncio.create_task(send_module_log(
                 f"{'👁️ OW' if mode == 'ow' else '💢 Fuck'} <b>Started</b>\n"
                 f"Target: <code>{t_id}</code>  Chat: <code>{dest}</code>"
                 + (f"\nCustom words: <code>{len(_ow_custom)}</code>" if _ow_custom else "")))
-            _loop_task = asyncio.current_task()
+            _mod_begin(istate, mode, dest, asyncio.current_task())
             _word_idx  = 0   # sequential index — cycles through words_db in order
             _cust_idx  = 0
+            # BUG FIX (.owtarget / .addow): custom words used to fire only on
+            # every 3rd message, so after adding a target the stream still read
+            # as the plain default ow.txt list ("normal hi fire ho rahi hai").
+            # Now: .addowline lines win, else .owtarget words are the ONLY
+            # payload, and ow.txt is used only when nothing custom is set.
+            _ow_pool = _ow_lines if (mode == "ow" and _ow_lines) else []
             try:
                 while True if mode == "fuck" else istate.ow_active.get(dest, True):
-                    # Hard-stop check — if task.cancel() was called, exit immediately
-                    if _loop_task is not None and _loop_task.cancelled():
+                    # Hard-stop check — cooperative flag, works even if the
+                    # cancellation was swallowed by an inner try/except.
+                    if _mod_should_stop(istate, mode, dest):
                         break
                     curr_mid  = istate.last_target_msg.get(dest)
                     speed     = _safe_delay(cfg["DEFAULT_SPEEDS"].get(mode, 0.1))
@@ -8205,8 +8344,8 @@ def create_event_handler(client, core_id=None):
                     f_idx     = cfg["ACTIVE_FONTS"].get(mode, 0)
                     # Sequential line-by-line from ow.txt / abuse.txt — NOT random
                     # .addowline diya hai to SIRF wahi lines fire hongi.
-                    if mode == "ow" and _ow_lines:
-                        raw_word  = _ow_lines[_word_idx % len(_ow_lines)]
+                    if _ow_pool:
+                        raw_word  = _ow_pool[_word_idx % len(_ow_pool)]
                         _word_idx += 1
                         word = apply_font_transformer(raw_word, f_idx)
                         if curr_mid:
@@ -8220,15 +8359,16 @@ def create_event_handler(client, core_id=None):
                         else:
                             await asyncio.sleep(0.3)
                         continue
-                    raw_word  = words_db[_word_idx % len(words_db)]
-                    _word_idx += 1
-                    # .addow words — bich bich me user ke diye hue words hi
-                    # aate hain. Target ka NAAM kabhi mention nahi hota.
-                    if mode == "ow" and _ow_custom and _word_idx % 3 == 0:
+                    if mode == "ow" and _ow_custom:
+                        # .addow / .owtarget words — sirf yahi fire honge.
                         raw_word = _humanize_ow_line(
                             _ow_custom[_cust_idx % len(_ow_custom)], "", cfg,
                         )
                         _cust_idx += 1
+                        _word_idx += 1
+                    else:
+                        raw_word  = words_db[_word_idx % len(words_db)]
+                        _word_idx += 1
                     word = apply_font_transformer(raw_word, f_idx)
                     if curr_mid:
                         if is_typing:
@@ -8243,6 +8383,10 @@ def create_event_handler(client, core_id=None):
                         await asyncio.sleep(0.3)
             except asyncio.CancelledError:
                 pass
+            finally:
+                _mod_finish(istate, mode, dest)
+                if mode == "ow":
+                    istate.ow_active.pop(dest, None)
 
         elif re.match(r"(?i)^\.addowline(?:\s+(.*))?$", text):
             # .addowline <line>  → ye poori line jaisi hai waisi hi OW me fire hogi
@@ -8408,7 +8552,7 @@ def create_event_handler(client, core_id=None):
                 else:
                     tag_lines = load_words(TAGALL_PATH, DEFAULT_TAGS)
                 _fkey      = "onetag" if cmd_type == "onetag" else "tagall"
-                istate.active_tasks[_fkey] = asyncio.current_task()
+                _mod_begin(istate, _fkey, chat_id, asyncio.current_task())
                 f_idx      = cfg["ACTIVE_FONTS"].get(_fkey, 0)
                 batch_size = 1 if cmd_type == "onetag" else 5
 
@@ -8421,6 +8565,8 @@ def create_event_handler(client, core_id=None):
 
                 batch = []
                 for user in users:
+                    if _mod_should_stop(istate, _fkey, chat_id):
+                        break
                     if user.bot or user.deleted:
                         continue
                     # Read speed INSIDE the loop so live .speed changes apply immediately
@@ -8455,6 +8601,9 @@ def create_event_handler(client, core_id=None):
                 pass
             except Exception as e:
                 asyncio.create_task(send_module_log(f"❌ Tagall error: <code>{e}</code>"))
+            finally:
+                _mod_finish(istate, "onetag" if cmd_type == "onetag" else "tagall",
+                            chat_id)
 
         elif re.match(r"(?i)^\.rraid(?:\s+(.+))?$", text):
             if not await verify_privileges(event, client=client): return
@@ -8541,7 +8690,7 @@ def create_event_handler(client, core_id=None):
                 "<blockquote>🔨 <b>BANALL INITIATED...</b></blockquote>")
             banned, failed = 0, 0
             limit  = cfg.get("MAX_BAN_LIMIT", 300)
-            istate.active_tasks["banall"] = asyncio.current_task()
+            _mod_begin(istate, "banall", chat_id, asyncio.current_task())
             try:
                 admin_ids = set()
                 async for admin in client.iter_participants(
@@ -9604,8 +9753,8 @@ def create_event_handler(client, core_id=None):
                         except Exception: pass
 
         elif re.match(
-            r"(?i)^\.(stop|stopm|stopraid|stoprraid|stopspam|stopow|"
-            r"stopfuck|stopmulti|stoptagall|stoponetag|stopsraid)$", text):
+            r"(?i)^\.(stop|stopm|stopall|stopraid|stoprraid|stopspam|stopow|"
+            r"stopfuck|stopmulti|stoptagall|stoponetag|stopsraid|stopghost)$", text):
             asyncio.create_task(event.delete())
             stop_cmd = text_lower.lstrip("./").strip()
             tgt = stop_cmd[4:] if stop_cmd.startswith("stop") else ""
@@ -9618,34 +9767,30 @@ def create_event_handler(client, core_id=None):
             elif tgt in ["ow", "fuck"]:
                 # ow/fuck messages are target-replies — must NOT be deleted on stop
                 istate.ow_active[chat_id] = False
-                task = istate.active_tasks.get(tgt)
-                if task and not task.done():
-                    task.cancel()
-                    await asyncio.sleep(0)   # yield so cancellation propagates immediately
-                istate.active_tasks.pop(tgt, None)
+                # Stop this chat AND any other chat where the module is looping
+                # (a single module handle used to be overwritten per chat).
+                _mod_stop(istate, tgt, chat_id)
+                _mod_stop(istate, tgt)
+                await asyncio.sleep(0)   # yield so cancellation propagates immediately
                 istate.last_target_msg[chat_id] = None
                 asyncio.create_task(send_module_log(
                     f"🛑 <b>{'OW' if tgt == 'ow' else 'Fuck'} Stopped</b>  Chat: <code>{chat_id}</code>"))
                 return  # skip wipe — target-reply messages stay
             elif tgt in ["tagall", "onetag"]:
                 # tagall/onetag messages stay — only the background task is killed
-                task = istate.active_tasks.get(tgt) or istate.active_tasks.get("tagall")
-                if task and not task.done():
-                    task.cancel()
-                    await asyncio.sleep(0)
-                istate.active_tasks.pop("tagall", None)
-                istate.active_tasks.pop("onetag", None)
+                _mod_stop(istate, tgt, chat_id)
+                _mod_stop(istate, "tagall")
+                _mod_stop(istate, "onetag")
+                await asyncio.sleep(0)
                 istate.last_target_msg[chat_id] = None
                 asyncio.create_task(send_module_log(
                     f"🛑 <b>{'Tagall' if tgt == 'tagall' else 'Onetag'} Stopped</b>  Chat: <code>{chat_id}</code>"))
                 return  # skip wipe — tag messages stay as-is
             elif tgt == "raid":
                 # Stop raid task without deleting raid messages — they stay in chat
-                task = istate.active_tasks.get("raid")
-                if task and not task.done():
-                    task.cancel()
-                    await asyncio.sleep(0)
-                istate.active_tasks.pop("raid", None)
+                _mod_stop(istate, "raid", chat_id)
+                _mod_stop(istate, "raid")
+                await asyncio.sleep(0)
                 istate.target_lists.pop(chat_id, None)
                 istate.last_target_msg[chat_id] = None
                 asyncio.create_task(send_module_log(
@@ -9653,29 +9798,25 @@ def create_event_handler(client, core_id=None):
                 return  # raid messages stay in chat — skip wipe
             elif tgt == "multi":
                 istate.multi_targets.pop(chat_id, None)
-                task = istate.active_tasks.get(tgt)
-                if task and not task.done():
-                    task.cancel()
-                    await asyncio.sleep(0)
-            elif tgt == "" or tgt == "m":
+                _mod_stop(istate, tgt, chat_id)
+                _mod_stop(istate, tgt)
+                await asyncio.sleep(0)
+            elif tgt in ("", "m", "all"):
+                # `.stop` / `.stopm` / `.stopall` — everything, every chat.
                 istate.rraid_active_users.clear()
                 istate.ow_active.clear()
                 istate.multi_targets.clear()
                 istate.target_lists.clear()
                 istate.sraid_state.clear()
-                for k, task in list(istate.active_tasks.items()):
-                    if not task.done():
-                        task.cancel()
+                _killed = _mod_stop_all(istate)
                 await asyncio.sleep(0)   # yield so all cancellations propagate
-                istate.active_tasks.clear()
                 asyncio.create_task(send_module_log(
-                    f"🛑 <b>ALL Tasks Stopped</b>  Chat: <code>{chat_id}</code>"))
+                    f"🛑 <b>ALL Tasks Stopped</b>  ({_killed})  "
+                    f"Chat: <code>{chat_id}</code>"))
             else:
-                task = istate.active_tasks.get(tgt)
-                if task and not task.done():
-                    task.cancel()
-                    await asyncio.sleep(0)
-                istate.active_tasks.pop(tgt, None)
+                _mod_stop(istate, tgt, chat_id)
+                _mod_stop(istate, tgt)
+                await asyncio.sleep(0)
             await wipe_untagged_messages(client, my_id, chat_id)
             istate.last_target_msg[chat_id] = None
 
@@ -9898,7 +10039,7 @@ def attach_passive_monitors(client):
     @client.on(events.MessageDeleted)
     async def del_mon(event):
         try:
-            istate = get_isolated_state((await client.get_me()).id)
+            istate = get_isolated_state((await get_me_cached(client)).id)
             for cid, lmid in list(istate.last_target_msg.items()):
                 if event.deleted_ids and lmid in event.deleted_ids:
                     istate.last_target_msg[cid] = None
@@ -9922,7 +10063,7 @@ def attach_passive_monitors(client):
     @client.on(events.NewMessage(incoming=True))
     async def inc_track(event):
         try:
-            me     = await client.get_me()
+            me     = await get_me_cached(client)
             my_id  = me.id
             istate = get_isolated_state(my_id)
         except Exception: return

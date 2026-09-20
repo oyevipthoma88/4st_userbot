@@ -41,6 +41,10 @@ def test_cmndrmall_resets_aliases_and_text_commands():
 def test_each_how_response_gets_an_example_and_stop_keys_match_tasks():
     source = (ROOT / "main.py").read_text(encoding="utf-8")
     assert 'if "Example:" not in doc:' in source
-    assert 'istate.active_tasks[_fkey] = asyncio.current_task()' in source
-    assert 'task = istate.active_tasks.get(tgt) or istate.active_tasks.get("tagall")' in source
+    # Modules are now registered per module+chat through _mod_begin so the same
+    # module running in two chats can still be stopped individually.
+    assert '_mod_begin(istate, _fkey, chat_id, asyncio.current_task())' in source
+    assert '_mod_stop(istate, "tagall")' in source
+    assert '_mod_should_stop(istate, "raid", _dest)' in source
+    assert 'async def get_me_cached(client' in source
     assert 'stop_cmd[4:] if stop_cmd.startswith("stop") else ""' in source
