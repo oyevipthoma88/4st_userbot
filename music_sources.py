@@ -830,7 +830,13 @@ async def download_direct_media(url: str, out_tmpl: str, logger=None):
             "-b:a", "320k", mp3_path,
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
         )
-        await asyncio.wait_for(proc.wait(), timeout=120)
+        try:
+            await asyncio.wait_for(proc.wait(), timeout=120)
+        except asyncio.TimeoutError:
+            proc.kill()
+            await proc.wait()
+            logger("MUSIC_DL_ERR", f"Direct media ffmpeg timed out: {url[:80]}")
+            return None
         if proc.returncode != 0 or not os.path.exists(mp3_path):
             return None
         title = os.path.basename(url.split("?")[0]) or "Direct Stream"
@@ -848,7 +854,12 @@ async def _probe_duration(path: str) -> int:
             "-of", "default=noprint_wrappers=1:nokey=1", path,
             stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
         )
-        out, _ = await asyncio.wait_for(proc.communicate(), timeout=20)
+        try:
+            out, _ = await asyncio.wait_for(proc.communicate(), timeout=20)
+        except asyncio.TimeoutError:
+            proc.kill()
+            await proc.wait()
+            return 0
         return int(float(out.decode().strip() or 0))
     except Exception:
         return 0
@@ -1156,7 +1167,11 @@ async def audius_search_download(query: str, out_tmpl: str, logger=None):
             mp3_path,
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
         )
-        await asyncio.wait_for(proc.wait(), timeout=120)
+        try:
+            await asyncio.wait_for(proc.wait(), timeout=120)
+        except asyncio.TimeoutError:
+            proc.kill()
+            await proc.wait()
         try:
             os.remove(raw_file)
         except Exception:
@@ -1250,7 +1265,11 @@ async def archive_org_search_download(query: str, out_tmpl: str, logger=None):
             "-b:a", "320k", mp3_path,
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
         )
-        await proc.wait()
+        try:
+            await asyncio.wait_for(proc.wait(), timeout=120)
+        except asyncio.TimeoutError:
+            proc.kill()
+            await proc.wait()
         try:
             os.remove(raw_path)
         except Exception:
@@ -1347,7 +1366,11 @@ async def archive_org_video_search_download(query: str, out_tmpl: str, logger=No
                 "-b:a", "192k", mp4_path,
                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
             )
-            await proc.wait()
+            try:
+                await asyncio.wait_for(proc.wait(), timeout=180)
+            except asyncio.TimeoutError:
+                proc.kill()
+                await proc.wait()
             try:
                 os.remove(raw_path)
             except Exception:
@@ -1636,7 +1659,11 @@ async def wikimedia_commons_search_download(query: str, out_tmpl: str, logger=No
             "-b:a", "320k", mp3_path,
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
         )
-        await proc.wait()
+        try:
+            await asyncio.wait_for(proc.wait(), timeout=120)
+        except asyncio.TimeoutError:
+            proc.kill()
+            await proc.wait()
         try:
             os.remove(raw_path)
         except Exception:
@@ -1709,7 +1736,11 @@ async def openverse_search_download(query: str, out_tmpl: str, logger=None):
             "-b:a", "320k", mp3_path,
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
         )
-        await proc.wait()
+        try:
+            await asyncio.wait_for(proc.wait(), timeout=120)
+        except asyncio.TimeoutError:
+            proc.kill()
+            await proc.wait()
         try:
             os.remove(raw_path)
         except Exception:
@@ -1784,7 +1815,11 @@ async def hearthis_search_download(query: str, out_tmpl: str, logger=None):
             "-b:a", "320k", mp3_path,
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
         )
-        await proc.wait()
+        try:
+            await asyncio.wait_for(proc.wait(), timeout=120)
+        except asyncio.TimeoutError:
+            proc.kill()
+            await proc.wait()
         try:
             os.remove(raw_path)
         except Exception:
@@ -1876,7 +1911,11 @@ async def ccmixter_search_download(query: str, out_tmpl: str, logger=None):
             "-b:a", "320k", mp3_path,
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
         )
-        await proc.wait()
+        try:
+            await asyncio.wait_for(proc.wait(), timeout=120)
+        except asyncio.TimeoutError:
+            proc.kill()
+            await proc.wait()
         try:
             os.remove(raw_path)
         except Exception:
@@ -2280,7 +2319,12 @@ async def jiosaavn_search_download(query: str, out_tmpl: str, logger=None):
             "-vn", "-ar", "44100", "-ac", "2", "-b:a", "320k", mp3_path,
             stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL,
         )
-        await proc.wait()
+        try:
+            await asyncio.wait_for(proc.wait(), timeout=120)
+        except asyncio.TimeoutError:
+            proc.kill()
+            with contextlib.suppress(Exception):
+                await proc.wait()
         with contextlib.suppress(Exception):
             os.remove(raw_path)
         if not os.path.exists(mp3_path):

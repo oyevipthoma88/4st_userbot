@@ -11,6 +11,8 @@ import datetime
 import shutil
 import concurrent.futures
 import hashlib
+import ast
+import operator as _operator
 from datetime import timedelta, timezone
 import warnings
 warnings.filterwarnings("ignore", category=FutureWarning, module="google")
@@ -53,6 +55,36 @@ def _find_binary(name: str) -> str | None:
     if name == "ffprobe":
         return _ffsetup.FFPROBE_BIN
     return shutil.which(name)
+# ─────────────────────────────────────────────────────────────────────────────
+
+# ── Safe arithmetic evaluator for .calc ─────────────────────────────────────
+# Replaces the old eval(expr, {"__builtins__": {}}, {}) which is trivially
+# escapable via the class hierarchy (RCE on the host). This AST walker only
+# permits numbers and basic arithmetic operators — no names, attributes,
+# calls, or comprehensions.
+_CALC_OPS = {
+    ast.Add: _operator.add, ast.Sub: _operator.sub, ast.Mult: _operator.mul,
+    ast.Div: _operator.truediv, ast.FloorDiv: _operator.floordiv,
+    ast.Mod: _operator.mod, ast.Pow: _operator.pow,
+    ast.USub: _operator.neg, ast.UAdd: _operator.pos,
+}
+
+def _safe_calc(node):
+    if isinstance(node, ast.Expression):
+        return _safe_calc(node.body)
+    if isinstance(node, ast.BinOp):
+        op = _CALC_OPS.get(type(node.op))
+        if op is None:
+            raise ValueError("unsupported operator")
+        return op(_safe_calc(node.left), _safe_calc(node.right))
+    if isinstance(node, ast.UnaryOp):
+        op = _CALC_OPS.get(type(node.op))
+        if op is None:
+            raise ValueError("unsupported operator")
+        return op(_safe_calc(node.operand))
+    if isinstance(node, ast.Constant) and isinstance(node.value, (int, float)):
+        return node.value
+    raise ValueError("disallowed expression")
 # ─────────────────────────────────────────────────────────────────────────────
 
 GENAI_AVAILABLE = False
@@ -3400,7 +3432,7 @@ async def music_play_next(chat_id: int, client=None, session_user_id: int = None
         # track silently gets skipped again right after it started —
         # looking to the user like the song "didn't play".
         now = time.time()
-        if now - mstate.last_advance_ts < 1.5:
+        if now - mstate.last_advance_ts < 0.6:
             bot_logger("MUSIC_DEBOUNCE", f"Ignoring duplicate advance for chat {chat_id}")
             return mstate.is_playing
         mstate.last_advance_ts = now
@@ -3425,9 +3457,20 @@ async def music_play_next(chat_id: int, client=None, session_user_id: int = None
         if session_user_id is None:
             bot_logger("MUSIC_PLAY_ERR", f"No owning session for chat {chat_id} — cannot advance.")
             mstate.last_error = "generic"
+            # Put the track back — we popped it but can't play it.
+            mstate.queue.insert(0, track)
             return False
         ok, reason = await music_play_track(chat_id, track, session_user_id)
         mstate.last_error = reason
+        if not ok:
+            # Failed to start the next track: reset playback state so the
+            # Now-Playing card doesn't get stuck on a dead track, and put
+            # the track back at the head of the queue so .skip can retry it
+            # instead of silently losing it forever.
+            mstate.is_playing = False
+            mstate.current    = None
+            _stop_progress_animator(mstate)
+            mstate.queue.insert(0, track)
     if not ok and client:
         await safe_send_and_track(client, chat_id, _play_failure_text(track.title, reason))
     return ok
@@ -3453,12 +3496,13 @@ def register_stream_end_handler(user_id: int):
             mstate = get_music_state(chat_id)
             if mstate.transitioning:
                 return
-            ok = await music_play_next(chat_id, client=userbot, session_user_id=user_id)
+            owning_client = active_core_clients.get(mstate.owner_uid) or userbot
+            ok = await music_play_next(chat_id, client=owning_client, session_user_id=user_id)
             if ok:
                 # Track auto-advanced (queue/loop) — refresh the Now Playing
                 # card in place so the animation continues on the new track.
                 mstate = get_music_state(chat_id)
-                await show_now_playing(userbot, chat_id, mstate)
+                await show_now_playing(owning_client, chat_id, mstate)
         except Exception as e:
             bot_logger("STREAM_END_ERR", str(e))
         finally:
@@ -3489,6 +3533,10 @@ async def auto_leave_empty_calls_task():
                 if not mstate.is_playing:
                     _empty_vc_counts.pop(chat_id, None)
                     _heal_fail_counts.pop(chat_id, None)
+                    # Reclaim memory from chats that finished long ago and have
+                    # no queue/current — music_states grew unbounded over days.
+                    if not mstate.queue and not mstate.current and not mstate.now_playing_msg:
+                        music_states.pop(chat_id, None)
                     continue
                 tgcalls = _get_session_pytgcalls(mstate.owner_uid)
                 if not tgcalls:
@@ -3513,9 +3561,12 @@ async def auto_leave_empty_calls_task():
                             bot_logger("MUSIC_HEAL", f"Auto-reconnect succeeded for {chat_id}.")
                         else:
                             bot_logger("MUSIC_HEAL", f"Auto-reconnect failed for {chat_id} — giving up.")
-                            mstate.is_playing = False
-                            mstate.current    = None
-                            mstate.queue      = []
+                            async with mstate.lock:
+                                _stop_progress_animator(mstate)
+                                mstate.is_playing = False
+                                mstate.current    = None
+                                mstate.queue      = []
+                                mstate.owner_uid  = None
                         _heal_fail_counts.pop(chat_id, None)
                     continue
                 if participants and len(participants) > 0:
@@ -3528,10 +3579,12 @@ async def auto_leave_empty_calls_task():
                         await tgcalls.leave_call(chat_id)
                     except Exception:
                         pass
-                    mstate.is_playing = False
-                    mstate.current    = None
-                    mstate.queue      = []
-                    mstate.owner_uid  = None
+                    async with mstate.lock:
+                        _stop_progress_animator(mstate)
+                        mstate.is_playing = False
+                        mstate.current    = None
+                        mstate.queue      = []
+                        mstate.owner_uid  = None
                     _empty_vc_counts.pop(chat_id, None)
                     gc.collect()
         except Exception as e:
@@ -5706,26 +5759,13 @@ async def _asst_callback_inner(event, data, sender_id, owner_id, is_owner):
         elif action == "vc_skip":
             if tgcalls and mstate.is_playing:
                 try:
-                    next_track = mstate.queue.pop(0) if mstate.queue else None
-                    if next_track:
-                        ok, _r = await music_play_track(ctrl_chat, next_track, mstate.owner_uid or 0)
-                        if ok:
-                            # find userbot client
-                            _cl = None
-                            for _uid, _client in [(uid, c)
-                                    for uid, c in [(list(active_user_ids)[0]
-                                    if active_user_ids else 0, userbot)]]:
-                                _cl = _client
-                                break
-                            if _cl:
-                                await show_now_playing(_cl, ctrl_chat, mstate)
-                            await _vc_answer(f"⏭️ Skipped → {next_track.title[:30]}")
-                        else:
-                            await _vc_answer("❌ Skip failed.")
+                    ok = await music_play_next(ctrl_chat, client=userbot,
+                                               session_user_id=mstate.owner_uid)
+                    if ok:
+                        _cl = active_core_clients.get(mstate.owner_uid) or userbot
+                        await show_now_playing(_cl, ctrl_chat, mstate)
+                        await _vc_answer("⏭️ Skipped")
                     else:
-                        await tgcalls.leave_call(ctrl_chat)
-                        mstate.is_playing = False
-                        mstate.current    = None
                         await _vc_answer("⏭️ Queue empty — VC stopped.")
                 except Exception as e:
                     await _vc_answer(f"❌ {str(e)[:60]}")
@@ -5733,15 +5773,17 @@ async def _asst_callback_inner(event, data, sender_id, owner_id, is_owner):
                 await _vc_answer("⏭️ Nothing playing to skip.")
 
         elif action == "vc_stop":
-            if tgcalls:
-                try:
-                    await tgcalls.leave_call(ctrl_chat)
-                except Exception:
-                    pass
-            mstate.is_playing = False
-            mstate.is_paused  = False
-            mstate.current    = None
-            mstate.queue      = []
+            async with mstate.lock:
+                _stop_progress_animator(mstate)
+                if tgcalls:
+                    try:
+                        await tgcalls.leave_call(ctrl_chat)
+                    except Exception:
+                        pass
+                mstate.is_playing = False
+                mstate.is_paused  = False
+                mstate.current    = None
+                mstate.queue      = []
             try:
                 await event.edit(
                     "<b>⏹️ Playback stopped.</b>\n"
@@ -5752,15 +5794,17 @@ async def _asst_callback_inner(event, data, sender_id, owner_id, is_owner):
             await _vc_answer("⏹️ Stopped!")
 
         elif action == "vc_end":
-            if tgcalls:
-                try:
-                    await tgcalls.leave_call(ctrl_chat)
-                except Exception:
-                    pass
-            mstate.is_playing = False
-            mstate.is_paused  = False
-            mstate.current    = None
-            mstate.queue      = []
+            async with mstate.lock:
+                _stop_progress_animator(mstate)
+                if tgcalls:
+                    try:
+                        await tgcalls.leave_call(ctrl_chat)
+                    except Exception:
+                        pass
+                mstate.is_playing = False
+                mstate.is_paused  = False
+                mstate.current    = None
+                mstate.queue      = []
             try:
                 await event.edit(
                     "<b>🚫 Voice chat ended.</b>\n"
@@ -6819,7 +6863,7 @@ def create_event_handler(client, core_id=None):
                     "<blockquote>⏹  Nothing is playing.</blockquote>")
                 return
             skipped = mstate.current
-            ok = await music_play_next(chat_id, client, session_user_id=my_id)
+            ok = await music_play_next(chat_id, client, session_user_id=mstate.owner_uid)
             if ok:
                 await show_now_playing(client, chat_id, mstate)
             else:
@@ -6868,63 +6912,66 @@ def create_event_handler(client, core_id=None):
         elif re.match(r"(?i)^\.pause$", text):
             asyncio.create_task(event.delete())
             mstate = get_music_state(chat_id)
-            if not mstate.is_playing or mstate.is_paused:
-                await safe_send_and_track(client, chat_id,
-                    "<blockquote>⏸  Already paused or nothing playing.</blockquote>")
-                return
-            try:
-                _tgcalls = _get_session_pytgcalls(mstate.owner_uid or my_id)
-                if _tgcalls:
-                    await _tgcalls.pause(chat_id)
-                mstate.is_paused = True
-                if mstate.current:
-                    mstate.current.paused_at = time.time()
-                if mstate.now_playing_msg:
-                    try:
-                        await mstate.now_playing_msg.edit(_now_playing_text(mstate))
-                    except Exception:
-                        pass
-                else:
+            async with mstate.lock:
+                if not mstate.is_playing or mstate.is_paused:
                     await safe_send_and_track(client, chat_id,
-                        f"<blockquote>⏸ <b>Paused:</b> "
-                        f"<code>{mstate.current.title if mstate.current else '?'}</code></blockquote>")
-            except Exception as e:
+                        "<blockquote>⏸  Already paused or nothing playing.</blockquote>")
+                    return
+                try:
+                    _tgcalls = _get_session_pytgcalls(mstate.owner_uid or my_id)
+                    if _tgcalls:
+                        await _tgcalls.pause(chat_id)
+                    mstate.is_paused = True
+                    if mstate.current:
+                        mstate.current.paused_at = time.time()
+                except Exception as e:
+                    await safe_send_and_track(client, chat_id,
+                        f"<blockquote>❌ Pause failed: <code>{e}</code></blockquote>")
+                    return
+            if mstate.now_playing_msg:
+                try:
+                    await mstate.now_playing_msg.edit(_now_playing_text(mstate))
+                except Exception:
+                    pass
+            else:
                 await safe_send_and_track(client, chat_id,
-                    f"<blockquote>❌ Pause failed: <code>{e}</code></blockquote>")
+                    f"<blockquote>⏸ <b>Paused:</b> "
+                    f"<code>{mstate.current.title if mstate.current else '?'}</code></blockquote>")
 
         elif re.match(r"(?i)^\.resume$", text):
             asyncio.create_task(event.delete())
             mstate = get_music_state(chat_id)
-            if not mstate.is_paused:
-                await safe_send_and_track(client, chat_id,
-                    "<blockquote>▶️  Not paused.</blockquote>")
-                return
-            try:
-                _tgcalls = _get_session_pytgcalls(mstate.owner_uid or my_id)
-                if _tgcalls:
-                    await _tgcalls.resume(chat_id)
-                # Shift started_at forward by however long we sat paused, so
-                # the progress bar picks up exactly where it froze instead of
-                # jumping ahead by the pause duration.
-                if mstate.current and mstate.current.paused_at is not None:
-                    paused_for = time.time() - mstate.current.paused_at
-                    mstate.current.started_at += paused_for
-                    mstate.current.paused_at = None
-                mstate.is_paused = False
-                if mstate.now_playing_msg:
-                    await show_now_playing(client, chat_id, mstate)
-                else:
+            async with mstate.lock:
+                if not mstate.is_paused:
                     await safe_send_and_track(client, chat_id,
-                        f"<blockquote>▶️ <b>Resumed:</b> "
-                        f"<code>{mstate.current.title if mstate.current else '?'}</code></blockquote>")
-            except Exception as e:
+                        "<blockquote>▶️  Not paused.</blockquote>")
+                    return
+                try:
+                    _tgcalls = _get_session_pytgcalls(mstate.owner_uid or my_id)
+                    if _tgcalls:
+                        await _tgcalls.resume(chat_id)
+                    # Shift started_at forward by however long we sat paused, so
+                    # the progress bar picks up exactly where it froze instead of
+                    # jumping ahead by the pause duration.
+                    if mstate.current and mstate.current.paused_at is not None:
+                        paused_for = time.time() - mstate.current.paused_at
+                        mstate.current.started_at += paused_for
+                        mstate.current.paused_at = None
+                    mstate.is_paused = False
+                except Exception as e:
+                    await safe_send_and_track(client, chat_id,
+                        f"<blockquote>❌ Resume failed: <code>{e}</code></blockquote>")
+                    return
+            if mstate.now_playing_msg:
+                await show_now_playing(client, chat_id, mstate)
+            else:
                 await safe_send_and_track(client, chat_id,
-                    f"<blockquote>❌ Resume failed: <code>{e}</code></blockquote>")
+                    f"<blockquote>▶️ <b>Resumed:</b> "
+                    f"<code>{mstate.current.title if mstate.current else '?'}</code></blockquote>")
 
         elif re.match(r"(?i)^\.(stopmusic|endmusic|musicstop|mend|end)$", text):
             asyncio.create_task(event.delete())
             mstate = get_music_state(chat_id)
-            _stop_progress_animator(mstate)
             stopped_text = "<blockquote>⏹  <b>Stopped.</b>  Left voice chat.</blockquote>"
             edited_in_place = False
             if mstate.now_playing_msg:
@@ -6933,18 +6980,20 @@ def create_event_handler(client, core_id=None):
                     edited_in_place = True
                 except Exception:
                     pass
-            mstate.now_playing_msg = None
-            mstate.queue.clear()
-            mstate.current    = None
-            mstate.is_playing = False
-            mstate.is_paused  = False
-            try:
-                _tgcalls = _get_session_pytgcalls(mstate.owner_uid or my_id)
-                if _tgcalls:
-                    await _tgcalls.leave_call(chat_id)
-            except Exception:
-                pass
-            mstate.owner_uid = None
+            async with mstate.lock:
+                _stop_progress_animator(mstate)
+                mstate.now_playing_msg = None
+                mstate.queue.clear()
+                mstate.current    = None
+                mstate.is_playing = False
+                mstate.is_paused  = False
+                try:
+                    _tgcalls = _get_session_pytgcalls(mstate.owner_uid or my_id)
+                    if _tgcalls:
+                        await _tgcalls.leave_call(chat_id)
+                except Exception:
+                    pass
+                mstate.owner_uid = None
             gc.collect()
             if not edited_in_place:
                 await safe_send_and_track(client, chat_id, stopped_text)
@@ -7278,7 +7327,7 @@ def create_event_handler(client, core_id=None):
             m    = re.search(r"(?i)^\.calc\s+(.+)$", text)
             expr = m.group(1).strip()
             try:
-                result = eval(expr, {"__builtins__": {}}, {})
+                result = _safe_calc(ast.parse(expr, mode="eval"))
                 await safe_send_and_track(client, chat_id,
                     f"<blockquote>🔢 <b>Calc:</b> <code>{expr}</code>\n"
                     f"✅ <b>Result:</b> <code>{result}</code></blockquote>")

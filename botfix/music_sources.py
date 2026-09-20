@@ -42,11 +42,12 @@ Sources implemented (no cookies, no login required):
       Music and Bensound links are also playable through this generic path
       even though they don't have a dedicated no-key *search* API.
 
-Every downloaded/converted file is normalized to the best practical quality
-for Telegram voice chats: 320kbps CBR MP3 audio (44.1kHz stereo) — going
-higher just wastes bandwidth since Telegram voice chats cap well below
-that — and, where a source offers it, the highest bitrate/resolution
-version available is picked instead of a default/preview-quality stream.
+YouTube playback preserves the provider's playable m4a/webm/opus source
+container by default, avoiding an extra FFmpeg transcode before playback.
+Set MUSIC_TRANSCODE_AUDIO=1 when a normalized Opus output is required. Long-tail
+fallback sources may still be converted when their provider requires it; where
+a source offers it, the highest practical bitrate/resolution version is picked
+instead of a default/preview-quality stream.
 
 A tiny on-disk "stream cache" is also provided so repeat requests for the
 same song reuse the already-downloaded file instead of re-fetching it.
@@ -56,57 +57,142 @@ import asyncio
 import contextlib
 import json
 import os
+import sys as _sys_top
+
+# bgutil is intentionally disabled. Heroku yt-dlp already discovers a provider
+# from site-packages; injecting the bundled copy caused duplicate provider
+# registration ("BgUtilHTTP already registered") on every music request.
+_BGUTIL_PLUGIN_DIR = ""
+
+# ── Cloud-host / IP-block detection (ported from Musicbot helpers/youtube.py) ──
+# On Heroku/Railway/Render the YouTube CDN (googlevideo.com) is IP-blocked.
+# Detect at startup and skip CDN streaming — go straight to yt-dlp download.
+_ON_CLOUD_HOST: bool = bool(
+    os.environ.get("DYNO")                    # Heroku
+    or os.environ.get("RAILWAY_ENVIRONMENT")  # Railway
+    or os.environ.get("RENDER_SERVICE_ID")    # Render
+    or os.environ.get("FLY_APP_NAME")         # Fly.io
+    or os.environ.get("K_SERVICE")            # Google Cloud Run
+)
 import random
 import re
+import shlex
 import shutil as _shutil
 import subprocess
 import sys as _sys
+import threading
 import time
 import unicodedata
 import urllib.parse as _urlparse
 from contextlib import asynccontextmanager
 
-# ── ffmpeg / ffprobe PATH fix (Heroku apt buildpack) ────────────────────────
-# Priority order for ffmpeg detection:
-# 1. shutil.which() — uses current PATH (Heroku .profile.d may already set it)
-# 2. Hardcoded Heroku/common paths
-# 3. env-var fallback (set by main.py's own detection pass)
-_MS_FFMPEG_EXTRA_DIRS = [
-    "/app/.apt/usr/bin",   # Heroku apt buildpack
-    "/app/bin",            # Heroku alt
-    "/usr/local/bin",
-    "/usr/bin",
-    "/bin",
-]
+# ── ffmpeg / ffprobe resolution (shared with main.py) ───────────────────────
+# See ffmpeg_setup.py for the root-cause writeup. The key invariant: we only
+# ever report an ffmpeg directory that contains a WORKING ffmpeg *and* a
+# working ffprobe, otherwise yt-dlp postprocessing dies with
+# "Postprocessing: ffprobe and ffmpeg not found".
+from ffmpeg_setup import (
+    ensure_ffmpeg as _ensure_ffmpeg,
+    ffmpeg_opts   as _ffmpeg_opts,
+    audio_pp      as _audio_pp,
+)
+import ffmpeg_setup as _ffsetup
 
-def _ms_find_bin(name: str) -> str | None:
-    # First try shutil.which (respects the full current PATH)
-    found = _shutil.which(name)
-    if found:
-        return found
-    for d in _MS_FFMPEG_EXTRA_DIRS:
-        p = os.path.join(d, name)
-        if os.path.isfile(p) and os.access(p, os.X_OK):
-            return p
+_ensure_ffmpeg()
+_MS_FFMPEG_BIN  = _ffsetup.FFMPEG_BIN  or "ffmpeg"
+_MS_FFPROBE_BIN = _ffsetup.FFPROBE_BIN or "ffprobe"
+_MS_FFMPEG_DIR  = _ffsetup.FFMPEG_DIR
+
+# YouTube already provides playable m4a/webm/opus audio. Re-encoding every
+# download to Opus adds an avoidable FFmpeg pass after the network download.
+# Preserve the source container by default for faster first playback; set
+# MUSIC_TRANSCODE_AUDIO=1 when a normalized Opus output is explicitly needed.
+def _youtube_audio_opts() -> dict:
+    flag = os.environ.get("MUSIC_TRANSCODE_AUDIO", "0").strip().lower()
+    if flag in {"1", "true", "yes", "on"}:
+        return _audio_pp("opus", "192")
+    return {**_ffmpeg_opts(), "postprocessors": []}
+
+# ── ROOT FIX (music play nahi hota) #1 — dead-mirror cooldown ───────────────
+# Piped/Invidious public mirrors are mostly dead (502/404/401/DNS/SSL).  Har
+# .play par poori list dobara try hoti thi → 25-40s har song me barbaad, aur
+# main.py ka 120s wait_for timeout hit ho jaata tha, isliye kuch bhi nahi
+# bajta tha.  Ek baar fail hone par host 30 min ke liye skip ho jaata hai.
+_DEAD_HOSTS: dict = {}
+_DEAD_HOST_TTL = 1800.0
+
+
+def _host_dead(url: str) -> bool:
+    exp = _DEAD_HOSTS.get(url)
+    if not exp:
+        return False
+    if exp > time.time():
+        return True
+    _DEAD_HOSTS.pop(url, None)
+    return False
+
+
+def _mark_host_dead(url: str) -> None:
+    _DEAD_HOSTS[url] = time.time() + _DEAD_HOST_TTL
+
+
+def _live_hosts(hosts):
+    """Skip hosts that failed recently; never return an empty list."""
+    hosts = list(hosts or [])
+    live = [h for h in hosts if not _host_dead(h)]
+    return live if live else hosts
+
+
+# ── ROOT FIX (music play nahi hota) #2 — downloaded file resolution ────────
+# Purana code sirf `out_tmpl.replace("%(ext)s", ext)` se file dhoondta tha.
+# Agar outtmpl me koi bhi doosra yt-dlp field (%(id)s, %(title)s ...) hai, ya
+# postprocessor ne koi aur extension likhi hai, to path match hi nahi karta —
+# file disk par hone ke baavjood download "fail" maana jaata tha aur .play
+# chup-chaap kuch nahi bajata tha.  Ab yt-dlp ka apna reported filepath use
+# hota hai, phir template, phir glob.
+def _resolve_downloaded_file(info: dict | None, out_tmpl: str,
+                             exts=("opus", "mp3", "m4a", "webm", "ogg", "mp4", "aac")):
+    import glob as _glob
+
+    def _ok(path):
+        try:
+            return bool(path) and os.path.exists(path) and os.path.getsize(path) > 4096
+        except Exception:
+            return False
+
+    # 1) yt-dlp ka apna reported path (postprocessing ke baad wala bhi)
+    for req in (info or {}).get("requested_downloads") or []:
+        for key in ("filepath", "_filename", "filename"):
+            cand = req.get(key)
+            if _ok(cand):
+                return cand
+    cand = (info or {}).get("filepath") or (info or {}).get("_filename")
+    if _ok(cand):
+        return cand
+
+    # 2) Template + known extensions
+    for ext in exts:
+        cand = out_tmpl.replace("%(ext)s", ext)
+        if _ok(cand):
+            return cand
+
+    # 3) Glob — har yt-dlp field ko wildcard bana do
+    pattern = re.sub(r"%\([^)]+\)[a-zA-Z]", "*", out_tmpl)
+    matches = [m for m in _glob.glob(pattern) if _ok(m)]
+    if matches:
+        # sabse recent + playable extension ko prefer karo
+        matches.sort(key=lambda m: (os.path.splitext(m)[1].lstrip(".") in exts,
+                                    os.path.getmtime(m)))
+        return matches[-1]
     return None
 
-_MS_FFMPEG_BIN  = (_ms_find_bin("ffmpeg")  or
-                   os.environ.get("FFMPEG_BINARY",  "ffmpeg"))
-_MS_FFPROBE_BIN = (_ms_find_bin("ffprobe") or
-                   os.environ.get("FFPROBE_BINARY", "ffprobe"))
-_MS_FFMPEG_DIR  = (os.path.dirname(_MS_FFMPEG_BIN)
-                   if os.path.isabs(_MS_FFMPEG_BIN) else None)
 
-# Make sure the directory is in PATH for any child processes we spawn
-if _MS_FFMPEG_DIR:
-    _cur = os.environ.get("PATH", "")
-    if _MS_FFMPEG_DIR not in _cur.split(":"):
-        os.environ["PATH"] = _MS_FFMPEG_DIR + ":" + _cur
-
-# Helper — merge into any yt-dlp opts dict so yt-dlp always knows where ffmpeg is
-def _ffmpeg_opts() -> dict:
-    """Return ``{"ffmpeg_location": dir}`` if we found ffmpeg, else empty dict."""
-    return {"ffmpeg_location": _MS_FFMPEG_DIR} if _MS_FFMPEG_DIR else {}
+def _ms_find_bin(name: str) -> str | None:
+    if name == "ffmpeg":
+        return _ffsetup.FFMPEG_BIN
+    if name == "ffprobe":
+        return _ffsetup.FFPROBE_BIN
+    return _shutil.which(name)
 # ─────────────────────────────────────────────────────────────────────────────
 
 # ── YouTube cookie support via env var ───────────────────────────────────────
@@ -122,32 +208,175 @@ def _ffmpeg_opts() -> dict:
 #   4. Copy the full file content → set as YTDLP_COOKIES env var
 #
 # Leave YTDLP_COOKIES unset to keep the current no-cookie behavior.
-_YTDLP_COOKIES_ENV = os.environ.get("YTDLP_COOKIES", "").strip()
-_YTDLP_COOKIE_FILE: str | None = None   # path to temp file, set at startup
+# Env aliases: YTDLP_COOKIES (this bot) and YT_COOKIES (Melody_music naming).
+# Value may be plain Netscape text, a browser-extension JSON array, or base64
+# of either — all four shapes are accepted.
+_YTDLP_COOKIES_ENV = (
+    os.environ.get("YTDLP_COOKIES", "").strip()
+    or os.environ.get("YT_COOKIES", "").strip()
+    or os.environ.get("COOKIES", "").strip()
+)
+
+# ROOT-CAUSE FIX (log 2026-08-23: every cloud_dl rung, including web_safari
+# +cookies, dies with "Sign in to confirm you're not a bot"):
+# yt-dlp WRITES the cookie jar back to `cookiefile` on close. This bot runs
+# several yt-dlp extractions in parallel (download + prefetch + stream warm),
+# so two writers truncate/interleave the SAME cookie file. The surviving
+# first line stops being the "# Netscape HTTP Cookie File" header and the
+# refreshed __Secure-3PSID / SAPISID / LOGIN_INFO cookies get corrupted →
+# every subsequent request is anonymous → bot-gate on every rung.
+# Fix (from Melody_music): keep the normalized cookie text in MEMORY as the
+# single source of truth and hand every yt-dlp run its OWN throwaway copy.
+_YTDLP_COOKIE_TEXT: str = ""
+_YTDLP_COOKIE_DIR = "/tmp/yt_cookies_runs"
+_YTDLP_COOKIE_LOCK = threading.Lock()
+_YTDLP_COOKIE_TTL_SECONDS = 900
+
+
+def _normalize_cookie_text(raw: str) -> str:
+    """Return a clean Netscape cookie file body, or '' if nothing usable."""
+    # Heroku Config Var CLI paste bug: literal \n / \t instead of real ones.
+    content = raw.replace("\\n", "\n").replace("\\t", "\t")
+    lines_out: list[str] = ["# Netscape HTTP Cookie File", ""]
+    for line in content.splitlines():
+        stripped = line.rstrip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        if "\t" not in stripped:
+            parts = stripped.split()
+            if len(parts) == 7:
+                stripped = "\t".join(parts)
+        if stripped.count("\t") == 6:
+            lines_out.append(stripped)
+    if len(lines_out) <= 2:
+        return ""
+    return "\n".join(lines_out) + "\n"
+
+
+def _cookies_json_to_netscape(raw: str) -> str:
+    """Convert a browser-extension JSON cookie array to Netscape text."""
+    try:
+        import json as _json
+        data = _json.loads(raw)
+    except Exception:
+        return ""
+    if not isinstance(data, list):
+        return ""
+    out = ["# Netscape HTTP Cookie File", ""]
+    for c in data:
+        if not isinstance(c, dict) or not c.get("name"):
+            continue
+        domain = str(c.get("domain") or "")
+        if not domain:
+            continue
+        flag = "TRUE" if domain.startswith(".") else "FALSE"
+        path = str(c.get("path") or "/")
+        secure = "TRUE" if c.get("secure") else "FALSE"
+        exp = c.get("expirationDate") or c.get("expires") or 0
+        try:
+            exp = str(int(float(exp)))
+        except Exception:
+            exp = "0"
+        out.append("\t".join([domain, flag, path, secure, exp,
+                              str(c["name"]), str(c.get("value", ""))]))
+    return ("\n".join(out) + "\n") if len(out) > 2 else ""
+
+
+def _decode_cookie_env(raw: str) -> str:
+    """Accept Netscape text, JSON array, or base64 of either."""
+    raw = (raw or "").strip()
+    if not raw:
+        return ""
+    if raw.lstrip().startswith("["):
+        got = _cookies_json_to_netscape(raw)
+        if got:
+            return got
+    got = _normalize_cookie_text(raw)
+    if got:
+        return got
+    # base64 (Heroku-friendly single-line paste)
+    try:
+        import base64 as _b64
+        decoded = _b64.b64decode(raw + "=" * (-len(raw) % 4), validate=False)
+        text = decoded.decode("utf-8", "strict")
+    except Exception:
+        return ""
+    if text.lstrip().startswith("["):
+        got = _cookies_json_to_netscape(text)
+        if got:
+            return got
+    return _normalize_cookie_text(text)
+
 
 def _init_yt_cookies():
-    """Write YTDLP_COOKIES env var content to a temp file if set."""
-    global _YTDLP_COOKIE_FILE
+    global _YTDLP_COOKIE_TEXT
     if not _YTDLP_COOKIES_ENV:
         return
-    import tempfile
-    try:
-        fd, path = tempfile.mkstemp(suffix=".txt", prefix="yt_cookies_")
-        with os.fdopen(fd, "w", encoding="utf-8") as f:
-            # Ensure the Netscape header is present
-            content = _YTDLP_COOKIES_ENV
-            if not content.startswith("# Netscape HTTP Cookie File"):
-                content = "# Netscape HTTP Cookie File\n" + content
-            f.write(content)
-        _YTDLP_COOKIE_FILE = path
-    except Exception:
-        _YTDLP_COOKIE_FILE = None
+    _YTDLP_COOKIE_TEXT = _decode_cookie_env(_YTDLP_COOKIES_ENV)
 
-_init_yt_cookies()   # run once at import time
+
+_init_yt_cookies()
+
+
+def _reap_cookie_copies() -> None:
+    cutoff = time.time() - _YTDLP_COOKIE_TTL_SECONDS
+    try:
+        for name in os.listdir(_YTDLP_COOKIE_DIR):
+            path = os.path.join(_YTDLP_COOKIE_DIR, name)
+            try:
+                if os.path.getmtime(path) < cutoff:
+                    os.remove(path)
+            except OSError:
+                pass
+    except OSError:
+        pass
+
+
+def cookiefile_for_run() -> "str | None":
+    """Fresh private copy of the cookie jar for one yt-dlp run (or None).
+
+    Never returns the master path — yt-dlp may write back to it and corrupt
+    the jar for every concurrent extraction.
+    """
+    if not _YTDLP_COOKIE_TEXT:
+        return None
+    with _YTDLP_COOKIE_LOCK:
+        try:
+            os.makedirs(_YTDLP_COOKIE_DIR, exist_ok=True)
+            _reap_cookie_copies()
+            path = os.path.join(
+                _YTDLP_COOKIE_DIR,
+                f"c_{os.getpid()}_{threading.get_ident()}_{time.time_ns()}.txt",
+            )
+            tmp = path + ".tmp"
+            with open(tmp, "w", encoding="utf-8", newline="\n") as f:
+                f.write(_YTDLP_COOKIE_TEXT)
+            os.replace(tmp, path)
+            return path
+        except OSError:
+            return None
+
+
+# Back-compat shim: any caller that still reads _YTDLP_COOKIE_FILE gets a
+# fresh private copy (never the master).
+class _CookieFileProxy:
+    def __bool__(self) -> bool:
+        return bool(_YTDLP_COOKIE_TEXT)
+
+    def __str__(self) -> str:
+        return cookiefile_for_run() or ""
+
+    def __fspath__(self) -> str:
+        return cookiefile_for_run() or ""
+
+
+_YTDLP_COOKIE_FILE = _CookieFileProxy() if _YTDLP_COOKIE_TEXT else None
+
 
 def _cookie_opts() -> dict:
-    """Return ``{"cookiefile": path}`` if cookies are configured, else empty dict."""
-    return {"cookiefile": _YTDLP_COOKIE_FILE} if _YTDLP_COOKIE_FILE else {}
+    """Return ``{"cookiefile": path}`` with a fresh per-run copy, or empty."""
+    p = cookiefile_for_run()
+    return {"cookiefile": p} if p else {}
 # ─────────────────────────────────────────────────────────────────────────────
 
 try:
@@ -159,6 +388,32 @@ try:
     import yt_dlp
 except ImportError:
     yt_dlp = None
+
+# ── Residential/rotating proxy support (YT_PROXY) ────────────────────────────
+# Heroku/cloud IPs are permanently flagged by YouTube ("Sign in to confirm
+# you're not a bot") on EVERY InnerTube client — android, web_safari, tv,
+# default, web_embedded, tv_simply all fail from the same datacenter IP even
+# with a valid PO-token. The only two real cures are (a) logged-in cookies and
+# (b) routing yt-dlp through a non-datacenter proxy. Melody_music exposes both;
+# this bot only had cookies, so we add YT_PROXY here and apply it to EVERY
+# yt-dlp instance (no matter which of the ~15 call sites builds the opts dict).
+_YT_PROXY = (
+    os.environ.get("YT_PROXY", "").strip()
+    or os.environ.get("YTDLP_PROXY", "").strip()
+    or os.environ.get("HTTP_PROXY_YT", "").strip()
+)
+
+if yt_dlp is not None and _YT_PROXY:
+    _OrigYoutubeDL = yt_dlp.YoutubeDL
+
+    class _ProxiedYoutubeDL(_OrigYoutubeDL):  # type: ignore[misc]
+        def __init__(self, params=None, *a, **kw):
+            params = dict(params or {})
+            if not params.get("proxy"):
+                params["proxy"] = _YT_PROXY
+            super().__init__(params, *a, **kw)
+
+    yt_dlp.YoutubeDL = _ProxiedYoutubeDL  # type: ignore[assignment]
 
 try:
     import aiohttp as _aiohttp
@@ -175,6 +430,247 @@ async def _make_aiohttp_session():
     connector = _aiohttp.TCPConnector(ssl=False)
     async with _aiohttp.ClientSession(connector=connector) as sess:
         yield sess
+
+
+# ── YouTube Data API v3 fast search (env: YOUTUBE_API_KEY) ──────────────
+#
+# Bina API key ke query→video resolve karne ke liye yt-dlp ko "ytsearch1:"
+# scrape karni padti hai (ya Piped/Invidious mirrors, jo aksar dead hote hain)
+# — ye 5-40s kha jaata hai. Ek YouTube Data API v3 key hone par search
+# official endpoint se ~200-400ms me resolve ho jaati hai, aur download
+# seedha watch?v=<id> par chalta hai (direct-URL path = sabse fast).
+#
+# Env:
+#   YOUTUBE_API_KEY  (alias: YT_API_KEY / YOUTUBE_API_KEYS)
+#   Comma/space se multiple keys de sakte ho — quota khatam hone par
+#   agli key par apne aap rotate ho jaata hai.
+_YT_API_KEYS: list[str] = [
+    k.strip() for k in re.split(
+        r"[,\s]+",
+        (os.environ.get("YOUTUBE_API_KEY")
+         or os.environ.get("YOUTUBE_API_KEYS")
+         or os.environ.get("YT_API_KEY")
+         or ""),
+    ) if k.strip()
+]
+_YT_API_DEAD: dict[str, float] = {}     # key → cooldown expiry (quota/403)
+_YT_API_CACHE: dict[str, tuple[float, dict]] = {}   # query → (ts, result)
+_YT_API_CACHE_TTL = 3600.0
+
+
+def yt_api_enabled() -> bool:
+    return bool(_YT_API_KEYS)
+
+
+def _yt_api_live_keys() -> list[str]:
+    now = time.time()
+    return [k for k in _YT_API_KEYS if _YT_API_DEAD.get(k, 0) < now]
+
+
+async def yt_api_search(query: str, logger=None, video: bool = False) -> dict | None:
+    """Resolve a search query to a YouTube video via the Data API v3.
+
+    Returns ``{"video_id", "url", "title", "channel", "duration"}`` or None.
+    Never raises — har failure par None, taki purana ladder chalta rahe.
+    """
+    logger = logger or (lambda *a: None)
+    q = (query or "").strip()
+    if not q or not _yt_api_live_keys() or _aiohttp is None:
+        return None
+
+    ck = ("v::" if video else "a::") + q.lower()
+    hit = _YT_API_CACHE.get(ck)
+    if hit and (time.time() - hit[0]) < _YT_API_CACHE_TTL:
+        return hit[1]
+
+    params = {
+        "part": "snippet",
+        "q": q,
+        "type": "video",
+        "maxResults": "5",
+        "videoEmbeddable": "true",
+        "safeSearch": "none",
+    }
+    if not video:
+        # Music category → covers/lyric-video noise kam, sahi gaana upar aata hai.
+        params["videoCategoryId"] = "10"
+
+    timeout = _aiohttp.ClientTimeout(total=8)
+    for key in _yt_api_live_keys():
+        try:
+            async with _make_aiohttp_session() as sess:
+                async with sess.get(
+                    "https://www.googleapis.com/youtube/v3/search",
+                    params={**params, "key": key}, timeout=timeout,
+                ) as resp:
+                    if resp.status == 200:
+                        data = await resp.json()
+                    else:
+                        body = ""
+                        with contextlib.suppress(Exception):
+                            body = (await resp.text())[:300]
+                        low = body.lower()
+                        # Retire the key ONLY when Google actually says it is
+                        # dead (quotaExceeded / keyInvalid / API key not valid
+                        # / accessNotConfigured). Transient HTTP 400s (bad
+                        # param, region block, hiccup) must NOT nuke the key
+                        # — Melody bot ka same fix; warna ek transient 400
+                        # saari keys 1 ghante ke liye cooldown me daal deta
+                        # tha aur music bajna hi band ho jaata tha.
+                        fatal = (
+                            "quota" in low
+                            or "keyinvalid" in low
+                            or "api key not valid" in low
+                            or "accessnotconfigured" in low
+                            or "api_key_invalid" in low
+                            or "keyexpired" in low
+                        )
+                        if resp.status == 429 or (resp.status in (400, 403) and fatal):
+                            _YT_API_DEAD[key] = time.time() + (
+                                300 if resp.status == 429 else 3600
+                            )
+                            logger("MUSIC_YT_API",
+                                   f"key retired (HTTP {resp.status}): {body[:120]}")
+                        else:
+                            logger("MUSIC_YT_API",
+                                   f"transient HTTP {resp.status} (key kept): {body[:120]}")
+                        continue
+
+            items = [i for i in (data.get("items") or [])
+                     if (i.get("id") or {}).get("videoId")]
+            if not items:
+                return None
+            top = items[0]
+            vid = top["id"]["videoId"]
+            snip = top.get("snippet") or {}
+            out = {
+                "video_id": vid,
+                "url":      f"https://www.youtube.com/watch?v={vid}",
+                "title":    snip.get("title") or q,
+                "channel":  snip.get("channelTitle") or "",
+                "duration": 0,
+                "alt_ids":  [i["id"]["videoId"] for i in items[1:4]],
+            }
+
+            # Duration ek extra videos.list call se (1 quota unit, sasta).
+            with contextlib.suppress(Exception):
+                async with _make_aiohttp_session() as sess:
+                    async with sess.get(
+                        "https://www.googleapis.com/youtube/v3/videos",
+                        params={"part": "contentDetails", "id": vid, "key": key},
+                        timeout=timeout,
+                    ) as r2:
+                        if r2.status == 200:
+                            vd = await r2.json()
+                            iso = (((vd.get("items") or [{}])[0].get("contentDetails")
+                                    or {}).get("duration") or "")
+                            m = re.match(
+                                r"P(?:(\d+)D)?T(?:(\d+)H)?(?:(\d+)M)?(?:(\d+)S)?", iso)
+                            if m:
+                                d, h, mi, se = (int(x or 0) for x in m.groups())
+                                out["duration"] = d * 86400 + h * 3600 + mi * 60 + se
+
+            _YT_API_CACHE[ck] = (time.time(), out)
+            logger("MUSIC_YT_API", f"⚡ {out['title'][:50]!r} → {vid}")
+            return out
+        except Exception:
+            continue
+    return None
+
+
+# ── InnerTube fast search (no API key, no quota) ────────────────────────
+# Data API v3 ki quota khatam ho jaaye (HTTP 429) to search 4s+ le leti thi
+# kyunki yt-dlp ko `ytsearch1:` scrape karna padta tha. YouTube ka apna
+# InnerTube endpoint bina key ke ~200-400ms me videoId de deta hai, aur
+# phir direct watch?v=<id> extract hota hai — yahi sub-5s playback ki key
+# hai. Failure par None, purana rasta chalta rehta hai.
+_YT_IT_CACHE: dict[str, tuple[float, dict]] = {}
+_YT_IT_CACHE_TTL = 1800.0
+_YT_IT_KEY = "AIzaSyA8eiZmM1FaDVjRy-df2KTyQ_vz_yYM39w"  # public InnerTube web key
+
+
+def _yt_it_walk_video(node, out: list):
+    """Collect {videoId,title,duration} dicts from an InnerTube JSON tree."""
+    if isinstance(node, dict):
+        vr = node.get("videoRenderer") or node.get("compactVideoRenderer")
+        if isinstance(vr, dict) and vr.get("videoId"):
+            title = ""
+            with contextlib.suppress(Exception):
+                t = vr.get("title") or {}
+                title = (t.get("simpleText")
+                         or "".join(r.get("text", "") for r in (t.get("runs") or [])))
+            secs = 0
+            with contextlib.suppress(Exception):
+                txt = ((vr.get("lengthText") or {}).get("simpleText") or "")
+                parts = [int(p) for p in txt.split(":") if p.strip().isdigit()]
+                for p in parts:
+                    secs = secs * 60 + p
+            badges = json.dumps(vr.get("badges") or []).lower()
+            out.append({"video_id": vr["videoId"], "title": title or "",
+                        "duration": secs, "live": "live" in badges or secs == 0})
+        for v in node.values():
+            _yt_it_walk_video(v, out)
+    elif isinstance(node, list):
+        for v in node:
+            _yt_it_walk_video(v, out)
+
+
+async def youtube_innertube_search(query: str, logger=None) -> dict | None:
+    """Key-free YouTube search via InnerTube. Returns same shape as
+    yt_api_search() — {"video_id","url","title","duration","alt_ids"} or None."""
+    logger = logger or (lambda *a: None)
+    q = (query or "").strip()
+    if not q or _aiohttp is None or q.startswith(("http://", "https://")):
+        return None
+    ck = q.lower()
+    hit = _YT_IT_CACHE.get(ck)
+    if hit and (time.time() - hit[0]) < _YT_IT_CACHE_TTL:
+        return hit[1]
+    payload = {
+        "context": {"client": {"clientName": "WEB", "clientVersion": "2.20240101.00",
+                               "hl": "en", "gl": "IN"}},
+        "query": q,
+        "params": "EgIQAQ%3D%3D",   # filter: videos only
+    }
+    try:
+        timeout = _aiohttp.ClientTimeout(total=float(
+            os.environ.get("MUSIC_INNERTUBE_TIMEOUT", "2.5")))
+        async with _make_aiohttp_session() as sess:
+            async with sess.post(
+                f"https://www.youtube.com/youtubei/v1/search?key={_YT_IT_KEY}"
+                "&prettyPrint=false",
+                json=payload, timeout=timeout,
+                headers={"Content-Type": "application/json",
+                         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"},
+            ) as resp:
+                if resp.status != 200:
+                    logger("MUSIC_YT_IT", f"HTTP {resp.status}")
+                    return None
+                data = await resp.json(content_type=None)
+    except Exception as exc:
+        logger("MUSIC_YT_IT", f"miss: {exc!r}")
+        return None
+    found: list = []
+    _yt_it_walk_video(data, found)
+    # Live streams / 0-duration entries ko peeche daal do — gaana chahiye.
+    ranked = [v for v in found if not v["live"]] or found
+    if not ranked:
+        return None
+    top = ranked[0]
+    out = {
+        "video_id": top["video_id"],
+        "url": f"https://www.youtube.com/watch?v={top['video_id']}",
+        "title": top["title"] or q,
+        "channel": "",
+        "duration": top["duration"],
+        "alt_ids": [v["video_id"] for v in ranked[1:4]],
+    }
+    _YT_IT_CACHE[ck] = (time.time(), out)
+    logger("MUSIC_YT_IT", f"⚡ {out['title'][:50]!r} → {out['video_id']}")
+    return out
+
+
+
 
 
 # ── Query / title normalization ─────────────────────────────────────────
@@ -334,7 +830,13 @@ async def download_direct_media(url: str, out_tmpl: str, logger=None):
             "-b:a", "320k", mp3_path,
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
         )
-        await asyncio.wait_for(proc.wait(), timeout=120)
+        try:
+            await asyncio.wait_for(proc.wait(), timeout=120)
+        except asyncio.TimeoutError:
+            proc.kill()
+            await proc.wait()
+            logger("MUSIC_DL_ERR", f"Direct media ffmpeg timed out: {url[:80]}")
+            return None
         if proc.returncode != 0 or not os.path.exists(mp3_path):
             return None
         title = os.path.basename(url.split("?")[0]) or "Direct Stream"
@@ -352,7 +854,12 @@ async def _probe_duration(path: str) -> int:
             "-of", "default=noprint_wrappers=1:nokey=1", path,
             stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
         )
-        out, _ = await asyncio.wait_for(proc.communicate(), timeout=20)
+        try:
+            out, _ = await asyncio.wait_for(proc.communicate(), timeout=20)
+        except asyncio.TimeoutError:
+            proc.kill()
+            await proc.wait()
+            return 0
         return int(float(out.decode().strip() or 0))
     except Exception:
         return 0
@@ -492,11 +999,9 @@ async def soundcloud_search_download(query: str, out_tmpl: str, ydl_common: dict
         def _ydl_fallback():
             opts = {
                 **ydl_common,
-                **_ffmpeg_opts(),
                 "format": "bestaudio/best",
                 "outtmpl": out_tmpl,
-                "postprocessors": [{"key": "FFmpegExtractAudio",
-                                    "preferredcodec": "mp3", "preferredquality": "192"}],
+                **_audio_pp("mp3", "192"),
             }
             opts.pop("cookiefile", None)
             try:
@@ -662,7 +1167,11 @@ async def audius_search_download(query: str, out_tmpl: str, logger=None):
             mp3_path,
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
         )
-        await asyncio.wait_for(proc.wait(), timeout=120)
+        try:
+            await asyncio.wait_for(proc.wait(), timeout=120)
+        except asyncio.TimeoutError:
+            proc.kill()
+            await proc.wait()
         try:
             os.remove(raw_file)
         except Exception:
@@ -756,7 +1265,11 @@ async def archive_org_search_download(query: str, out_tmpl: str, logger=None):
             "-b:a", "320k", mp3_path,
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
         )
-        await proc.wait()
+        try:
+            await asyncio.wait_for(proc.wait(), timeout=120)
+        except asyncio.TimeoutError:
+            proc.kill()
+            await proc.wait()
         try:
             os.remove(raw_path)
         except Exception:
@@ -853,7 +1366,11 @@ async def archive_org_video_search_download(query: str, out_tmpl: str, logger=No
                 "-b:a", "192k", mp4_path,
                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
             )
-            await proc.wait()
+            try:
+                await asyncio.wait_for(proc.wait(), timeout=180)
+            except asyncio.TimeoutError:
+                proc.kill()
+                await proc.wait()
             try:
                 os.remove(raw_path)
             except Exception:
@@ -971,11 +1488,7 @@ async def bandcamp_search_download(query: str, out_tmpl: str, logger=None):
             "format": "bestaudio/best",
             "outtmpl": out_tmpl,
             "noplaylist": True,
-            "postprocessors": [{
-                "key": "FFmpegExtractAudio",
-                "preferredcodec": "mp3",
-                "preferredquality": "320",
-            }],
+            **_audio_pp("mp3", "320"),
         }
         with yt_dlp.YoutubeDL(opts) as ydl:
             info = ydl.extract_info(url, download=True)
@@ -1047,11 +1560,7 @@ async def mixcloud_search_download(query: str, out_tmpl: str, logger=None):
             "format": "bestaudio/best",
             "outtmpl": out_tmpl,
             "noplaylist": True,
-            "postprocessors": [{
-                "key": "FFmpegExtractAudio",
-                "preferredcodec": "mp3",
-                "preferredquality": "320",
-            }],
+            **_audio_pp("mp3", "320"),
         }
         with yt_dlp.YoutubeDL(opts) as ydl:
             return ydl.extract_info(url, download=True)
@@ -1150,7 +1659,11 @@ async def wikimedia_commons_search_download(query: str, out_tmpl: str, logger=No
             "-b:a", "320k", mp3_path,
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
         )
-        await proc.wait()
+        try:
+            await asyncio.wait_for(proc.wait(), timeout=120)
+        except asyncio.TimeoutError:
+            proc.kill()
+            await proc.wait()
         try:
             os.remove(raw_path)
         except Exception:
@@ -1223,7 +1736,11 @@ async def openverse_search_download(query: str, out_tmpl: str, logger=None):
             "-b:a", "320k", mp3_path,
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
         )
-        await proc.wait()
+        try:
+            await asyncio.wait_for(proc.wait(), timeout=120)
+        except asyncio.TimeoutError:
+            proc.kill()
+            await proc.wait()
         try:
             os.remove(raw_path)
         except Exception:
@@ -1298,7 +1815,11 @@ async def hearthis_search_download(query: str, out_tmpl: str, logger=None):
             "-b:a", "320k", mp3_path,
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
         )
-        await proc.wait()
+        try:
+            await asyncio.wait_for(proc.wait(), timeout=120)
+        except asyncio.TimeoutError:
+            proc.kill()
+            await proc.wait()
         try:
             os.remove(raw_path)
         except Exception:
@@ -1390,7 +1911,11 @@ async def ccmixter_search_download(query: str, out_tmpl: str, logger=None):
             "-b:a", "320k", mp3_path,
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
         )
-        await proc.wait()
+        try:
+            await asyncio.wait_for(proc.wait(), timeout=120)
+        except asyncio.TimeoutError:
+            proc.kill()
+            await proc.wait()
         try:
             os.remove(raw_path)
         except Exception:
@@ -1597,11 +2122,7 @@ async def generic_yt_dlp_url_download(url: str, out_tmpl: str, ydl_common: dict,
             opts["merge_output_format"] = "mp4"
         else:
             opts["format"] = "bestaudio/best"
-            opts["postprocessors"] = [{
-                "key": "FFmpegExtractAudio",
-                "preferredcodec": "mp3",
-                "preferredquality": "320",
-            }]
+            opts.update(_audio_pp("mp3", "320"))
         with yt_dlp.YoutubeDL(opts) as ydl:
             info = ydl.extract_info(url, download=True)
             if isinstance(info, dict) and "entries" in info:
@@ -1798,7 +2319,12 @@ async def jiosaavn_search_download(query: str, out_tmpl: str, logger=None):
             "-vn", "-ar", "44100", "-ac", "2", "-b:a", "320k", mp3_path,
             stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL,
         )
-        await proc.wait()
+        try:
+            await asyncio.wait_for(proc.wait(), timeout=120)
+        except asyncio.TimeoutError:
+            proc.kill()
+            with contextlib.suppress(Exception):
+                await proc.wait()
         with contextlib.suppress(Exception):
             os.remove(raw_path)
         if not os.path.exists(mp3_path):
@@ -2410,7 +2936,7 @@ async def zero_disk_piped_lookup(query: str, logger=None, allow_live: bool = Fal
         return None
     _timeout = _aiohttp.ClientTimeout(total=12)
     _hdrs    = {"User-Agent": random_ua()}
-    for api in await _get_piped_apis():
+    for api in _live_hosts(await _get_piped_apis()):
         try:
             video_id = title = None
             duration, thumbnail = 0, None
@@ -2462,6 +2988,7 @@ async def zero_disk_piped_lookup(query: str, logger=None, allow_live: bool = Fal
                     "duration": int(sd.get("duration") or duration),
                     "thumbnail": sd.get("thumbnailUrl") or thumbnail, "source": "piped"}
         except Exception as exc:
+            _mark_host_dead(api)
             logger("MUSIC_DL_ERR", f"zero_disk_piped [{api}]: {exc}")
             continue
     return None
@@ -2476,7 +3003,7 @@ async def zero_disk_invidious_lookup(query: str, logger=None, allow_live: bool =
     if _aiohttp is None:
         return None
     _timeout = _aiohttp.ClientTimeout(total=10)
-    for instance in _INVIDIOUS:
+    for instance in _live_hosts(_INVIDIOUS):
         try:
             _hdrs = {"User-Agent": random_ua()}
             async with _make_aiohttp_session() as sess:
@@ -2517,6 +3044,7 @@ async def zero_disk_invidious_lookup(query: str, logger=None, allow_live: bool =
                     "duration": int(vdata.get("lengthSeconds") or 0),
                     "thumbnail": None, "source": "youtube"}
         except Exception as exc:
+            _mark_host_dead(instance)
             logger("MUSIC_DL_ERR", f"zero_disk_invidious [{instance}]: {exc}")
             continue
     return None
@@ -2535,7 +3063,7 @@ async def zero_disk_jiosaavn_lookup(query: str, logger=None, allow_live: bool = 
         for host in _JIOSAAVN_API_HOSTS:
             try:
                 resp = requests.get(f"{host}/search/songs", params={"query": query, "limit": 3},
-                                     headers={"User-Agent": random_ua()}, timeout=10)
+                                     headers={"User-Agent": random_ua()}, timeout=3)
                 if resp.status_code in (429, 403):
                     logger("MUSIC_DL_ERR", f"JioSaavn host {host} blocked ({resp.status_code})")
                     continue
@@ -2662,9 +3190,22 @@ async def zero_disk_soundcloud_lookup(query: str, logger=None, allow_live: bool 
 # ── Fast direct-stream resolver ─────────────────────────────────────────────
 # Resolve a playable CDN URL without downloading the whole track.  This is
 # deliberately bounded: a bad YouTube client must never hold .play hostage.
-_DIRECT_STREAM_CLIENTS = ["web_safari", "web", "android"]
+# SPEED FIX (.play must sing within 5s): "web"/"web_safari" clients force
+# yt-dlp to download and execute YouTube's player JS (nsig/sig solving) which
+# alone costs 5-15s on a Heroku dyno — that is exactly why MUSIC_DIRECT_FAST
+# kept timing out and every .play fell back to the 20s disk download.
+# android_vr / ios / android need no JS at all and answer in ~1-2s.
+_DIRECT_STREAM_CLIENTS = [
+    c.strip() for c in os.environ.get(
+        "MUSIC_DIRECT_CLIENTS", "android_vr,ios,android,tv,web_safari").split(",")
+    if c.strip()
+]
 _DIRECT_STREAM_RETRIES = 1
-_DIRECT_STREAM_TIMEOUT = 4.2
+try:
+    _DIRECT_STREAM_TIMEOUT = max(1.5, float(
+        os.environ.get("MUSIC_DIRECT_CLIENT_TIMEOUT", "4.0")))
+except (TypeError, ValueError):
+    _DIRECT_STREAM_TIMEOUT = 4.0
 _MUSIC_DOWNLOAD_LOCK = asyncio.Lock()
 
 
@@ -2735,28 +3276,112 @@ async def _direct_stream_is_live(url: str) -> bool:
     except Exception:
         return False
 
-async def _direct_stream_is_playable(url: str) -> bool:
-    """Validate that FFmpeg can decode real audio before PyTgCalls sees it."""
-    if not url or not await _direct_stream_is_live(url):
-        return False
+# ── ROOT FIX: "ProcessLookupError() → gaana bajta hi nahi" ────────────
+# PyTgCalls (pytgcalls/ffmpeg.py check_stream) FIRST runs `ffprobe ... -of json`
+# on whatever source we hand it. Agar ffprobe fail hota hai (403 CDN, HTML
+# error page, encrypted/DRM stream, unsupported container) to uska stdout
+# KHAALI aata hai → json.loads("") → JSONDecodeError → library `ffprobe.kill()`
+# call karti hai → process already dead → asyncio bare `ProcessLookupError()`
+# raise karta hai, jo asli error ko poori tarah CHHUPA deta hai.
+# Isi liye log me sirf ProcessLookupError dikhta tha aur PyTgCalls rebuild
+# karne se kabhi fix nahi hota tha (galti stream URL me thi, process me nahi).
+# Fix: hum WAHI ffprobe khud pehle chalate hain — jo URL ffprobe se paas nahi
+# hota wo PyTgCalls tak pahunchta hi nahi, aur asli reason log hota hai.
+# Shared single source of truth for the FFmpeg input flags used on remote
+# HTTP/CDN streams. main.py imports this so our probe gate and PyTgCalls'
+# internal probe can never drift apart again.
+# probesize/analyzeduration jaan-boojh kar 1M/1.5s rakhe hain: 5M par ffprobe
+# 5 MB tak data kheech leta tha (kai second) — 5-second play budget ka sabse
+# bada hissa wahi kha jaata tha.
+HTTP_STREAM_FFMPEG_FLAGS = (
+    "-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5 "
+    "-probesize 1000000 -analyzeduration 1500000"
+)
+LOCAL_FILE_FFMPEG_FLAGS = "-probesize 5000000 -analyzeduration 5000000"
+
+FFPROBE_GATE_TIMEOUT = float(os.environ.get("MUSIC_PROBE_TIMEOUT", "2.5") or 2.5)
+
+# CDN hosts whose URLs never need the extra local ffprobe gate (see
+# _direct_stream_is_playable) — skipping it is worth ~1-3s per .play.
+_TRUSTED_STREAM_HOSTS = (
+    "googlevideo.com", "saavncdn.com", "aac.saavncdn.com",
+    "sndcdn.com", "jiosaavn.com", "youtube.com",
+)
+
+
+async def ffprobe_stream_ok(source: str, ffmpeg_parameters: str = "",
+                            timeout: float | None = None,
+                            logger=None) -> tuple[bool, str]:
+    """Run PyTgCalls' own ffprobe check up-front.
+
+    Returns (ok, reason). ok=True means PyTgCalls' check_stream() will parse
+    valid JSON with at least one audio stream, so play() cannot die with the
+    masked ProcessLookupError anymore.
+    """
+    logger = logger or (lambda *a: None)
+    if not source:
+        return False, "empty source"
+    probe = _ms_find_bin("ffprobe") or "ffprobe"
+    cmd = [probe]
+    if ffmpeg_parameters:
+        try:
+            cmd += shlex.split(ffmpeg_parameters)
+        except Exception:
+            pass
+    cmd += ["-v", "error", "-show_entries",
+            "stream=codec_type,codec_name", "-show_format", "-of", "json",
+            "-i", source]
     proc = None
     try:
         proc = await asyncio.create_subprocess_exec(
-            "ffmpeg", "-nostdin", "-v", "error", "-t", "0.35",
-            "-i", url, "-map", "0:a:0?", "-f", "null", "-",
-            stdout=asyncio.subprocess.DEVNULL,
+            *cmd,
+            stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )
-        await asyncio.wait_for(proc.communicate(), timeout=2.2)
-        return proc.returncode == 0
-    except Exception:
+        stdout, stderr = await asyncio.wait_for(
+            proc.communicate(), timeout=timeout or FFPROBE_GATE_TIMEOUT)
+    except asyncio.TimeoutError:
         if proc is not None:
             try:
                 proc.kill()
                 await proc.wait()
-            except Exception:
+            except Exception:      # includes ProcessLookupError (already dead)
                 pass
+        # A timeout means "slow CDN", NOT "undecodable". Rejecting here would
+        # throw away perfectly playable streams, so we let it through and only
+        # note it — PyTgCalls' own probe has a much longer (20s) budget.
+        return True, "ffprobe slow (allowed through)"
+    except FileNotFoundError:
+        return False, "ffprobe not installed"
+    except Exception as exc:
+        return False, f"ffprobe spawn failed: {exc!r}"
+    try:
+        data = json.loads((stdout or b"").decode("utf-8", "replace") or "{}")
+    except Exception:
+        err = (stderr or b"").decode("utf-8", "replace").strip().splitlines()
+        return False, f"ffprobe gave no JSON: {(err[-1] if err else 'unknown')[:120]}"
+    streams = data.get("streams") or []
+    if not any((s or {}).get("codec_type") == "audio" for s in streams):
+        err = (stderr or b"").decode("utf-8", "replace").strip().splitlines()
+        return False, f"no audio stream: {(err[-1] if err else 'none')[:120]}"
+    return True, "ok"
+
+
+async def _direct_stream_is_playable(url: str, ffmpeg_parameters: str = "",
+                                     logger=None) -> bool:
+    """Validate that FFmpeg/ffprobe can really decode audio before PyTgCalls
+    sees the URL. Cheap HTTP preflight first, then the exact ffprobe gate."""
+    if not url or not await _direct_stream_is_live(url):
         return False
+    # SPEED FIX: these CDNs only ever serve real, decodable media. Running a
+    # second ffprobe on them burned 1-3s of the 5-second play budget for
+    # nothing. HTTP liveness above is enough; PyTgCalls probes again anyway.
+    if any(h in url for h in _TRUSTED_STREAM_HOSTS):
+        return True
+    ok, reason = await ffprobe_stream_ok(url, ffmpeg_parameters, logger=logger)
+    if not ok and logger:
+        logger("MUSIC_PROBE_REJECT", f"{reason} | {url[:90]}")
+    return ok
 
 async def youtube_direct_stream(query: str, logger=None) -> dict | None:
     """Resolve a fresh audio CDN URL with real bounded retries.
@@ -2788,7 +3413,11 @@ async def youtube_direct_stream(query: str, logger=None) -> dict | None:
             for task in asyncio.as_completed(tasks):
                 result = await task
                 if (result and result.get("stream_url")
-                        and await _direct_stream_is_playable(result["stream_url"])):
+                        and await _direct_stream_is_playable(
+                            result["stream_url"], HTTP_STREAM_FFMPEG_FLAGS, logger)):
+                    # The exact URL already passed the ffprobe gate here.  The
+                    # outer multi-provider race must not probe it a second time.
+                    result["probe_verified"] = True
                     logger("MUSIC_DIRECT",
                            f"direct audio ready on retry {attempt}: {result.get('title','')[:60]}")
                     return result
@@ -2803,7 +3432,8 @@ async def youtube_direct_stream(query: str, logger=None) -> dict | None:
            f"direct audio unavailable after {_DIRECT_STREAM_RETRIES} retries: {query[:80]}")
     return None
 
-async def resolve_zero_disk_stream(query: str, logger=None, allow_live: bool = False) -> dict | None:
+async def resolve_zero_disk_stream(query: str, logger=None, allow_live: bool = False,
+                                   youtube_target: str | None = None) -> dict | None:
     """Jugad #1/#2/#4/#5/#6/#10 orchestrator: try to get a directly-playable
     remote URL (no local file at all) before ever falling back to disk-based
     downloads.
@@ -2826,20 +3456,42 @@ async def resolve_zero_disk_stream(query: str, logger=None, allow_live: bool = F
 
     async def _safe(fn):
         try:
-            return await fn(query, logger=logger, allow_live=allow_live)
+            result = await fn(query, logger=logger, allow_live=allow_live)
+            url = (result or {}).get("stream_url") if result else None
+            # Every provider must pass the same cheap HTTP preflight. This
+            # prevents a dead CDN URL from reaching PyTgCalls and gives the
+            # caller a real fallback within the ten-second budget.
+            # ROOT FIX: pehle sirf HTTP liveness check hota tha — ek 200 OK
+            # magar undecodable/DRM/HTML stream jeet jaata tha aur PyTgCalls
+            # ke andar masked ProcessLookupError deta tha. Ab har provider ko
+            # wahi ffprobe gate paas karna padta hai jo PyTgCalls chalata hai.
+            if result and url and (result.get("probe_verified") or
+                    await _direct_stream_is_playable(
+                    url, HTTP_STREAM_FFMPEG_FLAGS, logger)):
+                result["probe_verified"] = True
+                return result
+            return None
         except Exception as exc:
             logger("MUSIC_DL_ERR", f"resolve_zero_disk_stream/{fn.__name__}: {exc}")
             return None
+    async def _youtube_direct(q, logger=None, allow_live=False):
+        # Data API v3 already resolved query -> video ID in the caller. Feeding
+        # that exact watch URL to yt-dlp avoids a second ytsearch scrape, which
+        # was the 4.2s timeout seen before every successful disk download.
+        return await youtube_direct_stream(youtube_target or q, logger=logger)
 
-    # Only Piped zero-disk — YouTube (with cookies) is the primary source.
-    tasks = {
+    # Race independent zero-disk CDNs. The first valid URL wins; a slow or
+    # dead mirror cannot block the other providers from starting immediately.
+    direct_tasks = {
         asyncio.create_task(_safe(fn)): fn.__name__
         for fn in (
-            zero_disk_jiosaavn_lookup,  # ① fast Indian music CDN
-            zero_disk_piped_lookup,      # ② YouTube via Piped frontend
+            _youtube_direct,           # ① authoritative YouTube CDN
+            zero_disk_jiosaavn_lookup,   # ① fast Indian music CDN
+            zero_disk_piped_lookup,       # ② YouTube via Piped frontend
+            zero_disk_invidious_lookup,   # ③ YouTube via Invidious frontend
         )
     }
-    pending = set(tasks)
+    pending = set(direct_tasks)
     try:
         while pending:
             done, pending = await asyncio.wait(pending, return_when=asyncio.FIRST_COMPLETED)
@@ -2852,6 +3504,8 @@ async def resolve_zero_disk_stream(query: str, logger=None, allow_live: bool = F
     finally:
         for t in pending:
             t.cancel()
+        if pending:
+            await asyncio.gather(*pending, return_exceptions=True)
     return None
 
 
@@ -3126,7 +3780,7 @@ def _yt_supported_clients() -> set:
 _YT_SUPPORTED_CLIENTS = _yt_supported_clients()
 # tv_downgraded needs an account Data Sync ID; never send it ourselves.
 _YT_BLOCKED_CLIENTS = {"tv_downgraded"}
-_YT_FALLBACK_CLIENTS = ["tv_simply", "web_safari", "mweb"]
+_YT_FALLBACK_CLIENTS = ["default", "tv", "web_safari"]
 
 def yt_clients(clients) -> list:
     """Normalise a player_client list for the installed yt-dlp version."""
@@ -3149,19 +3803,27 @@ def yt_clients(clients) -> list:
 # Client ladder in priority order (technique #1-10)
 # NOTE: names below are validated/remapped by yt_clients() before use.
 _YT_CLIENTS = yt_clients([
-    # ── Tier-1: NO PO-token required (bypass "Sign in to confirm" gate) ──
-    "android_vr",      # 1 — VR client. No PO-token, no bot-check. BEST on cloud IPs.
-    "tv_simply",       # 2 — Simplified TV player (replaces removed tv_embedded)
-    "web_creator",     # 3 — Creator Studio client.
-    # ── Tier-2: PO-token clients (may hit bot-check, still worth trying) ──
-    "android",         # 4 — Most reliable for public songs
-    "web_embedded",    # 5 — Embedded player bypass
-    "web_music",       # 6 — YouTube Music client (Hindi/regional)
-    "tv",              # 7 — TV client, different CDN stack
-    "mweb",            # 8 — Mobile web, lightweight
-    "web_safari",      # 9 — Safari fingerprint
-    "web",             # 10 — Standard web fallback
-    "ios",             # 11 — iOS unique fingerprint
+    # ROOT-CAUSE FIX (Heroku log 2026-08-23: "ERROR: [youtube] <id>: No video
+    # formats found!" for EVERY song, Piped/Invidious mirrors all 4xx/5xx):
+    # verified live from a datacenter IP with no cookies and no PO token —
+    #   android                      -> muxed https format 18 downloads fine
+    #   mweb / web_music             -> formats listed, media request 403s
+    #   default / tv / tv_simply /
+    #   android_vr                   -> "Sign in to confirm you're not a bot"
+    #   web_safari / ios             -> zero formats  => "No video formats found!"
+    # So the ANDROID InnerTube client is the only rung that actually plays on
+    # a cloud dyno right now; it must lead the ladder. It does NOT support a
+    # cookie jar (yt-dlp skips it when `cookiefile` is attached — that is why
+    # the cookie path also died with "No video formats found!"), so cookies
+    # are withheld for it by _clients_accept_cookies() below.
+    "android",         # 0 — ★ PO-token-free, cookie-free, proven working
+    # SABR-only experiment (yt-dlp #12482) ne `tv`/`default` ke https URLs
+    # strip kar diye, isliye SABR-resistant clients pehle.
+    "web_safari",      # 1 — Safari fingerprint, https formats abhi bhi aate hain
+    "web_embedded",    # 2 — embedded web player, PO-token gate halka
+    "tv_simply",       # 3 — SABR-free TV variant
+    "default",         # 4 — yt-dlp ka apna best-guess client set
+    "tv",              # 5 — last resort (SABR-affected)
 ])
 
 # Piped public API instances — open-source YouTube frontends (technique #37)
@@ -3177,16 +3839,14 @@ _YT_CLIENTS = yt_clients([
 # runtime and merges it in, so the bot self-heals as instances die/appear
 # without needing a code change + redeploy.
 _PIPED_APIS = [
+    # 2026-09 health-check sweep: only these mirrors answered /search with 200.
+    # Dead ones (orangenet 502, kavin.rocks 502, privacyredirect bad cert,
+    # r4fo/smnz/hostux/leptons DNS-or-refused) were burning the whole 4.6s
+    # direct deadline on connect timeouts — removed.
     "https://pipedapi.wireway.ch",
     "https://api.piped.private.coffee",
-    "https://pipedapi.orangenet.cc",
-    "https://pipedapi.kavin.rocks",
+    "https://pipedapi.ducks.party",
     "https://pipedapi.adminforge.de",
-    "https://api.piped.privacyredirect.com",
-    "https://pipedapi.r4fo.com",
-    "https://pipedapi.smnz.de",
-    "https://piped-api.hostux.net",
-    "https://pipedapi.leptons.xyz",
 ]
 
 _PIPED_INSTANCES_API = "https://piped-instances.kavin.rocks"
@@ -3243,20 +3903,18 @@ async def _get_piped_apis() -> list:
 
 
 # Invidious instances — alternate extraction frontends (technique #38)
-# Updated 2026-07: removed dead/blocked instances, added fresh working ones.
+# Updated 2026-08: removed instances confirmed dead from Heroku logs
+# (inv.us.projectsegfau.lt, slipfox.xyz, tux.pizza, lunar.icu,
+#  iv.melmac.space — Network unreachable, protokolla.fi + materialio.us
+#  returning empty JSON). Added fresh alternatives.
 _INVIDIOUS = [
-    # Dead Jul 2026 (DNS fail): io.lol, iv.datura.network, yt.drgnz.club
-    # Blocked Jul 2026 (403):   invidious.perennialte.ch
-    "https://invidious.private.coffee",       # AT — confirmed working
-    "https://inv.us.projectsegfau.lt",        # US — confirmed working
-    "https://invidious.slipfox.xyz",          # US — confirmed working
-    "https://invidious.privacyredirect.com",  # EU — active
-    "https://inv.tux.pizza",                  # US — stable
-    "https://invidious.nerdvpn.de",           # DE — reliable long-running
-    "https://invidious.lunar.icu",            # EU — active
-    "https://iv.melmac.space",               # EU — active
-    "https://invidious.protokolla.fi",        # FI — active
-    "https://invidious.materialio.us",        # US — active
+    # 2026-09 sweep: public Invidious API is mostly dead (nadeko 403, fdn /
+    # incogniweb / ybins / drgns DNS-gone, artemislena TLS error). Only
+    # materialio.us answered /api/v1/search with 200; rest kept as last resort.
+    "https://invidious.materialio.us",
+    "https://invidious.private.coffee",
+    "https://invidious.nerdvpn.de",
+    "https://inv.nadeko.net",
 ]
 
 _YT_UPDATE_DONE = False  # technique #39: update once per process
@@ -3264,36 +3922,59 @@ _YT_UPDATE_DONE = False  # technique #39: update once per process
 
 def _ensure_ytdlp_updated_sync():
     """Actual blocking pip call — must only ever run off the event loop
-    thread (see `_ensure_ytdlp_updated` below)."""
+    thread (see `_ensure_ytdlp_updated` below).
+
+    BUG FIX: flag was set True BEFORE running pip, so if pip failed
+    (network timeout, permission error, etc.) future calls would skip
+    the update entirely — yt-dlp stayed stale forever after one bad
+    attempt. Fix: only mark done AFTER pip returns successfully.
+    """
     global _YT_UPDATE_DONE
     if _YT_UPDATE_DONE or yt_dlp is None:
         return
-    _YT_UPDATE_DONE = True
     try:
-        subprocess.run(
+        result = subprocess.run(
             [_sys.executable, "-m", "pip", "install", "--upgrade", "--quiet", "yt-dlp"],
             capture_output=True, timeout=45,
         )
+        # Mark done only on success (returncode 0) so a failed pip attempt
+        # can be retried on the next music request instead of silently skipping.
+        if result.returncode == 0:
+            _YT_UPDATE_DONE = True
     except Exception:
         pass
 
 
 async def _ensure_ytdlp_updated():
-    """Silent yt-dlp self-update — best-effort, once per process (technique #39).
+    """Best-effort yt-dlp self-update, once per process.
 
-    BUG FIX: this used to call `subprocess.run(...)` (blocking I/O) directly
-    from inside an `async def` on the event loop thread. `subprocess.run`
-    does not yield to the loop — it freezes the *entire* bot (every chat,
-    every command, the pytgcalls callbacks) for up to the full 45s timeout
-    on the very first play command after every restart. If pip happened to
-    be slow or unreachable at that moment, the first song after any deploy
-    would look like a total hang with zero visible errors. Running the
-    blocking call in a worker thread via `asyncio.to_thread` fixes this
-    without changing the "update once per process" behaviour.
+    This is intentionally callable from the startup warm-up only. Updating a
+    package during the first user request adds avoidable cold-start latency and
+    cannot change the already-imported yt_dlp module anyway.
     """
     if _YT_UPDATE_DONE or yt_dlp is None:
         return
     await asyncio.to_thread(_ensure_ytdlp_updated_sync)
+
+
+async def warm_up_music_runtime(logger=None) -> None:
+    """Warm optional music dependencies without blocking the first `.play`.
+
+    Heroku builds normally contain yt-dlp, Deno and bgutil already. When a
+    build misses one of them, repair it while the worker is starting instead
+    of making the first song wait for pip/download/install work. Playback has
+    its own fallbacks and can proceed while this best-effort warm-up runs.
+    """
+    logger = logger or (lambda *a: None)
+    tasks = [asyncio.create_task(_ensure_ytdlp_updated())]
+    if _YTDLP_COOKIE_FILE and not _BGUTIL_ACTIVE:
+        tasks.append(asyncio.create_task(_ensure_bgutil_runtime(logger)))
+    elif _BGUTIL_ACTIVE and not _BGUTIL_HTTP_READY:
+        tasks.append(asyncio.create_task(warm_up_bgutil_server()))
+    results = await asyncio.gather(*tasks, return_exceptions=True)
+    for result in results:
+        if isinstance(result, Exception):
+            logger("MUSIC_WARMUP_WARN", str(result))
 
 
 def _yt_normalize_query(q: str) -> str:
@@ -3320,8 +4001,8 @@ def _yt_build_format_chain():
     cookies are active and the manifest is fully resolved.
     """
     return [
-        "bestaudio[ext=webm][acodec=opus]/bestaudio[ext=webm]/bestaudio[ext=opus]/bestaudio/best",
-        "bestaudio[ext=webm]/bestaudio/best",
+        "bestaudio/best",
+        "bestaudio[ext=webm]/bestaudio[ext=m4a]/bestaudio/best",
         "bestaudio",
         "best",
     ]
@@ -3356,7 +4037,876 @@ def random_ua() -> str:
 # Kept for any external caller expecting a fixed name — now just one pick.
 _YT_BROWSER_UA = random_ua()
 # Tier-1 clients that don't need PO tokens — skip innertube auth entirely
-_YT_NO_POTOKEN_CLIENTS = set(yt_clients(["android_vr", "tv_simply", "web_creator"]))
+_YT_NO_POTOKEN_CLIENTS: set = set()  # mobile/no-cookie client tier removed
+
+# ── Cookie-capability map (ROOT-CAUSE FIX, Heroku log 2026-08-16) ───────
+# yt-dlp REFUSES to use InnerTube clients that don't support cookies when an
+# authenticated cookie jar is attached:
+#   WARN: Skipping client "tv_simply" since it does not support cookies
+#   WARN: Skipping client "android_vr" since it does not support cookies
+#   WARN: Skipping client "android"  since it does not support cookies
+# Our ladder attached `cookiefile` to EVERY rung, so those three rungs ended
+# up with ZERO usable clients — yt-dlp then extracted nothing and reported
+# "Requested format is not available", which is exactly the failure in the
+# log for every single song. The cookieless clients are precisely the ones
+# that still work from a datacenter IP, so cookies were killing playback.
+#
+# Fix: attach cookies ONLY to rungs whose clients all support cookies; run
+# the cookieless clients genuinely cookieless.
+_YT_NO_COOKIE_CLIENTS = {"android", "android_vr", "android_music",
+                         "android_creator", "ios", "ios_music",
+                         "ios_creator", "tv_simply"}
+try:  # prefer yt-dlp's own metadata when available
+    from yt_dlp.extractor.youtube._base import INNERTUBE_CLIENTS as _IC
+    _YT_NO_COOKIE_CLIENTS |= {
+        k for k, v in _IC.items() if not v.get("SUPPORTS_COOKIES")
+    }
+except Exception:
+    pass
+
+
+def _clients_accept_cookies(clients) -> bool:
+    """True only if every client in the rung can use a cookie jar."""
+    return bool(clients) and all(
+        c not in _YT_NO_COOKIE_CLIENTS for c in clients
+    )
+
+
+# ── bgutil PO-token provider paths ──────────────────────────────────────
+# ROOT-CAUSE FIX (Heroku log 2026-08-16: every cloud_dl rung dying with
+# "unable to download video data: HTTP Error 403: Forbidden" and
+# "Requested format is not available"):
+#
+# The bgutil script provider was being handed the provider ROOT directory
+# as `server_home`. The plugin resolves the generator as
+# `<server_home>/src/generate_once.ts`, so it looked for
+# `vendor/bgutil-ytdlp-pot-provider/src/generate_once.ts` — a path that
+# does NOT exist (the real file lives under `.../server/src/`). The plugin
+# logged "Script path doesn't exist" and returned NO PO token, silently.
+#
+# Without a PO token, `formats: ["missing_pot"]` keeps the PO-token-gated
+# googlevideo formats visible, yt-dlp happily picks one, and YouTube
+# answers 403 on the actual media request — exactly what the log shows.
+# For clients that expose nothing else, the selector matches nothing and we
+# get "Requested format is not available" instead.
+#
+# `server_home` MUST be the `server` sub-directory.
+_BGUTIL_HOME: str = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)),
+    "vendor", "bgutil-ytdlp-pot-provider",
+)
+_BGUTIL_SERVER_HOME: str = os.path.join(_BGUTIL_HOME, "server")
+_BGUTIL_SCRIPT: str = os.path.join(
+    _BGUTIL_SERVER_HOME, "src", "generate_once.ts"
+)
+# Disabled: bundled bgutil versions conflict with yt-dlp provider registry.
+_BGUTIL_ACTIVE: bool = False
+
+# ── Warm bgutil HTTP provider (Melody_music proven fast path) ───────────
+# Script mode spawns a brand-new Deno + BotGuard session for EVERY token,
+# which costs seconds per track and times out under our short socket
+# timeouts. The bundled `server/src/main.ts` is the same provider running
+# as a long-lived local HTTP server with a warm session + token cache.
+# Prefer it, fall back to script mode automatically.
+_BGUTIL_HTTP_PORT: int = int(os.environ.get("BGUTIL_PORT", "4416"))
+_BGUTIL_HTTP_PROC = None
+_BGUTIL_HTTP_READY: bool = False
+_BGUTIL_HTTP_LOCK = threading.Lock()
+
+
+def ensure_bgutil_http_server() -> bool:
+    """Start the persistent bgutil PO-token HTTP server (idempotent)."""
+    global _BGUTIL_HTTP_PROC
+    with _BGUTIL_HTTP_LOCK:
+        if _BGUTIL_HTTP_READY:
+            return True
+        if _BGUTIL_HTTP_PROC is not None and _BGUTIL_HTTP_PROC.poll() is None:
+            return False  # starting — poll _bgutil_http_alive() shortly
+        main_ts = os.path.join(_BGUTIL_SERVER_HOME, "src", "main.ts")
+        _ensure_deno_cache_env()
+        deno = _find_deno() or ensure_deno_runtime()
+        if not os.path.isfile(main_ts) or not deno:
+            return False
+        cache_dir = os.path.join(_BGUTIL_SERVER_HOME, "cache")
+        node_mods = os.path.join(_BGUTIL_SERVER_HOME, "node_modules")
+        try:
+            os.makedirs(cache_dir, exist_ok=True)
+            _BGUTIL_HTTP_PROC = subprocess.Popen(
+                [
+                    deno, "run",
+                    "--allow-env", "--allow-net",
+                    f"--allow-ffi={node_mods}",
+                    f"--allow-write={cache_dir}",
+                    f"--allow-read={cache_dir},{node_mods}",
+                    main_ts, "--port", str(_BGUTIL_HTTP_PORT),
+                ],
+                cwd=_BGUTIL_SERVER_HOME,
+                env={**os.environ, "XDG_CACHE_HOME": cache_dir},
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+            return False
+        except Exception:
+            _BGUTIL_HTTP_PROC = None
+            return False
+
+
+def _bgutil_http_alive() -> bool:
+    """Best-effort /ping against the local bgutil HTTP server."""
+    global _BGUTIL_HTTP_READY
+    if _BGUTIL_HTTP_READY:
+        return True
+    try:
+        import urllib.request as _u
+        with _u.urlopen(
+            f"http://127.0.0.1:{_BGUTIL_HTTP_PORT}/ping", timeout=1.5
+        ) as r:
+            if r.status == 200:
+                _BGUTIL_HTTP_READY = True
+                return True
+    except Exception:
+        pass
+    return False
+
+
+async def warm_up_bgutil_server(timeout: float = 25.0) -> None:
+    """Start + wait for the bgutil HTTP server (call once at startup)."""
+    if not _BGUTIL_ACTIVE:
+        return
+    if not await asyncio.to_thread(ensure_bgutil_http_server) and _BGUTIL_HTTP_PROC is None:
+        return
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + timeout
+    while loop.time() < deadline:
+        if await asyncio.to_thread(_bgutil_http_alive):
+            return
+        await asyncio.sleep(0.5)
+
+
+def _bgutil_provider_args() -> dict:
+    """PO-token provider extractor_args — warm HTTP first, script fallback."""
+    if not _BGUTIL_ACTIVE:
+        return {}
+    if _bgutil_http_alive():
+        return {
+            "youtubepot-bgutilhttp": {
+                "base_url": [f"http://127.0.0.1:{_BGUTIL_HTTP_PORT}"],
+            }
+        }
+    # Kick the HTTP server off for the next track, use script mode now.
+    with contextlib.suppress(Exception):
+        ensure_bgutil_http_server()
+    return {"youtubepot-bgutilscript": {"server_home": [_BGUTIL_SERVER_HOME]}}
+
+if _BGUTIL_ACTIVE:
+    import logging as _logging
+    _logging.getLogger("music_sources").info(
+        "✅ bgutil PO-token provider active: %s", _BGUTIL_SERVER_HOME
+    )
+else:
+    # Provider intentionally disabled; strict audio path uses built-in yt-dlp.
+    pass
+
+
+# ── Deno runtime (build-time vendor + RUNTIME self-heal) ────────────────
+# ROOT-CAUSE FIX (Heroku log 2026-08-23: EVERY cloud_dl rung — web_safari,
+# web, web_embedded, tv, tv_simply, default — dies with
+#   "Sign in to confirm you're not a bot"
+# within ~1.5s, i.e. before any media request):
+# bgutil could not mint a Proof-of-Origin token, so YouTube treated the
+# datacenter IP as an unauthenticated bot on every client. bgutil cannot run
+# without Deno, and Deno was ONLY installed at build time from a single
+# GitHub URL with no mirrors — one 503 from GitHub during the build leaves
+# the dyno permanently without a JS runtime and bricks playback until the
+# next redeploy.
+# Fix (same approach as the Melody_music repo, where it resolved this exact
+# failure): keep the build-time vendoring, but also self-heal at runtime by
+# downloading Deno into /tmp from multiple mirrors, and point Deno's module
+# cache at a writable directory.
+_DENO_RUNTIME_DIR = "/tmp/deno_runtime"
+_DENO_LOCK = threading.Lock()
+_DENO_MIRRORS = (
+    "https://dl.deno.land/release/{ver}/deno-x86_64-unknown-linux-gnu.zip",
+    "https://github.com/denoland/deno/releases/download/{ver}"
+    "/deno-x86_64-unknown-linux-gnu.zip",
+    "https://github.com/denoland/deno/releases/latest/download"
+    "/deno-x86_64-unknown-linux-gnu.zip",
+)
+
+
+def _ensure_deno_cache_env() -> None:
+    """Deno needs a writable module/npm cache; $HOME may be read-only."""
+    cache = os.environ.get("DENO_DIR")
+    if not cache or not os.access(os.path.dirname(cache) or "/", os.W_OK):
+        cache = "/tmp/deno_cache"
+        os.environ["DENO_DIR"] = cache
+    os.environ.setdefault("DENO_NO_UPDATE_CHECK", "1")
+    with contextlib.suppress(Exception):
+        os.makedirs(cache, exist_ok=True)
+
+
+_ensure_deno_cache_env()
+
+
+def _find_deno() -> str | None:
+    """Find Deno binary — vendor path, /tmp runtime install, then PATH."""
+    _vendor_deno = os.path.join(
+        os.path.dirname(os.path.abspath(__file__)),
+        "vendor", "deno", "bin", "deno",
+    )
+    if os.path.isfile(_vendor_deno) and os.access(_vendor_deno, os.X_OK):
+        return _vendor_deno
+    _tmp_deno = os.path.join(_DENO_RUNTIME_DIR, "deno")
+    if os.path.isfile(_tmp_deno) and os.access(_tmp_deno, os.X_OK):
+        return _tmp_deno
+    import shutil as _sh2
+    return _sh2.which("deno")
+
+
+def ensure_deno_runtime(logger=None) -> str | None:
+    """Download Deno into /tmp when the build-time vendoring failed.
+
+    Blocking — always call via asyncio.to_thread(). Returns the binary path
+    or None when every mirror failed.
+    """
+    import logging as _log_d
+    _log = _log_d.getLogger("music_sources")
+    _info = logger or (lambda tag, msg: _log.info("[%s] %s", tag, msg))
+
+    found = _find_deno()
+    if found:
+        return found
+
+    with _DENO_LOCK:
+        found = _find_deno()
+        if found:
+            return found
+
+        _ensure_deno_cache_env()
+
+        import urllib.request as _ureq
+        import zipfile as _zf
+
+        version = "v2.9.5"
+        with contextlib.suppress(Exception):
+            with _ureq.urlopen(
+                "https://dl.deno.land/release-latest.txt", timeout=8
+            ) as _r:
+                _v = _r.read().decode().strip()
+                if _v.startswith("v"):
+                    version = _v
+
+        os.makedirs(_DENO_RUNTIME_DIR, exist_ok=True)
+        target = os.path.join(_DENO_RUNTIME_DIR, "deno")
+        archive = os.path.join(_DENO_RUNTIME_DIR, "deno.zip")
+
+        for mirror in _DENO_MIRRORS:
+            url = mirror.format(ver=version)
+            try:
+                _info("DENO", f"⬇️ Installing Deno at runtime from {url}")
+                with _ureq.urlopen(url, timeout=120) as resp, \
+                        open(archive, "wb") as fh:
+                    fh.write(resp.read())
+                if os.path.getsize(archive) < 1_000_000:
+                    raise RuntimeError("archive too small")
+                with _zf.ZipFile(archive) as zf:
+                    zf.extract("deno", _DENO_RUNTIME_DIR)
+                os.chmod(target, 0o755)
+                with contextlib.suppress(Exception):
+                    os.unlink(archive)
+                _info("DENO", f"✅ Deno {version} installed at {target}")
+                return target
+            except Exception as exc:
+                _info("DENO_WARN", f"⚠️ Deno mirror failed ({url}): {exc}")
+                with contextlib.suppress(Exception):
+                    os.unlink(archive)
+
+        _info(
+            "DENO_ERR",
+            "❌ Deno install failed on all mirrors — bgutil cannot mint a "
+            "PO-token, so YouTube will keep bot-gating this IP.",
+        )
+        return None
+
+
+def _get_js_runtime_opts() -> dict:
+    """Return js_runtimes + remote_components — Musicbot working jugad.
+
+    YouTube now requires a JavaScript runtime to solve its player challenge.
+    Without Deno + ejs:github, yt-dlp cannot extract formats from cloud/Heroku
+    IPs → 'No video formats found!'.
+
+    bin/post_compile installs Deno to vendor/deno/bin/deno at Heroku build time.
+    _find_deno() locates it.  remote_components=["ejs:github"] tells yt-dlp to
+    fetch the EJS extractor from GitHub — the same approach that makes Musicbot
+    work 100% on Heroku.
+    """
+    opts: dict = {"remote_components": ["ejs:github"]}
+    deno = _find_deno()
+    if deno:
+        opts["js_runtimes"] = {"deno": {"path": deno}}
+    return opts
+
+
+def _cloud_download_sync(
+    url_or_query: str,
+    out_tmpl: str,
+    audio_only: bool = True,
+    logger=None,
+    combos_override=None,
+) -> dict | None:
+    """Musicbot-style direct local download — works 100% on Heroku/cloud IPs.
+
+    On cloud/datacenter IPs the YouTube CDN (googlevideo.com) is IP-blocked.
+    Trying to stream directly or using complex client ladders just wastes time.
+    yt-dlp ships with curl_cffi which impersonates Chrome's TLS fingerprint —
+    this bypasses the CDN IP block entirely. Downloading to a local file and
+    serving that file sidesteps ALL streaming CDN restrictions.
+
+    Uses Musicbot's proven approach:
+      - player_client=["web"] with cookies (authenticates fully, full DASH manifest)
+      - js_runtimes + remote_components (solves YouTube JS challenge)
+      - bgutil PO-token (bypasses cloud-IP gate)
+      - 16 parallel fragment threads (fast download)
+      - curl_cffi TLS impersonation
+
+    Returns music_sources-style info dict or None on failure.
+    """
+    logger = logger or (lambda *a: None)
+    if yt_dlp is None:
+        return None
+
+    # Per-run: is a cookie jar available at all? Actual file is minted fresh
+    # per rung (see cookiefile_for_run() below) so parallel yt-dlp writers
+    # can't corrupt each other's jar mid-flight.
+    cookie = bool(_YTDLP_COOKIE_TEXT)
+    is_search = not (url_or_query.startswith("http://") or url_or_query.startswith("https://"))
+    target = f"ytsearch1:{url_or_query}" if is_search else url_or_query
+
+    # Combo format: (format_string, clients_list, need_player_skip)
+    # Ordering: no-PO-token clients FIRST so it works even without bgutil/cookies.
+    #
+    # tv_embedded + player_skip=["webpage"]: skips the sign-in gate entirely —
+    # no cookies, no PO-token needed. Gives limited DASH manifest (no separate
+    # audio DASH stream) but ffmpeg extracts audio fine from muxed stream.
+    # This is the most reliable on cloud IPs.
+    #
+    # web + cookies + bgutil: full DASH manifest, best quality. Needs bgutil
+    # PO-token because cloud IPs can't acquire PO-token from the webpage.
+    # ROOT-CAUSE FIX (Heroku log: cloud_dl [['android_vr']] / [['tv_simply']] /
+    # [['android']] → "Failed to extract any player response" on EVERY rung):
+    # `player_skip=["webpage"]` webpage se player response fetch hi nahi karne
+    # deta, aur ab YouTube in innertube clients ko datacenter IP par bina
+    # webpage/PO-token ke koi player response deta hi nahi. Isliye har attempt
+    # fail ho raha tha aur .play par kuch bhi nahi bajta tha.
+    #
+    # Melody_music (reference repo) wali proven config apnayi gayi hai:
+    #   player_client = ["default", "tv", "web_safari"]  + formats=missing_pot
+    #   (koi player_skip nahi) + native downloader.
+    # missing_pot yt-dlp ko wo formats bhi rakhne deta hai jinke liye PO-token
+    # nahi mila — cookies/bgutil ke saath ye normally download ho jaate hain.
+    # ROOT-CAUSE FIX (Heroku log 2026-08-16 cloud_dl [['tv']] ydl-errors:
+    #   "Some tv client https formats have been skipped as they are missing
+    #    a URL. YouTube may have enabled the SABR-only streaming experiment
+    #    for your account. See yt-dlp/yt-dlp#12482"):
+    # `tv` client (aur `default` jo tv bhi include karta hai) SABR-only ban
+    # gaya hai — HTTPS URLs strip ho jaate hain aur download 0-byte pe fail.
+    # yt-dlp #12482 ke mutabik SABR-resistant clients pehle try karo:
+    #   web_safari, mweb, ios, web_embedded, tv_embedded (with player_skip).
+    # tv/default ko sirf last resort ke taur pe rakho.
+    # LADDER ORDER — re-verified 2026-08-16 from a datacenter IP with the
+    # (now actually working) bgutil PO-token provider attached:
+    #   ✅ web_embedded, tv_simply, android_vr, android, default
+    #   ❌ web_safari / mweb / ios  → 403 Forbidden on the media request
+    #   ❌ tv / web                 → "Requested format is not available"
+    # The old order led with the three 403 clients, so every song burned
+    # ~40s of failures before reaching a client that actually works.
+    # ROOT-CAUSE FIX (Heroku log 2026-08-16 12:16, cookies=✅ but EVERY rung:
+    #   "Sign in to confirm you're not a bot"  on tv_simply / android_vr /
+    #   android). Those three clients CANNOT use a cookie jar.
+    #
+    # ROOT-CAUSE FIX (Heroku log 2026-08-16 12:35, cookies=✅ bgutil=✅ but
+    #   cloud_dl [['mweb']]: "unable to download video data: HTTP Error 403:
+    #   Forbidden" and then NOTHING played at all):
+    # Two separate defects combined:
+    #   1. Cookie-first ordering put the whole `web` family (web_embedded,
+    #      web_safari, mweb, web, web_music) at the TOP of the ladder. On a
+    #      datacenter IP every one of those needs a valid GVS PO-token for the
+    #      media request; with `formats=["missing_pot"]` we deliberately keep
+    #      the un-tokened formats visible, yt-dlp picks one and googlevideo
+    #      answers 403 Forbidden. Guaranteed failure, ~8s burned per rung.
+    #   2. The `_botgate_hits >= 2` optimisation skipped EVERY cookieless rung
+    #      once two rungs hit the bot-gate — i.e. exactly the tv_simply /
+    #      android_vr / tv_embedded rungs that actually work on Heroku were
+    #      thrown away, so the ladder ran out of options and `.play` produced
+    #      nothing at all.
+    # Fix: one single ladder that leads with the PO-token-free clients
+    # (verified working from a datacenter IP), attaches cookies only where the
+    # client supports them, and keeps the web family as a later fallback.
+    # A 403 on the media request now marks the whole web family as gated and
+    # skips its remaining rungs instead of aborting the useful ones.
+    _WEB_FAMILY = {"web", "web_safari", "web_embedded", "web_music", "mweb"}
+
+    # ROOT-CAUSE FIX (Heroku log 2026-08-16 13:02, bgutil=✅ deno=✅ cookies=✅
+    #   but EVERY rung: cloud_dl [['tv_simply']] / [['android_vr']] →
+    #   "Sign in to confirm you're not a bot"):
+    # tv_simply / android_vr / tv_embedded CANNOT use a cookie jar, and from a
+    # datacenter IP YouTube now bot-gates them even with a PO-token provider
+    # attached. Leading the ladder with them means every single rung that can
+    # actually authenticate is reached only after ~8 wasted attempts — and the
+    # cookieless rungs can never succeed on Heroku at all.
+    # Fix: when cookies are available, lead with the Melody_music-proven
+    # cookie + bgutil configuration (player_client default/tv/web_safari with
+    # formats=missing_pot), which is the config verified working on this exact
+    # Heroku USA dyno. The cookieless clients stay on as a fallback for the
+    # no-cookie deployment.
+    # ROOT-CAUSE FIX (Heroku log 2026-08-16 18:03, cloud_dl [['tv']] ydl-errors:
+    #   "Some tv client https formats have been skipped as they are missing a
+    #    URL. YouTube may have enabled the SABR-only streaming experiment"):
+    # YouTube ne is IP/account ke liye `tv` (aur `default` jo tv include karta
+    # hai) ko SABR-only kar diya — https URLs hi nahi aate, isliye rung 0-byte
+    # pe marta hai. SABR-resistant clients pehle chalte hain aur SABR warning
+    # dikhte hi us client family ke baaki rungs skip ho jaate hain.
+    _SABR_FAMILY = {"tv", "default"}
+
+    # ★ Rung 0 — the only combination verified to actually deliver bytes from a
+    # datacenter IP today (no cookies, no PO token). `best` is required in the
+    # selector because the android client only advertises the muxed format 18;
+    # _audio_pp() extracts the audio track afterwards.
+    _ANDROID_RUNGS = [
+        ("bestaudio/best[acodec!=none]/best", ["android"], False),
+    ]
+
+    _COOKIE_RUNGS = [
+        # SABR-resistant, cookie-capable clients pehle.
+        ("bestaudio[ext=m4a]/bestaudio/best",  ["web_safari"],      False),
+        ("bestaudio[abr<=128]/bestaudio/best", ["web_safari", "web"], False),
+        ("bestaudio[ext=m4a]/bestaudio/best",  ["web"],             False),
+        ("bestaudio/best",                     ["web_embedded"],    False),
+        # tv/default (SABR-affected) sirf last resort.
+        ("bestaudio[abr<=128]/bestaudio/best",
+         ["web_safari", "tv", "default"],                          False),
+    ]
+
+    _NOCOOKIE_RUNGS = [
+        ("bestaudio/best",                     ["web_safari"],    False),
+        ("bestaudio/best",                     ["web_embedded"],  False),
+        ("bestaudio/best",                     ["tv_simply"],     False),
+        ("bestaudio/best",                     ["default"],       False),
+        ("bestaudio/best",
+         ["web_safari", "default", "tv"],                         False),
+    ]
+    if cookie:
+        # Production proof: android hit bot-gate, web_safari returned bytes.
+        # Cookie-capable Safari/Web must run before anonymous Android.
+        combos = _COOKIE_RUNGS + _ANDROID_RUNGS + _NOCOOKIE_RUNGS
+    else:
+        combos = _ANDROID_RUNGS + _NOCOOKIE_RUNGS + _COOKIE_RUNGS
+    # Last resort: SABR-affected clients (tv/default).
+    combos += [
+        ("bestaudio/best",                    ["tv"],                False),
+        ("bestaudio/best",                    ["tv_simply"],         False),
+    ]
+    # FINAL SAFETY NET — never fail with "Requested format is not available"
+    # just because the selector was too strict. These rungs accept literally
+    # any downloadable stream (audio-only preferred, then muxed, then worst)
+    # from the clients that are proven to still serve https URLs.
+    _ANY_FMT = ("bestaudio*[protocol^=http]/bestaudio*/bestaudio/"
+                "best[protocol^=http]/best/worst")
+    combos += [
+        (_ANY_FMT, ["android"],                                    False),
+        (_ANY_FMT, ["web_safari", "web", "web_embedded"],          False),
+        (_ANY_FMT, ["default", "tv", "web_safari"],                False),
+        (_ANY_FMT, ["default"],                                    False),
+    ]
+
+
+    # HEROKU FIX: when ffmpeg not found, override format to pre-packaged audio.
+    # "bestaudio/best" can pick DASH separate streams that need FFmpegMergerPP —
+    # yt-dlp adds that automatically, causing crash even with postprocessors=[].
+    # m4a/opus/webm/mp4 are single-file containers — no merge, no ffmpeg needed.
+    _NO_FFMPEG_FMT = (
+        "bestaudio[ext=m4a]/bestaudio[ext=opus]/bestaudio[ext=webm]"
+        "/best[ext=mp4]/best[ext=webm]/best"
+    )
+
+    _botgate_hits = 0          # how many rungs died on "Sign in to confirm…"
+    _pot403_hits = 0           # web-family rungs killed by a 403 media request
+    _sabr_hits = 0             # rungs killed by the SABR-only experiment (tv/default)
+    if combos_override is not None:
+        combos = list(combos_override)
+    for fmt, clients, use_player_skip in combos:
+        actual_fmt = fmt if _MS_FFMPEG_DIR else _NO_FFMPEG_FMT
+        clients = yt_clients(clients)
+        # A 403 on the media request means this IP has no valid GVS PO-token,
+        # so every remaining PO-token-gated web rung will fail identically —
+        # skip them (but NEVER skip the cookieless clients that do work).
+        if _pot403_hits >= 3 and set(clients) <= _WEB_FAMILY:
+            continue
+        # SABR-only experiment: tv/default se https URLs aate hi nahi, so once
+        # it has bitten, don't burn more time on pure tv/default rungs.
+        if _sabr_hits >= 1 and set(clients) <= _SABR_FAMILY:
+            continue
+        # Same idea for the anonymous bot-gate: once it has bitten twice,
+        # cookieless rungs are hopeless *only if* we still have cookie-capable
+        # rungs left, so just skip pure-cookieless single-client rungs.
+        if (cookie and _botgate_hits >= 3
+                and "android" not in clients
+                and not _clients_accept_cookies(clients)):
+            continue
+
+
+        # formats=missing_pot: PO-token ke bina bhi formats hide na ho —
+        # warna selector kuch match nahi karta ("Requested format is not
+        # available") aur har client fail dikhta hai.
+        yt_ext: dict = {"player_client": clients, "formats": ["missing_pot"]}
+        if use_player_skip:
+            yt_ext["player_skip"] = ["webpage"]
+        ext_args: dict = {"youtube": yt_ext}
+        ext_args.update(_bgutil_provider_args())
+
+
+        opts: dict = {
+            "format":           actual_fmt,
+            "outtmpl":          out_tmpl,
+            "quiet":            False,   # ← keep stderr for debug logging below
+            "no_warnings":      False,
+            "noplaylist":       not is_search,
+            "geo_bypass":       True,
+            "geo_bypass_country": "US",
+            "check_formats":    False,
+            "socket_timeout":   6,
+            "retries":          1,       # fast fail — don't retry same broken client
+            "extractor_retries": 1,
+            "fragment_retries": 3,
+            "concurrent_fragment_downloads": 16,
+            # Melody fix: kabhi external downloader (ffmpeg/aria2c) mat use
+            # karo — Heroku par wo non-zero exit code se marta hai aur
+            # yt-dlp use hard DownloadError bana deta hai.
+            "external_downloader": {"default": "native"},
+            "hls_prefer_native": True,
+
+            "http_headers": {
+                "User-Agent": (
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                    "AppleWebKit/537.36 (KHTML, like Gecko) "
+                    "Chrome/125.0.0.0 Safari/537.36"
+                ),
+                "Referer": "https://www.youtube.com/",
+            },
+            "extractor_args": ext_args,
+            "plugin_dirs": [],
+            **_get_js_runtime_opts(),
+            **_get_impersonate_opt(),
+            # _audio_pp() emits FFmpegExtractAudio + ffmpeg_location when a real
+            # ffmpeg/ffprobe PAIR exists, otherwise postprocessors=[] plus
+            # fixup="never" so yt-dlp's implicit fixup pass can't invoke a
+            # missing binary. This is the actual "ffprobe and ffmpeg not found" fix.
+            **_youtube_audio_opts()
+        }
+        # BUG FIX: always inject cookies when available — even for tv_embedded/android_vr
+        # with player_skip. YouTube now bot-checks these clients from cloud IPs regardless
+        # of player_skip, so valid cookies are required to pass the gate.
+        # Only attach cookies to rungs whose clients actually support them —
+        # otherwise yt-dlp skips every client in the rung and the download
+        # dies with "Requested format is not available" (see note above).
+        if cookie and _clients_accept_cookies(clients):
+            _fresh = cookiefile_for_run()
+            if _fresh:
+                opts["cookiefile"] = _fresh
+
+        # Capture yt-dlp stderr for debug logging
+        _ydl_error: list[str] = []
+
+        class _ErrLogger:
+            def debug(self, msg):   pass
+            def warning(self, msg): _ydl_error.append(f"WARN: {msg}")
+            def error(self, msg):   _ydl_error.append(f"ERR: {msg}")
+
+        opts["logger"] = _ErrLogger()
+
+        info = None
+        try:
+            with yt_dlp.YoutubeDL(opts) as ydl:
+                raw = ydl.extract_info(target, download=True)
+                if isinstance(raw, dict) and "entries" in raw:
+                    entries = [e for e in (raw.get("entries") or []) if e]
+                    info = entries[0] if entries else None
+                else:
+                    info = raw
+        except Exception as exc:
+            err_str = str(exc)
+            if _ydl_error:
+                err_str = _ydl_error[-1] + " | " + err_str
+            if "not a bot" in err_str or "Sign in to confirm" in err_str:
+                _botgate_hits += 1
+            if ("403" in err_str and "Forbidden" in err_str
+                    and set(clients) <= _WEB_FAMILY):
+                _pot403_hits += 1
+            if ("SABR" in err_str or "missing a URL" in err_str):
+                _sabr_hits += 1
+
+            logger("MUSIC_DL_ERR", f"cloud_dl [{clients}]: {err_str[:200]}")
+
+            # Cleanup partial files
+            for ext in ("opus", "mp3", "m4a", "webm", "part", "ytdl"):
+                p = out_tmpl.replace("%(ext)s", ext)
+                if os.path.exists(p):
+                    with contextlib.suppress(Exception):
+                        os.remove(p)
+            continue
+
+        if _ydl_error:
+            _joined = " ".join(_ydl_error)
+            if "SABR" in _joined or "missing a URL" in _joined:
+                _sabr_hits += 1
+            logger("MUSIC_DL_ERR", f"cloud_dl [{clients}] ydl-errors: {'; '.join(_ydl_error[-3:])[:300]}")
+
+        if info:
+            p = _resolve_downloaded_file(info, out_tmpl)
+            if p:
+                logger("MUSIC_DL", f"cloud_dl ✓ [{clients}] '{(info.get('title',''))[:50]}'")
+                return {
+                    "title":     info.get("title", url_or_query),
+                    "file_path": p,
+                    "duration":  int(info.get("duration") or 0),
+                    "thumbnail": info.get("thumbnail"),
+                    "source":    "youtube",
+                }
+            logger("MUSIC_DL_ERR",
+                   f"cloud_dl [{clients}]: downloaded file not found for {out_tmpl}")
+        else:
+            logger("MUSIC_DL_ERR", f"cloud_dl [{clients}]: ydl returned no info")
+
+        # Cleanup partial files on no-result
+        for ext in ("opus", "mp3", "m4a", "webm", "part", "ytdl"):
+            p = out_tmpl.replace("%(ext)s", ext)
+            if os.path.exists(p):
+                with contextlib.suppress(Exception):
+                    os.remove(p)
+
+    return None
+
+
+# ── curl-cffi TLS impersonation (jugad #42) ──────────────────────────────────
+# yt-dlp[default,curl-cffi] is in requirements.txt.
+# ImpersonateTarget makes requests look like real Chrome at the TLS layer,
+# bypassing Heroku/cloud-IP fingerprinting that YouTube/CDN uses to detect bots.
+try:
+    from yt_dlp.networking.impersonate import ImpersonateTarget as _ImpersonateTarget
+except Exception:
+    _ImpersonateTarget = None
+
+# BUG FIX: importing ImpersonateTarget only proves yt-dlp is installed — the
+# class lives in core yt-dlp, NOT in curl-cffi. When the curl_cffi wheel is
+# missing/failed to build (very common on Heroku), passing `impersonate`
+# raised "Impersonate target chrome:windows is not available" and EVERY
+# single download attempt died instantly — that is why the whole client
+# ladder failed in seconds with no usable error. Now the real, runtime list
+# of supported targets is probed once and impersonation is simply skipped
+# when unsupported.
+_IMPERSONATE_TARGET = None
+_IMPERSONATE_PROBED = False
+
+
+def _probe_impersonate_target():
+    """Pick a genuinely available impersonate target, or None."""
+    global _IMPERSONATE_TARGET, _IMPERSONATE_PROBED
+    if _IMPERSONATE_PROBED:
+        return _IMPERSONATE_TARGET
+    _IMPERSONATE_PROBED = True
+    if yt_dlp is None or _ImpersonateTarget is None:
+        return None
+    try:
+        import curl_cffi  # noqa: F401  — the actual backend
+    except Exception:
+        return None
+    try:
+        with yt_dlp.YoutubeDL({"quiet": True, "no_warnings": True}) as _y:
+            available = list(_y._get_available_impersonate_targets() or [])
+    except Exception:
+        return None
+    if not available:
+        return None
+    preferred = (
+        _ImpersonateTarget("chrome", None, "windows", None),
+        _ImpersonateTarget("chrome", None, None, None),
+    )
+    targets = [t[0] if isinstance(t, (tuple, list)) else t for t in available]
+    for want in preferred:
+        for got in targets:
+            try:
+                if got in want or want in got:
+                    _IMPERSONATE_TARGET = want
+                    return _IMPERSONATE_TARGET
+            except Exception:
+                continue
+    _IMPERSONATE_TARGET = targets[0]
+    return _IMPERSONATE_TARGET
+
+
+def _get_impersonate_opt() -> dict:
+    """Return {"impersonate": <target>} only when it actually works here."""
+    target = _probe_impersonate_target()
+    return {"impersonate": target} if target else {}
+
+
+_CURL_CFFI_AVAILABLE = None  # legacy flag kept for external callers
+
+
+# ── Runtime bgutil installer (jugad #43) ─────────────────────────────────────
+# bgutil provides Proof-of-Origin tokens that YouTube requires from cloud IPs.
+# bin/post_compile installs it at Heroku build time; this function installs it
+# at runtime on the first music request so any running dyno gets it immediately
+# without a full redeploy.
+_BGUTIL_INSTALL_LOCK = asyncio.Lock()
+_BGUTIL_INSTALL_DONE = False
+
+
+async def _ensure_bgutil_runtime(logger=None) -> None:
+    # External bgutil builds are incompatible with the deployed yt-dlp
+    # provider registry; strict audio playback intentionally does not install
+    # or register them at runtime.
+    return
+    # External bgutil builds are incompatible with the deployed yt-dlp
+    # provider registry; strict audio playback intentionally does not install
+    # or register them at runtime.
+    return
+    """One-shot runtime bgutil installer — idempotent and async-safe."""
+    global _BGUTIL_ACTIVE, _BGUTIL_INSTALL_DONE
+    if _BGUTIL_ACTIVE or _BGUTIL_INSTALL_DONE:
+        return
+    async with _BGUTIL_INSTALL_LOCK:
+        if _BGUTIL_ACTIVE or _BGUTIL_INSTALL_DONE:
+            return
+        _BGUTIL_INSTALL_DONE = True  # prevent retries on failure
+
+        import logging as _log2
+        _log = _log2.getLogger("music_sources")
+        _info = logger or (lambda tag, msg: _log.info("[%s] %s", tag, msg))
+
+        BGUTIL_VERSION = "1.3.1"
+        BGUTIL_URL = (
+            f"https://github.com/Brainicism/bgutil-ytdlp-pot-provider"
+            f"/archive/refs/tags/{BGUTIL_VERSION}.zip"
+        )
+
+        try:
+            import zipfile
+            import tempfile
+            import urllib.request as _urlreq
+
+            _info("BGUTIL", f"⬇️ Installing bgutil v{BGUTIL_VERSION} (IP bypass for YouTube)...")
+
+            tmp_zip = os.path.join(tempfile.gettempdir(), "bgutil_dl.zip")
+            tmp_ext = os.path.join(tempfile.gettempdir(), "bgutil_ext")
+
+            # Download
+            def _dl():
+                _urlreq.urlretrieve(BGUTIL_URL, tmp_zip)
+            await asyncio.to_thread(_dl)
+
+            # Extract
+            def _unzip():
+                import shutil as _sh3
+                if os.path.exists(tmp_ext):
+                    _sh3.rmtree(tmp_ext)
+                os.makedirs(tmp_ext, exist_ok=True)
+                with zipfile.ZipFile(tmp_zip) as zf:
+                    zf.extractall(tmp_ext)
+            await asyncio.to_thread(_unzip)
+
+            # Find extracted root dir
+            extracted_root = None
+            for _item in os.listdir(tmp_ext):
+                _full = os.path.join(tmp_ext, _item)
+                if os.path.isdir(_full):
+                    extracted_root = _full
+                    break
+            if not extracted_root:
+                raise RuntimeError("bgutil: no directory in extracted archive")
+
+            plugin_src = os.path.join(extracted_root, "plugin")
+            server_src = os.path.join(extracted_root, "server")
+            if not os.path.isdir(plugin_src) or not os.path.isdir(server_src):
+                raise RuntimeError("bgutil: unexpected archive layout")
+
+            # Copy to vendor/
+            import shutil as _sh4
+            bgutil_home = _BGUTIL_HOME
+            plugin_dst = os.path.join(bgutil_home, "plugin")
+            server_dst = os.path.join(bgutil_home, "server")
+            os.makedirs(bgutil_home, exist_ok=True)
+            if os.path.exists(plugin_dst):
+                _sh4.rmtree(plugin_dst)
+            if os.path.exists(server_dst):
+                _sh4.rmtree(server_dst)
+            await asyncio.to_thread(_sh4.copytree, plugin_src, plugin_dst)
+            await asyncio.to_thread(_sh4.copytree, server_src, server_dst)
+
+            # Register plugin with yt-dlp
+            if plugin_dst not in _sys_top.path:
+                _sys_top.path.insert(0, plugin_dst)
+
+            # Find Deno (self-heal at runtime when the build hook failed)
+            deno = await asyncio.to_thread(ensure_deno_runtime, logger)
+            if not deno:
+                _info("BGUTIL_WARN", "⚠️ Deno not found — bgutil downloaded but provider inactive. Songs will still play via direct cookie path.")
+                return
+
+            # deno install
+            def _deno_install():
+                _ensure_deno_cache_env()
+                return subprocess.run(
+                    [deno, "install", "--allow-scripts=npm:canvas", "--frozen"],
+                    cwd=server_dst, capture_output=True, timeout=180,
+                    env={**os.environ},
+                )
+            res = await asyncio.to_thread(_deno_install)
+            if res.returncode != 0:
+                _info("BGUTIL_WARN", f"⚠️ bgutil deno install error: {res.stderr.decode()[:300]}")
+                return
+
+            # Verify
+            gen_once = os.path.join(server_dst, "src", "generate_once.ts")
+            if os.path.isfile(gen_once):
+                _BGUTIL_ACTIVE = True
+                # Bring the warm HTTP provider up right away.
+                with contextlib.suppress(Exception):
+                    asyncio.create_task(warm_up_bgutil_server())
+                _info("BGUTIL", "✅ bgutil runtime install complete — PO-token provider active!")
+            else:
+                _info("BGUTIL_WARN", "⚠️ bgutil: generate_once.ts missing after install")
+
+            # Cleanup
+            def _cleanup():
+                import shutil as _sh5
+                _sh5.rmtree(tmp_ext, ignore_errors=True)
+                try:
+                    os.unlink(tmp_zip)
+                except Exception:
+                    pass
+            await asyncio.to_thread(_cleanup)
+
+        except Exception as _be:
+            _info("BGUTIL_ERR", f"⚠️ bgutil runtime install failed: {_be}. Continuing with cookie-only path.")
+
+
+def _build_extractor_args(yt_args: dict) -> dict:
+    """Wrap youtube extractor args and add bgutil PO-token provider if installed.
+
+    bgutil (https://github.com/Brainicism/bgutil-ytdlp-pot-provider) provides
+    real Proof-of-Origin tokens to yt-dlp, which YouTube now requires for
+    cloud/datacenter IPs. Without it, most innertube clients return
+    'No video formats found!' on Heroku/Railway/Render.
+
+    The provider is installed by bin/post_compile at Heroku build time.
+    On a fresh deploy it will be missing (shows ⚠️ above); redeploy to get it.
+    """
+    providers: dict = {"youtube": yt_args}
+    providers.update(_bgutil_provider_args())
+    return providers
+
 
 def _yt_base_opts(out_tmpl: str, client: str, fmt: str) -> dict:
     """Build yt-dlp options with all stability/bypass techniques applied.
@@ -3370,13 +4920,16 @@ def _yt_base_opts(out_tmpl: str, client: str, fmt: str) -> dict:
     clients authenticate fully and get the complete DASH manifest including
     separate audio-only streams — 'bestaudio' works correctly.
     """
-    # Build extractor_args — skip po_token gate only when no cookies are active
-    ext_args_yt: dict = {"player_client": yt_clients([client])}
-    _cookies_active = bool(_YTDLP_COOKIE_FILE)
-    if client in _YT_NO_POTOKEN_CLIENTS and not _cookies_active:
-        # Without cookies, skip the webpage fetch to avoid the bot-check gate.
-        # With cookies, we MUST NOT skip it — we need the full format manifest.
-        ext_args_yt["player_skip"] = ["webpage"]
+    # BUG FIX (Heroku: "Failed to extract any player response"):
+    # player_skip=["webpage"] ab har client ko tod deta hai — YouTube bina
+    # webpage ke player response hi nahi bhejta. Isliye player_skip hata diya
+    # aur Melody wala formats=missing_pot laga diya, jisse PO-token na milne
+    # par bhi formats visible rehte hain.
+    ext_args_yt: dict = {
+        "player_client": yt_clients([client]),
+        "formats": ["missing_pot"],
+    }
+
 
     class _QuietYtdlpLogger:
         def debug(self, msg): pass
@@ -3389,14 +4942,25 @@ def _yt_base_opts(out_tmpl: str, client: str, fmt: str) -> dict:
         "logger": _QuietYtdlpLogger(),
         "nocheckcertificate": True,        # technique #14
         "geo_bypass": True,                # technique #12
+        "geo_bypass_country": "US",        # spoof US location for regional blocks
         "force_ipv4": True,                # technique #11
-        "prefer_free_formats": True,       # technique #24
+        # prefer_free_formats removed: it filters out m4a/mp4 which are
+        # YouTube's primary audio formats on server IPs, causing empty format
+        # lists ("No video formats found!"). Codec preference is handled by
+        # the postprocessors (opus output) instead.
+
         # BUG FIX: 30→15s — faster fail-over across the 13-client ladder.
         # socket_timeout governs TCP idle, not total extraction, so 15s
         # is still generous while preventing one stuck client from blocking
         # the event loop for up to 13×30=390 s per song.
         "socket_timeout": 15,              # technique #33
         "retries": 3,                      # technique #32
+        # BUG FIX: extractor_retries 5→1 on cloud/Heroku IPs.
+        # "No video formats found!" is a SYSTEMATIC YouTube block, not a
+        # transient glitch — retrying the same client 5 times just wastes
+        # 10-15s per client before moving on. With 1 retry we fail fast
+        # and the outer client loop reaches tv_embedded/Piped much sooner.
+        "extractor_retries": 1,            # fail fast on datacenter IP blocks
         "fragment_retries": 5,             # technique #30
         "noplaylist": True,
         "concurrent_fragment_downloads": 1, # technique #34
@@ -3406,6 +4970,7 @@ def _yt_base_opts(out_tmpl: str, client: str, fmt: str) -> dict:
         # report 'Requested format is not available' even when the URL is
         # fine. check_formats=False skips the probe; ffmpeg validates on open.
         "check_formats": False,
+        "ignore_no_formats_error": True,
         "format": fmt,
         "outtmpl": out_tmpl,
         # HTTP headers — realistic, ROTATING browser fingerprint (jugad #10)
@@ -3424,11 +4989,11 @@ def _yt_base_opts(out_tmpl: str, client: str, fmt: str) -> dict:
         # play(). Producing Opus directly here skips that extra transcode
         # generation, which cuts CPU/RAM per track and shaves startup
         # latency versus the old "always MP3" pipeline.
-        "postprocessors": [{
-            "key": "FFmpegExtractAudio",
-            "preferredcodec": "opus",
-            "preferredquality": "192",  # good headroom above Telegram VC's ceiling
-        }],
+        # BUG FIX: only ask ffmpeg to do this if it's actually available —
+        # otherwise yt-dlp's automatic fixup postprocessors still try to
+        # invoke a nonexistent ffmpeg and crash with "ffprobe and ffmpeg
+        # not found", even though our own postprocessor list is empty.
+        **_youtube_audio_opts(),  # preserve source audio for faster startup
         # FFmpeg reconnect + low-latency flags (techniques #27-29, jugad #6):
         # nobuffer/low_delay/tiny probesize shrink startup latency so a
         # track begins streaming to the voice chat almost immediately
@@ -3444,14 +5009,36 @@ def _yt_base_opts(out_tmpl: str, client: str, fmt: str) -> dict:
                 "-analyzeduration", "0",
             ]
         },
-        # Innertube client + bot-check bypass
-        "extractor_args": {
-            "youtube": ext_args_yt,
-        },
-        "plugin_dirs": [],
-        # Cookie support — auto-injected if YTDLP_COOKIES env var is set.
-        # Enables age-restricted / geo-locked / bot-checked video playback.
-        **_cookie_opts(),
+        # curl-cffi TLS impersonation (jugad #42) — makes all HTTP(S) requests
+        # from yt-dlp look like real Chrome at the TLS/JA3 fingerprint level.
+        # YouTube and googlevideo CDN use TLS fingerprinting to detect cloud IPs;
+        # impersonating Chrome bypasses this check without needing a proxy.
+        **_get_impersonate_opt(),
+        # ── MUSICBOT JUGAD ── js_runtimes + remote_components ──────────────
+        # YouTube now requires a JavaScript runtime to solve its player challenge.
+        # Without Deno + ejs:github this entire client ladder returns
+        # "No video formats found!" on Heroku/cloud IPs regardless of cookies.
+        # bin/post_compile installs Deno to vendor/deno/bin/deno at build time.
+        **_get_js_runtime_opts(),
+        # Innertube client + bot-check bypass + bgutil PO-token provider
+        # bgutil is auto-installed at runtime on first use (_ensure_bgutil_runtime).
+        # It generates Proof-of-Origin tokens that YouTube now requires for
+        # cloud-IP requests — without it most clients return "No video formats".
+        "extractor_args": _build_extractor_args(ext_args_yt),
+        # BUG FIX: DO NOT inject cookies for Tier-1 no-PO-token clients.
+        # tv_embedded / android_vr / web_creator / android_testsuite use
+        # player_skip=["webpage"] to bypass the sign-in gate entirely —
+        # they work COOKIE-FREE by design. Injecting a cookiefile for these
+        # clients can confuse yt-dlp's auth flow and produce "No video
+        # formats found!" even when the cookie-free path would succeed.
+        # Cookies are only useful for authenticated DASH clients (web,
+        # android, ios) that can leverage the full session manifest.
+        # ROOT-CAUSE FIX: _YT_NO_POTOKEN_CLIENTS is an empty set, so a cookie
+        # jar was attached to EVERY client — including android/ios/tv_simply,
+        # which yt-dlp then skips entirely ("does not support cookies"),
+        # leaving zero clients and the exact "No video formats found!" error
+        # from the log. Ask the real cookie-capability map instead.
+        **({} if not _clients_accept_cookies([client]) else _cookie_opts()),
     }
 
 
@@ -3490,6 +5077,10 @@ async def _yt_try_download(search_target: str, out_tmpl: str, client_name: str,
             "extract_flat": True,   # metadata only, no download
             "skip_download": True,
             "quiet": True,
+            # CRITICAL FIX: ytsearch1:/ytsearch5: returns a "SearchResultsPlaylist"
+            # internally. noplaylist=True (default in _yt_base_opts) makes yt-dlp
+            # 2025.x+ refuse to process it → silent empty result.
+            "noplaylist": False,
         }
         info_opts.pop("postprocessors", None)
         info_opts.pop("outtmpl", None)
@@ -3518,6 +5109,12 @@ async def _yt_try_download(search_target: str, out_tmpl: str, client_name: str,
     # Actual download: use best_url if we found one, otherwise original target
     download_target = best_url if best_url else search_target
     opts = _yt_base_opts(out_tmpl, client_name, fmt)
+    # CRITICAL FIX: ytsearch* targets return a "SearchResultsPlaylist" internally.
+    # noplaylist=True (set in _yt_base_opts) causes yt-dlp 2025.x+ to silently
+    # refuse to process it → "No video formats found" / empty result with no error.
+    # Override to False for any search target; True stays for direct video URLs.
+    if download_target.startswith(("ytsearch", "ytmsearch", "scsearch")):
+        opts["noplaylist"] = False
 
     def _run():
         try:
@@ -3533,32 +5130,22 @@ async def _yt_try_download(search_target: str, out_tmpl: str, client_name: str,
     try:
         info = await asyncio.to_thread(_run)
         if info:
-            # Primary: FFmpeg-converted native Opus (jugad #7 — see _yt_base_opts).
-            # "mp3" is still checked as a compat fallback for any older/custom
-            # yt-dlp postprocessor config that hasn't switched over.
-            for primary_ext in ("opus", "mp3"):
-                primary = out_tmpl.replace("%(ext)s", primary_ext)
-                if os.path.exists(primary) and os.path.getsize(primary) > 4096:
-                    return {
-                        "title":     info.get("title", search_target),
-                        "file_path": primary,
-                        "duration":  int(info.get("duration") or 0),
-                        "thumbnail": info.get("thumbnail"),
-                        "source":    "youtube",
-                    }
-            # Fallback: raw audio format downloaded without FFmpeg postprocessing.
-            # pytgcalls can decode m4a/webm/opus natively, so these are playable
-            # even when the ffmpeg binary is absent on the host (e.g. bare Heroku).
-            for raw_ext in ("m4a", "webm", "opus", "ogg", "aac", "mp4"):
-                raw = out_tmpl.replace("%(ext)s", raw_ext)
-                if os.path.exists(raw) and os.path.getsize(raw) > 4096:
-                    return {
-                        "title":     info.get("title", search_target),
-                        "file_path": raw,
-                        "duration":  int(info.get("duration") or 0),
-                        "thumbnail": info.get("thumbnail"),
-                        "source":    "youtube",
-                    }
+            # Primary: FFmpeg-converted native Opus (jugad #7 — see _yt_base_opts),
+            # warna jo bhi raw audio (m4a/webm/ogg) disk par utra hai — pytgcalls
+            # unhe natively decode kar leta hai.  Path yt-dlp se hi lete hain,
+            # isliye custom outtmpl fields ya postprocessor ki badli hui extension
+            # se ab koi successful download discard nahi hota.
+            found = _resolve_downloaded_file(info, out_tmpl)
+            if found:
+                return {
+                    "title":     info.get("title", search_target),
+                    "file_path": found,
+                    "duration":  int(info.get("duration") or 0),
+                    "thumbnail": info.get("thumbnail"),
+                    "source":    "youtube",
+                }
+            logger("MUSIC_DL_ERR",
+                   f"yt_dl [{client_name}]: file missing after download ({out_tmpl})")
     except Exception:
         pass
 
@@ -3574,9 +5161,12 @@ async def _yt_try_download(search_target: str, out_tmpl: str, client_name: str,
 async def _yt_try_piped(video_id: str, out_tmpl: str, logger=None) -> dict | None:
     """Technique #37: Piped.video open-source API fallback for known video IDs."""
     logger = logger or (lambda *a: None)
-    if not video_id or yt_dlp is None:
+    # BUG FIX: this used the bare name `aiohttp`, which is never imported in
+    # this module (the import is aliased to `_aiohttp`). Every Piped fallback
+    # attempt therefore died with NameError instead of returning a stream.
+    if not video_id or yt_dlp is None or _aiohttp is None:
         return None
-    for api in await _get_piped_apis():
+    for api in _live_hosts(await _get_piped_apis()):
         url = f"{api}/streams/{video_id}"
         try:
             async with _make_aiohttp_session() as sess:
@@ -3593,24 +5183,36 @@ async def _yt_try_piped(video_id: str, out_tmpl: str, logger=None) -> dict | Non
             title      = data.get("title", video_id)
             duration   = int(data.get("duration") or 0)
 
-            # Download the stream URL with yt-dlp generic downloader
+            # BUG FIX: requests+ffmpeg se download karo (yt-dlp nahi)
+            # Piped stream URL googlevideo.com proxy hai — direct requests
+            # se download Heroku pe kaam karta hai.
+            raw_path = out_tmpl.replace("%(ext)s", "piped_raw")
             mp3_path = out_tmpl.replace("%(ext)s", "mp3")
-            opts = {
-                "quiet": True, "no_warnings": True,
-                "format": "bestaudio/best",
-                "outtmpl": out_tmpl,
-                "postprocessors": [{"key": "FFmpegExtractAudio",
-                                    "preferredcodec": "mp3", "preferredquality": "256"}],
-                "external_downloader_args": {"ffmpeg_i": ["-reconnect", "1",
-                    "-reconnect_streamed", "1", "-reconnect_delay_max", "5"]},
-            }
-            def _run(u=stream_url):
+            def _run_raw(u=stream_url):
                 try:
-                    with yt_dlp.YoutubeDL(opts) as ydl:
-                        ydl.extract_info(u, download=True)
+                    with requests.get(u, stream=True, timeout=90,
+                                      headers={"User-Agent": random_ua()},
+                                      allow_redirects=True) as r:
+                        r.raise_for_status()
+                        with open(raw_path, "wb") as fh:
+                            for chunk in r.iter_content(chunk_size=1 << 16):
+                                if chunk: fh.write(chunk)
                 except Exception:
                     pass
-            await asyncio.to_thread(_run)
+            await asyncio.to_thread(_run_raw)
+            if not os.path.exists(raw_path) or os.path.getsize(raw_path) < 4096:
+                continue
+            try:
+                proc = await asyncio.create_subprocess_exec(
+                    "ffmpeg", "-y", "-i", raw_path,
+                    "-vn", "-ar", "44100", "-ac", "2", "-b:a", "320k", mp3_path,
+                    stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL,
+                )
+                await proc.wait()
+            except Exception:
+                pass
+            with contextlib.suppress(Exception):
+                os.remove(raw_path)
             if os.path.exists(mp3_path) and os.path.getsize(mp3_path) > 4096:
                 logger("MUSIC_DL", f"Piped [{api}] ✓ {title!r}")
                 return {"title": title, "file_path": mp3_path,
@@ -3625,7 +5227,7 @@ async def _yt_try_invidious(video_id: str, out_tmpl: str, logger=None) -> dict |
     logger = logger or (lambda *a: None)
     if not video_id or yt_dlp is None:
         return None
-    for instance in _INVIDIOUS:
+    for instance in _live_hosts(_INVIDIOUS):
         try:
             # Use yt-dlp with invidious URL — it uses the generic extractor
             inv_url = f"{instance}/watch?v={video_id}"
@@ -3637,8 +5239,7 @@ async def _yt_try_invidious(video_id: str, out_tmpl: str, logger=None) -> dict |
                 "format": "bestaudio/best",
                 "outtmpl": out_tmpl,
                 "retries": 2,
-                "postprocessors": [{"key": "FFmpegExtractAudio",
-                                    "preferredcodec": "mp3", "preferredquality": "256"}],
+                **_audio_pp("mp3", "256"),
                 "external_downloader_args": {"ffmpeg_i": ["-reconnect", "1",
                     "-reconnect_streamed", "1", "-reconnect_delay_max", "5"]},
             }
@@ -3689,10 +5290,13 @@ async def piped_search_download(query: str, out_tmpl: str, logger=None) -> dict 
     if _aiohttp is None or yt_dlp is None:
         return None
 
-    _timeout = _aiohttp.ClientTimeout(total=12)
+    # BUG FIX: 12s→7s per instance — Piped instances that are slow/down
+    # were silently blocking the event loop for 12s each with no log output,
+    # causing a visible 15-20s pause before Phase 1 kicked in.
+    _timeout = _aiohttp.ClientTimeout(total=7)
     _hdrs    = {"User-Agent": random_ua()}
 
-    for api in await _get_piped_apis():
+    for api in _live_hosts(await _get_piped_apis()):
         try:
             # ── Step 1: Search ──────────────────────────────────────────
             video_id = title = None
@@ -3709,6 +5313,10 @@ async def piped_search_download(query: str, out_tmpl: str, logger=None) -> dict 
                             timeout=_timeout,
                         ) as r:
                             if r.status != 200:
+                                # BUG FIX: log non-200 so dead Piped instances
+                                # are visible in Heroku logs (was silent before)
+                                _mark_host_dead(api)
+                                logger("MUSIC_DL_ERR", f"piped_search [{api}]: HTTP {r.status}")
                                 continue
                             data = await r.json(content_type=None)
                     items = [i for i in (data.get("items") or [])
@@ -3756,52 +5364,52 @@ async def piped_search_download(query: str, out_tmpl: str, logger=None) -> dict 
             a_streams.sort(key=lambda s: s.get("bitrate", 0), reverse=True)
             stream_url = a_streams[0]["url"]
 
-            # ── Step 3: Download via yt-dlp ─────────────────────────────
+            # ── Step 3: Download via requests+ffmpeg (yt-dlp nahi) ──────
+            # BUG FIX: yt-dlp Piped stream URL ko YouTube extractor se handle
+            # karta tha aur googlevideo.com hit karta tha → Heroku pe block.
+            # Ab: requests se seedha Piped proxy URL download karo (Piped apne
+            # servers se serve karta hai), ffmpeg se mp3 banao. JioSaavn wali
+            # same approach — Heroku pe 100% kaam karti hai.
+            raw_path = out_tmpl.replace("%(ext)s", "piped_raw")
             mp3_path = out_tmpl.replace("%(ext)s", "mp3")
-            dl_opts  = {
-                "quiet":             True,
-                "no_warnings":       True,
-                "nocheckcertificate": True,
-                "format":            "bestaudio/best",
-                "outtmpl":           out_tmpl,
-                "socket_timeout":    20,
-                "postprocessors": [{
-                    "key":              "FFmpegExtractAudio",
-                    "preferredcodec":   "mp3",
-                    "preferredquality": "256",
-                }],
-                "external_downloader_args": {
-                    "ffmpeg_i": ["-reconnect", "1",
-                                 "-reconnect_streamed", "1",
-                                 "-reconnect_delay_max", "5"]
-                },
-            }
 
-            def _dl(url=stream_url, opts=dl_opts):
+            def _dl_raw(url=stream_url):
                 try:
-                    with yt_dlp.YoutubeDL(opts) as ydl:
-                        ydl.extract_info(url, download=True)
+                    with requests.get(url, stream=True, timeout=90,
+                                      headers={"User-Agent": random_ua()},
+                                      allow_redirects=True) as r:
+                        r.raise_for_status()
+                        with open(raw_path, "wb") as fh:
+                            for chunk in r.iter_content(chunk_size=1 << 16):
+                                if chunk:
+                                    fh.write(chunk)
                 except Exception:
                     pass
 
-            await asyncio.to_thread(_dl)
+            await asyncio.to_thread(_dl_raw)
+            if not os.path.exists(raw_path) or os.path.getsize(raw_path) < 4096:
+                continue  # is instance ne kaam nahi kiya, agli try karo
 
-            # MP3 (with FFmpeg) or raw audio (without FFmpeg — both playable)
+            try:
+                proc = await asyncio.create_subprocess_exec(
+                    "ffmpeg", "-y", "-i", raw_path,
+                    "-vn", "-ar", "44100", "-ac", "2", "-b:a", "320k", mp3_path,
+                    stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL,
+                )
+                await proc.wait()
+            except Exception:
+                pass
+            with contextlib.suppress(Exception):
+                os.remove(raw_path)
+
             if os.path.exists(mp3_path) and os.path.getsize(mp3_path) > 4096:
                 logger("MUSIC_DL", f"Piped ✓ [{api}] '{title[:50]}'")
                 return {"title": title, "file_path": mp3_path,
                         "duration": duration, "thumbnail": thumbnail,
                         "source": "piped"}
 
-            for raw_ext in ("m4a", "webm", "opus", "ogg", "aac"):
-                raw = out_tmpl.replace("%(ext)s", raw_ext)
-                if os.path.exists(raw) and os.path.getsize(raw) > 4096:
-                    logger("MUSIC_DL", f"Piped raw/{raw_ext} ✓ [{api}] '{title[:50]}'")
-                    return {"title": title, "file_path": raw,
-                            "duration": duration, "thumbnail": thumbnail,
-                            "source": "piped"}
-
         except Exception as exc:
+            _mark_host_dead(api)
             logger("MUSIC_DL_ERR", f"piped_search [{api}]: {exc}")
             continue
 
@@ -3815,8 +5423,11 @@ async def _yt_search_via_invidious(query: str, out_tmpl: str, logger=None) -> di
     logger = logger or (lambda *a: None)
     if _aiohttp is None or yt_dlp is None:
         return None
-    _timeout = _aiohttp.ClientTimeout(total=10)
-    for instance in _INVIDIOUS:
+    # BUG FIX: timeout 10s→5s per instance — dead instances were blocking
+    # the event loop for 10s each; with 9 instances that's up to 90s of
+    # waiting. 5s is still generous for a live instance over HTTPS.
+    _timeout = _aiohttp.ClientTimeout(total=5)
+    for instance in _live_hosts(_INVIDIOUS):
         try:
             _hdrs = {"User-Agent": random_ua()}
             async with _make_aiohttp_session() as sess:
@@ -3824,6 +5435,8 @@ async def _yt_search_via_invidious(query: str, out_tmpl: str, logger=None) -> di
                                      params={"q": query, "type": "video"},
                                      headers=_hdrs, timeout=_timeout) as r:
                     if r.status != 200:
+                        _mark_host_dead(instance)
+                        logger("MUSIC_DL_ERR", f"_yt_search_via_invidious [{instance}]: HTTP {r.status}")
                         continue
                     results = await r.json(content_type=None)
             if not results:
@@ -3838,25 +5451,46 @@ async def _yt_search_via_invidious(query: str, out_tmpl: str, logger=None) -> di
                 result["title"] = result.get("title") or title
                 return result
         except Exception as exc:
+            _mark_host_dead(instance)
             logger("MUSIC_DL_ERR", f"_yt_search_via_invidious [{instance}]: {exc}")
             continue
     return None
 
 
 async def youtube_search_download(query: str, out_tmpl: str, logger=None) -> dict | None:
-    """Strict bounded audio race: direct CDN and parallel download together."""
+    """Resolve and download audio using the complete resilient client ladder.
+
+    The old fast path forced ``player_client=["web"]`` here. That bypassed
+    the cookie-aware Android/Safari/TV ladder below and reliably failed on
+    cloud IPs with YouTube's bot-check page, even when cookies and a Data API
+    key were configured.
+    """
     logger = logger or (lambda *a: None)
     if yt_dlp is None:
         return None
-    target = query if query.startswith(("http://", "https://")) else "ytsearch1:" + query
-    clients = list(dict.fromkeys(yt_clients(_YT_CLIENTS[:3])))
-    try: fmt=_yt_build_format_chain()[0]
-    except Exception: fmt="bestaudio/best"
+
+    # The Data API selects a stable video URL; yt-dlp still performs the
+    # authenticated media download through the full client ladder.
+    download_target = query
+    if not (query.startswith("http://") or query.startswith("https://")) and yt_api_enabled():
+        try:
+            api_hit = await yt_api_search(query, logger=logger, video=False)
+            if api_hit and api_hit.get("url"):
+                download_target = api_hit["url"]
+                logger("MUSIC_YT_API", f"selected {api_hit.get('video_id', '?')} for {query!r}")
+        except Exception as exc:
+            logger("MUSIC_YT_API_ERR", f"{type(exc).__name__}: {exc}")
+
     async def _parallel_round(round_no: int):
+        # One native yt-dlp worker at a time. The downloader itself walks the
+        # complete cookie-aware client ladder; do not override it with a
+        # single web client, which is bot-gated on hosted/cloud IPs.
+        workers = [(None, None)]
         tasks=[]
-        for client in clients:
-            tmpl=out_tmpl.replace("%(ext)s", f"_parallel{round_no}_{client}.%(ext)s")
-            tasks.append(asyncio.create_task(_yt_try_download(target, tmpl, client, fmt, logger)))
+        for client, fmt in workers:
+            target=out_tmpl.replace("%(ext)s", f"_parallel{round_no}_ladder.%(ext)s")
+            tasks.append(asyncio.create_task(asyncio.to_thread(
+                _cloud_download_sync, download_target, target, True, logger)))
         try:
             for task in asyncio.as_completed(tasks):
                 try: result=await task
@@ -3868,15 +5502,29 @@ async def youtube_search_download(query: str, out_tmpl: str, logger=None) -> dic
                 if not task.done(): task.cancel()
             await asyncio.gather(*tasks, return_exceptions=True)
         return None
+
     async def _parallel_download():
         for round_no in (1, 2):
-            # Direct CDN winners remain immediate; preserve valid local files.
-            try: result=await asyncio.wait_for(_parallel_round(round_no), timeout=30.0)
+            try:
+                # Direct CDN winners remain immediate; let a valid local
+                # web_safari/web worker finish instead of discarding it early.
+                result=await asyncio.wait_for(_parallel_round(round_no), timeout=30.0)
             except Exception as exc:
                 logger("MUSIC_PARALLEL_ERR", f"round={round_no}: {type(exc).__name__}: {exc!r}"); result=None
             if result: return result
             if round_no == 1: await asyncio.sleep(0.1)
         return None
+
+    async def _direct_provider(fn):
+        try:
+            result = await fn(query, logger=logger, allow_live=False)
+            url = (result or {}).get("stream_url") if result else None
+            if result and url and await _direct_stream_is_live(url):
+                return result
+        except Exception as exc:
+            logger("MUSIC_DIRECT_PROVIDER_ERR", f"{getattr(fn, '__name__', 'provider')}: {type(exc).__name__}: {exc!r}")
+        return None
+
     async def _piped_to_local_fast():
         """Convert a fast Piped audio URL to a local file before playback."""
         try:
@@ -3922,12 +5570,20 @@ async def youtube_search_download(query: str, out_tmpl: str, logger=None) -> dic
                 if not task.done():
                     task.cancel()
             await asyncio.gather(*all_tasks, return_exceptions=True)
-    try: result=await asyncio.wait_for(_race(), timeout=40.0)
-    except asyncio.TimeoutError:
-        logger("MUSIC_RACE_TIMEOUT", f"bounded 40s deadline: {query!r}"); result=None
-    except Exception as exc:
-        logger("MUSIC_RACE_ERR", repr(exc)); result=None
-    if result: return result
+    # Only one disk/yt-dlp race may run at a time on a low-memory dyno.
+    # Cancelling asyncio.to_thread tasks does not stop their native work, so
+    # overlapping .play requests otherwise leave several ffmpeg/yt-dlp jobs alive.
+    async with _MUSIC_DOWNLOAD_LOCK:
+        try:
+            result=await asyncio.wait_for(_race(), timeout=40.0)
+        except asyncio.TimeoutError:
+            logger("MUSIC_RACE_TIMEOUT", f"bounded 40s deadline: {query!r}")
+            result=None
+        except Exception as exc:
+            logger("MUSIC_RACE_ERR", repr(exc)); result=None
+    if result:
+        logger("MUSIC_YT", f"✓ [direct+parallel-race] {result.get('title', query)!r}")
+        return result
     logger("MUSIC_YT_FAIL", f"Direct+parallel race failed within strict deadline: {query!r}")
     return None
 async def youtube_video_download(query: str, out_tmpl: str, logger=None) -> dict | None:
@@ -3937,12 +5593,18 @@ async def youtube_video_download(query: str, out_tmpl: str, logger=None) -> dict
     if yt_dlp is None:
         return None
 
-    try:
-        await _ensure_ytdlp_updated()
-    except Exception:
-        pass
-
+    # yt-dlp updates run in the startup warm-up, never in a user request.
     is_direct = bool(_URL_RE.match(query.strip()))
+
+    # FAST PATH: Data API v3 se query → watch URL (see yt_api_search).
+    api_title = None
+    if not is_direct and yt_api_enabled():
+        _api = await yt_api_search(query, logger, video=True)
+        if _api:
+            query     = _api["url"]
+            api_title = _api["title"]
+            is_direct = True
+
     norm_q    = _yt_normalize_query(query)
     simp_q    = _yt_simplify_query(norm_q)
     ts        = int(time.time() * 1000)
@@ -3965,10 +5627,17 @@ async def youtube_video_download(query: str, out_tmpl: str, logger=None) -> dict
     #      (2) drop m4a from the chain, (3) cycle ALL formats per client,
     #      (4) check_formats=False to skip CDN HEAD probes that return 403,
     #      (5) inject cookies, (6) accept any output extension.
+    # BUG FIX (logs: repeated "Requested format is not available"):
+    # har format alag attempt tha, isliye ek client ke liye 4 baar extraction
+    # chalti thi aur kisi bhi format ke na milne par poora ladder loop karta
+    # tha. Ab har entry khud slash-fallback chain hai — yt-dlp ek hi
+    # extraction me neeche gir jaata hai — aur aakhri entry "best" hai jo
+    # kabhi fail nahi hoti. Do hi attempts per client.
     video_fmts = [
-        "best[height<=720][vcodec!=none][acodec!=none]",   # single container, no mux
-        "bestvideo[height<=720][ext=webm]+bestaudio[ext=webm]/bestvideo[height<=720]+bestaudio",
-        "bestvideo[height<=480]+bestaudio/best[height<=480]/best",
+        ("best[height<=720][vcodec!=none][acodec!=none]/"
+         "bestvideo[height<=720]+bestaudio/"
+         "best[height<=720]/"
+         "bestvideo+bestaudio/best"),
         "best",
     ]
 
@@ -3991,8 +5660,15 @@ async def youtube_video_download(query: str, out_tmpl: str, logger=None) -> dict
                     "external_downloader_args": {"ffmpeg_i": [
                         "-reconnect", "1", "-reconnect_streamed", "1", "-reconnect_delay_max", "5",
                     ]},
-                    "extractor_args": {"youtube": {"player_client": yt_clients([client])}},
-                    **_cookie_opts(),               # BUG FIX: inject cookies
+                    # missing_pot: PO-token na mile to bhi formats hide na ho.
+                    "extractor_args": {"youtube": {
+                        "player_client": yt_clients([client]),
+                        "formats": ["missing_pot"],
+                    }},
+                    # Cookies only for clients that support them — attaching a
+                    # cookie jar to android/ios/tv_simply makes yt-dlp skip the
+                    # client and report "No video formats found!".
+                    **(_cookie_opts() if _clients_accept_cookies([client]) else {}),
                 }
 
                 def _run(o=opts, st=search_target):
@@ -4026,7 +5702,7 @@ async def youtube_video_download(query: str, out_tmpl: str, logger=None) -> dict
                         if found_file:
                             logger("MUSIC_YT_VID", f"✓ [{client}] {info.get('title', query)!r}")
                             return {
-                                "title":     info.get("title", query),
+                                "title":     info.get("title") or api_title or query,
                                 "file_path": found_file,
                                 "duration":  int(info.get("duration") or 0),
                                 "thumbnail": info.get("thumbnail"),
