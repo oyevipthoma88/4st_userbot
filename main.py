@@ -7296,28 +7296,120 @@ def create_event_handler(client, core_id=None):
         # ORIGINAL COMMANDS
         # ══════════════════════════════════════════
 
-        elif re.match(r"(?i)^\.bcast(?:\s+(gc|users|all|cores))?(?:\s+([\s\S]+))?$", text):
-            # .bcast [gc|users|all|cores] <message>
-            # Direct broadcast command — owner/sudo only.
-            if not await verify_privileges(event, client=client, strict_owner_only=True):
+        elif re.match(r"(?i)^\.bcast(?:\s+(myg|mydm|myall|gc|users|all|cores))?(?:\s+([\s\S]+))?$", text):
+            # .bcast [scope] <message>
+            # Scopes for ANY account holder (owner + sudo):
+            #   myg   → all groups THIS account is member of
+            #   mydm  → all DMs (users, not bots/channels) of THIS account
+            #   myall → groups + DMs of THIS account
+            # Owner-only scopes (bot-side):
+            #   gc    → bot-tracked groups (via asstbot)
+            #   users → bot-tracked users (DM via asstbot)
+            #   cores → Saved Messages of all logged-in cores
+            #   all   → gc + users + cores (owner only)
+            if not await verify_privileges(event, client=client):
                 return
             asyncio.create_task(event.delete())
-            _m_b = re.match(r"(?i)^\.bcast(?:\s+(gc|users|all|cores))?(?:\s+([\s\S]+))?$", text)
-            _scope = (_m_b.group(1) or "all").lower()
+            _m_b = re.match(r"(?i)^\.bcast(?:\s+(myg|mydm|myall|gc|users|all|cores))?(?:\s+([\s\S]+))?$", text)
+            _scope = (_m_b.group(1) or "myall").lower()
             _payload = (_m_b.group(2) or "").strip()
+            _is_owner = (event.sender_id == cfg.get("OWNER_ID", 0)) or (my_id == cfg.get("OWNER_ID", 0))
+            _owner_scopes = {"gc", "users", "all", "cores"}
+            if _scope in _owner_scopes and not _is_owner:
+                await safe_send_and_track(client, chat_id,
+                    "<blockquote>❌ <b>That broadcast scope is owner-only.</b>\n"
+                    "Use: <code>.bcast myg</code> / <code>.bcast mydm</code> / <code>.bcast myall</code></blockquote>")
+                return
             if not _payload:
                 await safe_send_and_track(client, chat_id,
                     "<blockquote>📢 <b>BROADCAST</b>\n\n"
-                    "<b>Usage:</b> <code>.bcast [gc|users|all|cores] &lt;message&gt;</code>\n\n"
-                    "  <code>.bcast gc Hello GCs</code> — all tracked groups\n"
-                    "  <code>.bcast users Hello users</code> — all bot users (DM)\n"
-                    "  <code>.bcast all Hello everyone</code> — GCs + Users\n"
-                    "  <code>.bcast cores Hello cores</code> — Saved Messages of all cores\n"
-                    "  <code>.bcast Hello everyone</code> — default: all</blockquote>")
+                    "<b>Usage:</b> <code>.bcast [scope] &lt;message&gt;</code>\n\n"
+                    "<b>Your account scopes:</b>\n"
+                    "  <code>.bcast myg Hello</code> — all your groups\n"
+                    "  <code>.bcast mydm Hello</code> — all your DMs\n"
+                    "  <code>.bcast myall Hello</code> — groups + DMs (default)\n\n"
+                    "<b>Owner-only scopes:</b>\n"
+                    "  <code>.bcast gc Hello</code> — bot-tracked groups\n"
+                    "  <code>.bcast users Hello</code> — bot-tracked users\n"
+                    "  <code>.bcast all Hello</code> — gc + users + cores\n"
+                    "  <code>.bcast cores Hello</code> — all cores' Saved Messages</blockquote>")
                 return
             _prog = await safe_send_and_track(client, chat_id,
                 f"<blockquote>🚀 <b>Broadcasting ({_scope})...</b></blockquote>")
             _g_ok = _g_fail = _u_ok = _u_fail = _c_ok = _c_fail = 0
+
+            # ── User-scoped: iterate THIS account's own dialogs ──
+            if _scope in ("myg", "mydm", "myall"):
+                _my_g = 0; _my_g_fail = 0; _my_dm = 0; _my_dm_fail = 0
+                try:
+                    _dlg_count = 0
+                    async for dialog in client.iter_dialogs():
+                        _dlg_count += 1
+                        if _dlg_count > 300:
+                            break
+                        _eid = dialog.entity.id
+                        _is_group = dialog.is_group
+                        _is_user = (not dialog.is_group and not dialog.is_channel)
+                        if _scope == "myg" and not _is_group:
+                            continue
+                        if _scope == "mydm" and not _is_user:
+                            continue
+                        if _scope == "myall" and not (_is_group or _is_user):
+                            continue
+                        try:
+                            await client.send_message(_eid,
+                                f"<blockquote>📢 <b>4ST BROADCAST:</b>\n\n{_payload}</blockquote>",
+                                parse_mode='html')
+                            if _is_group:
+                                _my_g += 1
+                            else:
+                                _my_dm += 1
+                            await asyncio.sleep(0.4)
+                        except errors.FloodWaitError as _fw:
+                            if _fw.seconds <= 60:
+                                await asyncio.sleep(_fw.seconds + 1)
+                                try:
+                                    await client.send_message(_eid,
+                                        f"<blockquote>📢 <b>4ST BROADCAST:</b>\n\n{_payload}</blockquote>",
+                                        parse_mode='html')
+                                    if _is_group:
+                                        _my_g += 1
+                                    else:
+                                        _my_dm += 1
+                                except Exception:
+                                    if _is_group:
+                                        _my_g_fail += 1
+                                    else:
+                                        _my_dm_fail += 1
+                            else:
+                                if _is_group:
+                                    _my_g_fail += 1
+                                else:
+                                    _my_dm_fail += 1
+                        except Exception:
+                            if _is_group:
+                                _my_g_fail += 1
+                            else:
+                                _my_dm_fail += 1
+                except Exception:
+                    pass
+                _my_report = []
+                if _scope in ("myg", "myall"):
+                    _my_report.append(f"Groups → Sent: <code>{_my_g}</code> | Failed: <code>{_my_g_fail}</code>")
+                if _scope in ("mydm", "myall"):
+                    _my_report.append(f"DMs → Sent: <code>{_my_dm}</code> | Failed: <code>{_my_dm_fail}</code>")
+                _report = "\n".join(_my_report) or "Nothing sent."
+                if _prog:
+                    try:
+                        await _premium_edit(_prog,
+                            f"<blockquote>✅ <b>Broadcast complete ({_scope})</b>\n{_report}</blockquote>")
+                    except Exception:
+                        pass
+                asyncio.create_task(send_module_log(
+                    f"📢 <b>Broadcast ({_scope})</b>\nBy: <code>{my_id}</code>"))
+                return
+
+            # ── Owner-scoped: bot-side broadcast ──
             if _scope in ("gc", "all"):
                 for gid in list(state.active_bot_groups):
                     try:
@@ -7337,15 +7429,7 @@ def create_event_handler(client, core_id=None):
                         await asyncio.sleep(0.3)
                     except Exception:
                         _u_fail += 1
-            if _scope == "cores":
-                for cl in [userbot] + extra_clients:
-                    try:
-                        await cl.send_message("me",
-                            f"<blockquote>📢 <b>4ST BROADCAST:</b>\n\n{_payload}</blockquote>")
-                        _c_ok += 1
-                    except Exception:
-                        _c_fail += 1
-            if _scope == "all":
+            if _scope in ("cores", "all"):
                 for cl in [userbot] + extra_clients:
                     try:
                         await cl.send_message("me",
@@ -7379,7 +7463,8 @@ def create_event_handler(client, core_id=None):
                 "  .fuck  .ow  .ghost  .sraid\n"
                 "  .stopsraid  .multi  .stop\n\n"
                 "📢  <b>BROADCAST</b>\n"
-                "  .bcast gc|users|all|cores\n"
+                "  .bcast myg|mydm|myall (your chats)\n"
+                "  .bcast gc|users|all|cores (owner)\n"
                 "  .tagall  .otagall  .onetag\n"
                 "  .targetlist  .addtarget\n"
                 "  .rmtarget  .rmtargetall\n\n"
@@ -9269,12 +9354,17 @@ def create_event_handler(client, core_id=None):
                 "sudolist":   ".sudolist — Show all Sudo Level 1 and Level 2 users",
                 "forceplay":  ".playforce [song/URL] — Immediately play song, skipping queue",
                 "q":          ".q — Show music queue (short form of .queue)",
-                "bcast":      ".bcast [gc|users|all|cores] <message> — Direct broadcast from any chat.\n"
-                              "  gc    → all tracked groups\n"
-                              "  users → all bot users (DM)\n"
-                              "  all   → GCs + Users + Cores (default)\n"
-                              "  cores → Saved Messages of all logged-in cores\n"
-                              "<b>Example:</b> <code>.bcast gc Hello everyone!</code>",
+                "bcast":      ".bcast [scope] <message> — Broadcast to your chats.\n"
+                              "<b>Your scopes (owner + sudo):</b>\n"
+                              "  myg   → all groups you're in\n"
+                              "  mydm  → all your DMs\n"
+                              "  myall → groups + DMs (default)\n"
+                              "<b>Owner-only scopes:</b>\n"
+                              "  gc    → bot-tracked groups\n"
+                              "  users → bot-tracked users (DM)\n"
+                              "  all   → gc + users + cores\n"
+                              "  cores → all cores' Saved Messages\n"
+                              "<b>Example:</b> <code>.bcast myg Hello groups!</code>",
             }
             doc = HOW_DOCS.get(cmd_q) or (_generated_command_doc(cmd_q) if cmd_q in _CODE_COMMAND_INDEX else None)
             if doc:
