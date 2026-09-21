@@ -10,6 +10,7 @@ import gc
 import datetime
 import shutil
 import concurrent.futures
+import signal
 import hashlib
 import ast
 import operator as _operator
@@ -1620,6 +1621,10 @@ extra_clients    = []
 # reflect actual connected clients instead of stale saved-session metadata.
 active_core_clients: dict[int, object] = {}
 background_tasks = set()
+# Set in main() once the event loop exists; signal handlers flip it to ask the
+# reconnect loop to exit instead of the process being killed mid-write.
+_shutdown_event = None
+
 _play_in_progress: set[int] = set()   # chats currently processing a .play download — dedup guard for multi-account setups
 
 
@@ -9499,11 +9504,16 @@ def create_event_handler(client, core_id=None):
                     try:
                         import subprocess
                         converted = dl_path.rsplit(".", 1)[0] + ".webp"
-                        subprocess.run(
+                        # BUG FIX: was a blocking subprocess.run() inside the
+                        # async handler — it froze every client's event loop
+                        # (and dropped connections) for up to 15s per .kang.
+                        await asyncio.to_thread(
+                            subprocess.run,
                             ["ffmpeg", "-i", dl_path, "-vf", "scale=512:512:force_original_aspect_ratio=decrease",
                              converted, "-y"],
                             capture_output=True, timeout=15
                         )
+
                         if os.path.exists(converted):
                             sticker_path = converted
                     except Exception:
@@ -10303,7 +10313,12 @@ async def deploy_new_session_string(session_str: str, is_startup: bool = False,
             except Exception:
                 pass
         bot_logger("DEPLOY_OK", f"Core: {me.first_name} ({me.id})")
-        background_tasks.add(asyncio.create_task(_run_extra_core(new_client, int(me.id))))
+        # BUG FIX: prune finished tasks — background_tasks grew forever as
+        # extra cores came and went (memory leak over long uptimes).
+        _bg_task = asyncio.create_task(_run_extra_core(new_client, int(me.id)))
+        background_tasks.add(_bg_task)
+        _bg_task.add_done_callback(background_tasks.discard)
+
         return True
     except Exception as e:
         # Always close partially connected clients. AuthKeyDuplicated and
@@ -10433,7 +10448,27 @@ async def main():
     asyncio.get_running_loop().set_default_executor(
         concurrent.futures.ThreadPoolExecutor(max_workers=4))
 
+    # BUG FIX: no SIGTERM handling existed. Heroku/Docker send SIGTERM on every
+    # restart or redeploy, which killed the process mid-write (config saves,
+    # session strings) with no chance to stop group calls cleanly. Now a signal
+    # only asks the reconnect loop to exit, so shutdown runs the cleanup path.
+    global _shutdown_event
+    _shutdown_event = asyncio.Event()
+    for _sig_name in ("SIGTERM", "SIGINT"):
+        _sig = getattr(signal, _sig_name, None)
+        if _sig is None:
+            continue
+        try:
+            asyncio.get_running_loop().add_signal_handler(
+                _sig, lambda s=_sig_name: (
+                    bot_logger("SYSTEM", f"{s} received — shutting down gracefully..."),
+                    _shutdown_event.set(),
+                ))
+        except (NotImplementedError, RuntimeError, ValueError):
+            pass
+
     bot_logger("BOOT", f"4ST Prime Core starting — data dir: {DATA_DIR}")
+
     # Warm yt-dlp/bgutil/Deno in the background. Never make the first user
     # request pay for package installation or PO-token provider startup.
     asyncio.create_task(music_sources.warm_up_music_runtime(logger=bot_logger))
@@ -10537,8 +10572,23 @@ async def main():
                            "Userbot continues normally.")
                 break  # don't crash — let userbot keep running
         except Exception as _e:
+            # BUG FIX: this used to `raise`, which escaped main() (only
+            # KeyboardInterrupt is caught at the bottom) and killed the whole
+            # worker — userbot + every music engine died because of one bad
+            # bot-token/network blip. Retry once, then continue without the
+            # assistant bot instead of crashing the process.
             bot_logger("BOT_ERROR", f"Assistant bot failed to start: {_e}")
-            raise
+            try:
+                await asstbot.disconnect()
+            except Exception:
+                pass
+            if _bot_attempt == 0:
+                await asyncio.sleep(5)
+                continue
+            bot_logger("BOT_ERROR",
+                       "Assistant bot unavailable — userbot and music keep running.")
+            break
+
     asyncio.create_task(log_to_channel("SYSTEM_BOOT",
                                         {"Status": "4ST Prime Core Active",
                                          "DataDir": DATA_DIR}))
@@ -10655,16 +10705,28 @@ async def main():
 
 
     while True:
+        if _shutdown_event is not None and _shutdown_event.is_set():
+            break
+
         gather_tasks = []
         if asstbot_started:
-            gather_tasks.append(asstbot.run_until_disconnected())
+            gather_tasks.append(asyncio.ensure_future(asstbot.run_until_disconnected()))
         if userbot_started:
-            gather_tasks.append(userbot.run_until_disconnected())
+            gather_tasks.append(asyncio.ensure_future(userbot.run_until_disconnected()))
 
         if not gather_tasks:
             bot_logger("SYSTEM",
                 "Neither bot nor userbot is connected — retrying in 30s...")
-            await asyncio.sleep(30)
+            # Interruptible wait so SIGTERM doesn't take up to 30s to be honoured
+            if _shutdown_event is not None:
+                try:
+                    await asyncio.wait_for(_shutdown_event.wait(), timeout=30)
+                    break
+                except asyncio.TimeoutError:
+                    pass
+            else:
+                await asyncio.sleep(30)
+
             # Attempt reconnect
             try:
                 if not asstbot.is_connected():
@@ -10685,15 +10747,36 @@ async def main():
                 bot_logger("USERBOT_ERROR", f"Userbot reconnect failed: {_re}")
             continue
 
-        # Add still-running background tasks (extra session clients, etc.)
-        alive_bg = [t for t in background_tasks if not t.done()]
-        gather_tasks.extend(alive_bg)
+        # BUG FIX: this used to gather() the client waiters *together with*
+        # background_tasks (extra saved-session cores). Those run forever, so
+        # once the primary clients dropped, gather() kept waiting on them and
+        # the reconnect below never ran — the bot looked "stopped" while the
+        # process was still alive. Wait only for the primary clients now, and
+        # stop as soon as the first one drops (or a shutdown signal arrives).
+        _waiters = list(gather_tasks)
+        if _shutdown_event is not None:
+            _waiters.append(asyncio.ensure_future(_shutdown_event.wait()))
+        _done, _pending = await asyncio.wait(
+            _waiters, return_when=asyncio.FIRST_COMPLETED)
+        for _t in _pending:
+            _t.cancel()
+        for _t in _done:
+            # Consume results so a client error isn't logged as "never retrieved"
+            try:
+                _t.exception()
+            except Exception:
+                pass
+        with contextlib.suppress(asyncio.CancelledError):
+            await asyncio.gather(*_pending, return_exceptions=True)
 
-        await asyncio.gather(*gather_tasks, return_exceptions=True)
+        if _shutdown_event is not None and _shutdown_event.is_set():
+            bot_logger("SYSTEM", "Shutdown requested — stopping cleanly.")
+            break
 
         if not _AUTO_REBOOT:
             bot_logger("SYSTEM", "All connections dropped. AUTO_REBOOT is off — exiting.")
             break
+
 
         bot_logger("SYSTEM",
             f"All connections dropped. Reconnecting in {_reconnect_delay}s...")

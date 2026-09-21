@@ -927,7 +927,9 @@ async def soundcloud_search_download(query: str, out_tmpl: str, ydl_common: dict
         return None
 
     # ── Step 1: get client_id ─────────────────────────────────────────────
-    client_id = _sc_get_client_id(logger)
+    # BUG FIX: _sc_get_client_id does blocking requests.get() calls (up to ~1
+    # min worst case) — running it inline froze the whole event loop.
+    client_id = await asyncio.to_thread(_sc_get_client_id, logger)
 
     # ── Step 2: search + get stream URL via SC API v2 ─────────────────────
     def _resolve_via_api():
@@ -1011,9 +1013,15 @@ async def soundcloud_search_download(query: str, out_tmpl: str, ydl_common: dict
                         info = ([e for e in info["entries"] if e] or [None])[0]
                     if not info:
                         return None
-                    fpath = out_tmpl.replace("%(ext)s", "mp3")
-                    if not os.path.exists(fpath):
+                    # BUG FIX: this assumed the final file is always ".mp3".
+                    # If the mp3 postprocessor doesn't run, or yt-dlp keeps the
+                    # native container (m4a/opus/webm), the file existed but was
+                    # reported as a failed download and the track got skipped.
+                    fpath = _resolve_downloaded_file(info, out_tmpl)
+                    if not fpath:
                         return None
+
+
                     return {
                         "title": info.get("title", query),
                         "file_path": fpath,
@@ -1504,9 +1512,12 @@ async def bandcamp_search_download(query: str, out_tmpl: str, logger=None):
         if not url:
             return None
         info = await asyncio.to_thread(_download, url)
-        fpath = out_tmpl.replace("%(ext)s", "mp3")
-        if not info or not os.path.exists(fpath):
+        # BUG FIX: hardcoded ".mp3" path — if the postprocessor kept the native
+        # container the downloaded file was treated as missing.
+        fpath = _resolve_downloaded_file(info, out_tmpl)
+        if not info or not fpath:
             return None
+
         return {
             "title": info.get("title", query),
             "file_path": fpath,
@@ -1570,9 +1581,11 @@ async def mixcloud_search_download(query: str, out_tmpl: str, logger=None):
         if not url:
             return None
         info = await asyncio.to_thread(_download, url)
-        fpath = out_tmpl.replace("%(ext)s", "mp3")
-        if not info or not os.path.exists(fpath):
+        # BUG FIX: same hardcoded ".mp3" assumption as the Bandcamp path.
+        fpath = _resolve_downloaded_file(info, out_tmpl)
+        if not info or not fpath:
             return None
+
         return {
             "title": info.get("title", query),
             "file_path": fpath,
@@ -3109,7 +3122,8 @@ async def zero_disk_soundcloud_lookup(query: str, logger=None, allow_live: bool 
     if requests is None:
         return None
 
-    client_id = _sc_get_client_id(logger)
+    # BUG FIX: blocking client_id fetch moved off the event loop.
+    client_id = await asyncio.to_thread(_sc_get_client_id, logger)
     if not client_id:
         logger("MUSIC_DL_ERR", "zero_disk_soundcloud: could not get SC client_id")
         return None
@@ -3852,6 +3866,49 @@ _PIPED_APIS = [
 _PIPED_INSTANCES_API = "https://piped-instances.kavin.rocks"
 _piped_apis_cache = {"ts": 0.0, "apis": None}
 _PIPED_APIS_CACHE_TTL = 1800  # 30 min — instance health changes slowly enough
+_piped_bg_tasks = set()       # keeps refresh tasks referenced (GC safety)
+
+
+async def _refresh_piped_apis() -> list:
+    """Fetch the live Piped instance directory and merge it with the static
+    list. Always returns a usable list (static list on any failure)."""
+    live = []
+    if _aiohttp is not None:
+        try:
+            async with _make_aiohttp_session() as sess:
+                async with sess.get(
+                    _PIPED_INSTANCES_API,
+                    timeout=_aiohttp.ClientTimeout(total=6),
+                ) as r:
+                    if r.status == 200:
+                        data = await r.json(content_type=None)
+                        for entry in data or []:
+                            api_url = (entry or {}).get("api_url")
+                            if api_url:
+                                live.append(api_url.rstrip("/"))
+        except Exception:
+            pass
+
+    merged, seen = [], set()
+    for api in live + _PIPED_APIS:
+        if api not in seen:
+            seen.add(api)
+            merged.append(api)
+
+    _piped_apis_cache["apis"] = merged or list(_PIPED_APIS)
+    _piped_apis_cache["ts"] = time.time()
+    return _piped_apis_cache["apis"]
+
+
+def _spawn_piped_refresh() -> None:
+    """Refresh the instance list in the background — never delays a .play."""
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        return
+    _t = loop.create_task(_refresh_piped_apis())
+    _piped_bg_tasks.add(_t)
+    _t.add_done_callback(_piped_bg_tasks.discard)
 
 
 async def _get_piped_apis() -> list:
@@ -3866,40 +3923,17 @@ async def _get_piped_apis() -> list:
     now = time.time()
     if _piped_apis_cache["apis"] is not None and (now - _piped_apis_cache["ts"]) < _PIPED_APIS_CACHE_TTL:
         return _piped_apis_cache["apis"]
-    # Hard-play latency fix: never spend the first .play request waiting for
-    # the optional instance-directory service. The static list is already
-    # ordered with known-good APIs; refresh is deferred until the cache TTL.
+    # Hard-play latency fix: never spend a .play request waiting for the
+    # optional instance-directory service — refresh runs in the background.
+    # BUG FIX: previously the merge only ran on a *second* call made after the
+    # TTL, so on short-lived dynos the live list was never fetched at all and
+    # dead hardcoded mirrors stayed in rotation forever.
     if _piped_apis_cache["apis"] is None:
         _piped_apis_cache["apis"] = list(_PIPED_APIS)
-        _piped_apis_cache["ts"] = now
-        return _piped_apis_cache["apis"]
-
-    live = []
-    if _aiohttp is not None:
-        try:
-            async with _make_aiohttp_session() as sess:
-                async with sess.get(
-                    _PIPED_INSTANCES_API,
-                    timeout=_aiohttp.ClientTimeout(total=6),
-                ) as r:
-                    if r.status == 200:
-                        data = await r.json(content_type=None)
-                        for entry in data or []:
-                            api_url = entry.get("api_url")
-                            if api_url:
-                                live.append(api_url.rstrip("/"))
-        except Exception:
-            pass
-
-    merged, seen = [], set()
-    for api in live + _PIPED_APIS:
-        if api not in seen:
-            seen.add(api)
-            merged.append(api)
-
-    _piped_apis_cache["apis"] = merged or _PIPED_APIS
     _piped_apis_cache["ts"] = now
+    _spawn_piped_refresh()
     return _piped_apis_cache["apis"]
+
 
 
 # Invidious instances — alternate extraction frontends (technique #38)
@@ -5313,11 +5347,13 @@ async def piped_search_download(query: str, out_tmpl: str, logger=None) -> dict 
                             timeout=_timeout,
                         ) as r:
                             if r.status != 200:
-                                # BUG FIX: log non-200 so dead Piped instances
-                                # are visible in Heroku logs (was silent before)
-                                _mark_host_dead(api)
+                                # BUG FIX: do NOT blacklist the whole instance
+                                # here — one unsupported/flaky filter used to
+                                # kill a healthy mirror for 30 min even though
+                                # the next filter would have worked.
                                 logger("MUSIC_DL_ERR", f"piped_search [{api}]: HTTP {r.status}")
                                 continue
+
                             data = await r.json(content_type=None)
                     items = [i for i in (data.get("items") or [])
                              if i.get("type") in ("stream", "video", None)]
@@ -5711,7 +5747,11 @@ async def youtube_video_download(query: str, out_tmpl: str, logger=None) -> dict
                 except Exception:
                     pass
 
-        if client_idx < len(_YT_CLIENTS) - 1:
-            await asyncio.sleep(0.2)
+            # BUG FIX: this sleep was indented one level out, so it ran only
+            # after every client was exhausted (and the condition was always
+            # False) — yt-dlp hammered all clients with zero backoff.
+            if client_idx < len(_YT_CLIENTS) - 1:
+                await asyncio.sleep(0.2)
 
     return None
+
