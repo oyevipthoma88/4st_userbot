@@ -1342,6 +1342,7 @@ _CODE_COMMAND_INDEX = (
     'alive',
     'ban',
     'banall',
+    'bcast',
     'bomb',
     'calc',
     'cmnd',
@@ -7295,40 +7296,137 @@ def create_event_handler(client, core_id=None):
         # ORIGINAL COMMANDS
         # ══════════════════════════════════════════
 
+        elif re.match(r"(?i)^\.bcast(?:\s+(gc|users|all|cores))?(?:\s+([\s\S]+))?$", text):
+            # .bcast [gc|users|all|cores] <message>
+            # Direct broadcast command — owner/sudo only.
+            if not await verify_privileges(event, client=client, strict_owner_only=True):
+                return
+            asyncio.create_task(event.delete())
+            _m_b = re.match(r"(?i)^\.bcast(?:\s+(gc|users|all|cores))?(?:\s+([\s\S]+))?$", text)
+            _scope = (_m_b.group(1) or "all").lower()
+            _payload = (_m_b.group(2) or "").strip()
+            if not _payload:
+                await safe_send_and_track(client, chat_id,
+                    "<blockquote>📢 <b>BROADCAST</b>\n\n"
+                    "<b>Usage:</b> <code>.bcast [gc|users|all|cores] &lt;message&gt;</code>\n\n"
+                    "  <code>.bcast gc Hello GCs</code> — all tracked groups\n"
+                    "  <code>.bcast users Hello users</code> — all bot users (DM)\n"
+                    "  <code>.bcast all Hello everyone</code> — GCs + Users\n"
+                    "  <code>.bcast cores Hello cores</code> — Saved Messages of all cores\n"
+                    "  <code>.bcast Hello everyone</code> — default: all</blockquote>")
+                return
+            _prog = await safe_send_and_track(client, chat_id,
+                f"<blockquote>🚀 <b>Broadcasting ({_scope})...</b></blockquote>")
+            _g_ok = _g_fail = _u_ok = _u_fail = _c_ok = _c_fail = 0
+            if _scope in ("gc", "all"):
+                for gid in list(state.active_bot_groups):
+                    try:
+                        await asstbot.send_message(gid,
+                            f"<blockquote>📢 <b>4ST BROADCAST:</b>\n\n{_payload}</blockquote>",
+                            parse_mode='html')
+                        _g_ok += 1
+                        await asyncio.sleep(0.5)
+                    except Exception:
+                        _g_fail += 1
+            if _scope in ("users", "all"):
+                for uid in list(state.active_bot_users):
+                    try:
+                        await _bot_send_premium(uid,
+                            f"<blockquote>📢 <b>4ST BROADCAST:</b>\n\n{_payload}</blockquote>")
+                        _u_ok += 1
+                        await asyncio.sleep(0.3)
+                    except Exception:
+                        _u_fail += 1
+            if _scope == "cores":
+                for cl in [userbot] + extra_clients:
+                    try:
+                        await cl.send_message("me",
+                            f"<blockquote>📢 <b>4ST BROADCAST:</b>\n\n{_payload}</blockquote>")
+                        _c_ok += 1
+                    except Exception:
+                        _c_fail += 1
+            if _scope == "all":
+                for cl in [userbot] + extra_clients:
+                    try:
+                        await cl.send_message("me",
+                            f"<blockquote>📢 <b>4ST BROADCAST:</b>\n\n{_payload}</blockquote>")
+                        _c_ok += 1
+                    except Exception:
+                        _c_fail += 1
+            _report_parts = []
+            if _scope in ("gc", "all"):
+                _report_parts.append(f"GCs → Sent: <code>{_g_ok}</code> | Failed: <code>{_g_fail}</code>")
+            if _scope in ("users", "all"):
+                _report_parts.append(f"Users → Sent: <code>{_u_ok}</code> | Failed: <code>{_u_fail}</code>")
+            if _scope in ("cores", "all"):
+                _report_parts.append(f"Cores → Sent: <code>{_c_ok}</code> | Failed: <code>{_c_fail}</code>")
+            _report = "\n".join(_report_parts) or "Nothing sent."
+            if _prog:
+                try:
+                    await _premium_edit(_prog, f"<blockquote>✅ <b>Broadcast complete ({_scope})</b>\n{_report}</blockquote>")
+                except Exception:
+                    pass
+            asyncio.create_task(send_module_log(
+                f"📢 <b>Broadcast ({_scope})</b>\nBy: <code>{my_id}</code>"))
+
         elif re.match(r"(?i)^\.(help|h)$", text):
             asyncio.create_task(event.delete())
             cmnd_count = len(cfg.get("CUSTOM_CMDS", {}).get(my_id_str, {}))
             help_msg = (
-                f"<blockquote>⚡  <b>4ST PRIME CORE</b>\n\n"
+                f"<blockquote expandable>⚡  <b>4ST PRIME CORE</b>\n\n"
                 "🔥  <b>COMBAT</b>\n"
-                "  .raid  .rraid  .spam  .multi\n"
-                "  .fuck  .ow  .ghost  .sraid  .stop\n\n"
-                "🏷️  <b>BROADCAST</b>\n"
-                "  .tagall  .otagall  .onetag  .targetlist\n\n"
+                "  .raid  .rraid  .spam  .gspam\n"
+                "  .fuck  .ow  .ghost  .sraid\n"
+                "  .stopsraid  .multi  .stop\n\n"
+                "📢  <b>BROADCAST</b>\n"
+                "  .bcast gc|users|all|cores\n"
+                "  .tagall  .otagall  .onetag\n"
+                "  .targetlist  .addtarget\n"
+                "  .rmtarget  .rmtargetall\n\n"
+                "🏷️  <b>OW CUSTOM</b>\n"
+                "  .owtarget  .addowline\n"
+                "  .stopow  .stopfuck\n\n"
                 "👑  <b>ADMIN</b>\n"
-                "  .ban  .mute  .banall  .promote  .demote\n"
-                "  .unmute  .unban  .pin  .unpin\n"
-                "  .warn  .unwarn  .warnlist\n\n"
+                "  .ban  .unban  .mute  .unmute\n"
+                "  .promote  .demote  .banall\n"
+                "  .pin  .unpin  .purge\n"
+                "  .warn  .unwarn  .warnlist\n"
+                "  .delall  .forcepromote\n\n"
                 "🛡️  <b>SECURITY</b>\n"
-                "  .dmsec  .sudoadd  .sudoaddfull\n"
-                "  .sudorm  .sudolist\n\n"
-                "🤖  <b>AI  &amp;  FUN</b>\n"
-                "  .setmode  .mimic  .fun  .dice\n"
-                "  .hack  .magic  .bomb  .moon  .rocket\n\n"
+                "  .dmsec  .gcsec  .safemode\n"
+                "  .sudoadd  .sudoaddfull\n"
+                "  .sudorm  .sudolist\n"
+                "  .mastersync  .config\n\n"
+                "🔍  <b>SCAN</b>\n"
+                "  .scan  .scanbot  .scanub\n"
+                "  .scanws  .scanlog  .scanids\n\n"
+                "🤖  <b>AI &amp; FUN</b>\n"
+                "  .setmode  .mimic  .fun\n"
+                "  .dice  .hack  .magic  .bomb\n"
+                "  .moon  .rocket  .hearts\n\n"
                 "🛠️  <b>TOOLS</b>\n"
-                "  .tr  .weather  .ytdl  .calc  .kang  .qout\n"
-                "  .info  .id  .ping  .purge  .delall\n"
-                "  .config  .speed  .font  .typing\n"
-                f"  .cmnd  .rmcmnd  <i>({cmnd_count} active)</i>\n\n"
+                "  .tr  .weather  .ytdl  .calc\n"
+                "  .kang  .qout  .rev  .upper\n"
+                "  .lower  .info  .nh  .id\n"
+                "  .ping  .afk  .restart\n\n"
+                "⚙️  <b>SETTINGS</b>\n"
+                "  .speed  .font  .typing\n"
+                "  .safemode  .startpic\n"
+                "  .cmnd  .rmcmnd  .cmndrmall\n"
+                f"  <i>({cmnd_count} custom cmds active)</i>\n\n"
                 "🎵  <b>MUSIC</b>\n"
-                "  .play    .vplay    .skip    .pause\n"
-                "  .resume  .playforce  .queue  .loop\n"
-                "  .mend   .mstatus   .ytdl   .forall\n\n"
+                "  .play    .vplay    .skip\n"
+                "  .pause   .resume   .playforce\n"
+                "  .queue   .loop     .mstatus\n"
+                "  .mend    .forall   .forme\n\n"
+                "🌱  <b>GROW</b>\n"
+                "  .growadd  .forcejoin\n"
+                "  .fjadd  .fjrm\n\n"
                 "──────────────────────\n"
                 "  <code>.how [cmd]</code>  —  detailed help\n"
-                "  <code>.ping</code>  ·  <code>.restart</code>  ·  <code>.config</code>\n\n"
-                "📚  <b>COMPLETE LIVE COMMAND INDEX</b>\n"
-                f"  <code>{'  '.join('.' + c for c in _CODE_COMMAND_INDEX)}</code>"
+                "  <code>.ping</code>  ·  <code>.restart</code>\n\n"
+                f"📚  <b>{len(_CODE_COMMAND_INDEX)} commands</b>\n"
+                f"<code>{' '.join('.' + c for c in _CODE_COMMAND_INDEX)}</code>"
                 "</blockquote>"
             )
             await safe_send_and_track(client, chat_id, help_msg)
@@ -9171,6 +9269,12 @@ def create_event_handler(client, core_id=None):
                 "sudolist":   ".sudolist — Show all Sudo Level 1 and Level 2 users",
                 "forceplay":  ".playforce [song/URL] — Immediately play song, skipping queue",
                 "q":          ".q — Show music queue (short form of .queue)",
+                "bcast":      ".bcast [gc|users|all|cores] <message> — Direct broadcast from any chat.\n"
+                              "  gc    → all tracked groups\n"
+                              "  users → all bot users (DM)\n"
+                              "  all   → GCs + Users + Cores (default)\n"
+                              "  cores → Saved Messages of all logged-in cores\n"
+                              "<b>Example:</b> <code>.bcast gc Hello everyone!</code>",
             }
             doc = HOW_DOCS.get(cmd_q) or (_generated_command_doc(cmd_q) if cmd_q in _CODE_COMMAND_INDEX else None)
             if doc:
