@@ -834,11 +834,23 @@ def load_words(file_path, fallbacks):
 
 
 def _clean_ow_line(value: str) -> str:
-    """Keep OW payloads plain by removing the legacy token and emoji."""
+    """Keep OW payloads plain by removing the legacy token, emoji and decorative unicode."""
     line = _EMOJI_RE.sub("", str(value))
     line = re.sub(r"[\U0001F000-\U0001FAFF\u2600-\u27BF\u2B00-\u2BFF]", "", line)
+    # BUG FIX: decorative unicode (Egyptian hieroglyphs 𓆩, modifier letters
+    # ˢᵗ, special arrows ⟶, dotted circles ⃪, heavy arrows, etc.) jo owtarget
+    # words me aa jaate the. Strip sab.
+    line = re.sub(r"[\U00013000-\U0001342F]", "", line)  # Egyptian hieroglyphs
+    line = re.sub(r"[\u1D00-\u1D7F\u1D80-\u1DFF\u2070-\u209F]", "", line)  # modifier/superscript letters
+    line = re.sub(r"[\u2190-\u21FF\u27A0-\u27BF\u2B00-\u2BFF]", "", line)  # arrows
+    line = re.sub(r"[\uFE00-\uFE0F\u20D0-\u20FF\u0F20-\u0FFF\uA6A0-\uA6FF]", "", line)  # variation selectors & combining marks
+    line = re.sub(r"[\u16A0-\u16FF\u1B00-\u1B7F]", "", line)  # runic & balinese deco
     line = line.replace("\u200d", "").replace("\ufe0f", "")
     line = re.sub(r"(?i)(?<!\w)4st(?!\w)", "", line)
+    # Remove leftover decorative symbols: 💘, 🇮‌, 𓆪, etc. already covered above
+    line = re.sub(r"[\U0001F000-\U0001FFFF]", "", line)
+    # Strip invisible/format chars except basic whitespace
+    line = re.sub(r"[\u200B-\u200F\u202A-\u202E\u2060-\u206F]", "", line)
     return re.sub(r"[ \t]{2,}", " ", line).strip()
 
 
@@ -849,13 +861,15 @@ def _clean_ow_line(value: str) -> str:
 
 # BUG FIX: OW lines me target ka naam mention hota tha — ab naam kahin nahi
 # aata, sirf .addow ke words (+ optional live time) use hote hain.
+# BUG FIX: time templates bahut bade sentence bana rahe the. Ab short —
+# sirf word + brief time, max 2-3 words extra.
 _OW_TIME_TEMPLATES = [
     "{word}",
     "{word}",
     "{word}",
-    "abhi {time} baj raha hai, {word}",
-    "{word} — {time} ho gaya",
-    "{time} par bhi {word}",
+    "{word} {time}",
+    "{time} {word}",
+    "{word} {time}",
 ]
 
 
@@ -939,7 +953,8 @@ def _get_ow_target_words(cfg, my_id_str, chat_id) -> list:
     words = list(store.get(str(chat_id), []) or [])
     if not words:
         words = list(store.get("*", []) or [])
-    return [w for w in words if str(w).strip()]
+    # BUG FIX: owtarget words me decorative unicode aa sakta hai — clean karo.
+    return [_clean_ow_line(w) for w in words if str(w).strip()]
 
 
 def _humanize_ow_line(word: str, target_name: str, cfg=None) -> str:
@@ -8334,9 +8349,15 @@ def create_event_handler(client, core_id=None):
             # BUG FIX (.owtarget / .addow): custom words used to fire only on
             # every 3rd message, so after adding a target the stream still read
             # as the plain default ow.txt list ("normal hi fire ho rahi hai").
-            # Now: .addowline lines win, else .owtarget words are the ONLY
-            # payload, and ow.txt is used only when nothing custom is set.
+            # BUG FIX: pehle custom words set hone par ow.txt BILKUL use nahi
+            # hota tha. Ab custom words bich-bich me use hote hain — ow.txt
+            # ke words ke saath alternately. User jo word add karega wo bich
+            # bich me aayega, baaki ow.txt se aayega.
+            # .addowline diya hai to SIRF wahi lines fire hongi (override).
             _ow_pool = _ow_lines if (mode == "ow" and _ow_lines) else []
+            # Interval: har N-th message pe custom word fire hoga (ow.txt ke
+            # saath mix). N=2 matlab alternate, N=3 matlab har teesre message pe.
+            _custom_interval = 2
             try:
                 while True if mode == "fuck" else istate.ow_active.get(dest, True):
                     # Hard-stop check — cooperative flag, works even if the
@@ -8364,16 +8385,19 @@ def create_event_handler(client, core_id=None):
                         else:
                             await asyncio.sleep(0.3)
                         continue
-                    if mode == "ow" and _ow_custom:
-                        # .addow / .owtarget words — sirf yahi fire honge.
+                    # BUG FIX: custom words bich-bich me use hote hain, ow.txt
+                    # ke saath mix. Har _custom_interval-th message pe custom
+                    # word, baaki me ow.txt word.
+                    _use_custom = (mode == "ow" and _ow_custom
+                                   and (_word_idx % _custom_interval == 0))
+                    if _use_custom:
                         raw_word = _humanize_ow_line(
                             _ow_custom[_cust_idx % len(_ow_custom)], "", cfg,
                         )
                         _cust_idx += 1
-                        _word_idx += 1
                     else:
                         raw_word  = words_db[_word_idx % len(words_db)]
-                        _word_idx += 1
+                    _word_idx += 1
                     word = apply_font_transformer(raw_word, f_idx)
                     if curr_mid:
                         if is_typing:
@@ -8459,8 +8483,12 @@ def create_event_handler(client, core_id=None):
                 await safe_send_and_track(client, chat_id,
                     "<blockquote>❌ Usage: <code>.owtarget target ka naam/text</code></blockquote>")
                 return
-            new_words = [_arg]
-            target_name = _arg
+            new_words = [_clean_ow_line(_arg)]
+            target_name = new_words[0] if new_words else _arg
+            if not target_name:
+                await safe_send_and_track(client, chat_id,
+                    "<blockquote>❌ <b>Word khali ho gaya clean karne ke baad. Kuch real text do.</b></blockquote>")
+                return
             merged = _store.get(_ckey, []) + new_words
             # de-dupe, preserve order, cap so config.json stays small
             seen, deduped = set(), []
