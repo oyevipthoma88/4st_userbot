@@ -88,6 +88,10 @@ def run_wizard() -> None:
         val = values.get(key, "")
         if val:
             lines.append(f"{key}={val}")
+            # bootstrap() loaded the previous .env before opening this
+            # wizard. Update the live process too, otherwise main.py would
+            # keep using the old token/session until the next restart.
+            os.environ[key] = val
     with open(ENV_PATH, "w", encoding="utf-8") as fh:
         fh.write("\n".join(lines) + "\n")
     try:
@@ -95,8 +99,8 @@ def run_wizard() -> None:
     except OSError:
         pass
     print(f"\n  ✅ Saved: {ENV_PATH}")
-    print("  Dobara poochha nahi jayega. Badalna ho to .env edit karein"
-          " ya delete karke dobara run karein.\n")
+    print("  Agli baar purani values default ke roop me dikhengi; Enter se"
+          " keep karein ya nayi value daalein.\n")
 
 
 def _load_env_file() -> None:
