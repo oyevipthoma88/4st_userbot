@@ -21,6 +21,11 @@ Termux runs the complete userbot/admin/AI/plugin feature set **without music,
 voice-chat, Pyrogram, PyTgCalls, yt-dlp, or ffmpeg**. This keeps installation
 reliable on Android and avoids native voice-chat build failures.
 
+The default installer skips the optional `google-genai` package because its
+`cryptography` dependency may compile for a long time on Android/Python 3.13.
+The core bot works without it; install the AI add-on separately after setup if
+you need Gemini features.
+
 The one-shot launcher asks for the required Telegram values on first run, saves
 them in a local `.env`, and starts the bot again automatically on later runs.
 
@@ -76,6 +81,13 @@ chmod +x start-termux.sh
 ```
 
 To stop: `Ctrl+C`. To start again later: `cd ~/4st_userbot && ./start-termux.sh`.
+
+Optional AI add-on (run only after the bot is installed):
+
+```bash
+cd ~/4st_userbot
+pip install -r requirements-termux-ai.txt
+```
 
 ### Deploy to Heroku
 

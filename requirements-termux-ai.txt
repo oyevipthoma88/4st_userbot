@@ -1,0 +1,4 @@
+# Optional AI add-on for Termux.
+# The base Termux install intentionally skips this because google-genai pulls
+# cryptography, which may compile from source on Android/Python 3.13.
+google-genai>=0.1.0
