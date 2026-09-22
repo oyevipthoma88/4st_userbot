@@ -10655,7 +10655,7 @@ async def _start_music_engine(user_id: int):
 # MAIN ENGINE ENTRY
 # ══════════════════════════════════════════
 async def main():
-    global asstbot_started   # set True once bot signs in — read by show_now_playing
+    global asstbot, asstbot_started   # recreate bot client after stale auth errors
     # Cap concurrent OS threads used by asyncio.to_thread() (music-source
     # searches/downloads, ffmpeg fetch loops, etc.). Racing ~12 sources at
     # once can otherwise spawn a dozen simultaneous blocking threads; on a
@@ -10814,9 +10814,12 @@ async def main():
                 cfg["BOT_SESSION"] = ""
                 cfg["BOT_TOKEN_ID"] = _BOT_TOKEN_ID
                 save_config(cfg)
-                asstbot.session = StringSession()
+                # Replacing only `.session` leaves Telethon's existing sender
+                # and auth-key state alive. Build a completely fresh client so
+                # ImportBotAuthorization cannot reuse the revoked auth key.
+                asstbot = TelegramClient(StringSession(), _API_ID, _API_HASH)
                 bot_logger("BOT_TOKEN",
-                           "Cached assistant session cleared; retrying with current token.")
+                           "Cached assistant session cleared; fresh client retrying with current token.")
             if _bot_attempt == 0:
                 await asyncio.sleep(5)
                 continue
