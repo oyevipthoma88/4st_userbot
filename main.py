@@ -10809,7 +10809,7 @@ async def main():
                 await asyncio.sleep(5)
                 continue
             bot_logger("BOT_ERROR",
-                       "Assistant bot unavailable — userbot and music keep running.")
+                       "Assistant bot unavailable — userbot core continues running.")
             break
 
     asyncio.create_task(log_to_channel("SYSTEM_BOOT",
@@ -10820,7 +10820,7 @@ async def main():
     # userbot logs in and plays music through its OWN session, never a
     # shared one. cfg["PYRO_SESSIONS"] is {user_id_str: session_string}.
     _pyro_sessions = cfg.get("PYRO_SESSIONS", {})
-    if _pyro_sessions:
+    if MUSIC_ENABLED and _pyro_sessions:
         # Do not start one Pyrogram/PyTgCalls pair per saved core. That
         # multiplies Telegram receivers, ffmpeg state, and native buffers;
         # the supplied log reached 1.48 GB before the first song could play.
@@ -10844,7 +10844,7 @@ async def main():
             else:
                 bot_logger("MUSIC", f"Failed to init Pyrogram for {_uid} — check its session string.")
         bot_logger("MUSIC", f"Started {_started_music}/{len(_pyro_sessions)} music engines (MAX_MUSIC_SESSIONS={MAX_MUSIC_SESSIONS}).")
-    else:
+    elif MUSIC_ENABLED:
         bot_logger("MUSIC", "No Pyrogram sessions. Use bot /start → 🎵 Music Setup to login.")
 
     # Start primary userbot
