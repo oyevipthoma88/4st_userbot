@@ -121,13 +121,15 @@ def bootstrap() -> bool:
     """Returns True when running in Termux (music profile is excluded)."""
     if not is_termux():
         return False
-    if not os.path.isfile(ENV_PATH):
-        if sys.stdin is not None and sys.stdin.isatty():
-            run_wizard()
-        else:
-            print("[TERMUX] .env missing — interactive terminal me run karein "
-                  "taaki setup wizard chal sake.")
     _load_env_file()
+    # Interactive Termux runs always open the wizard. Existing values are
+    # shown as defaults, so pressing Enter keeps them; this also makes it easy
+    # to replace a revoked bot token/session without editing .env manually.
+    if sys.stdin is not None and sys.stdin.isatty():
+        run_wizard()
+    elif not os.path.isfile(ENV_PATH):
+        print("[TERMUX] .env missing — interactive terminal me run karein "
+              "taaki setup wizard chal sake.")
     os.environ["TERMUX_MODE"] = "1"
     os.environ.setdefault("MUSIC_DISABLED", "1")
     return True

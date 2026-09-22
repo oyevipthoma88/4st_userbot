@@ -26,8 +26,9 @@ The default installer skips the optional `google-genai` package because its
 The core bot works without it; install the AI add-on separately after setup if
 you need Gemini features.
 
-The one-shot launcher asks for the required Telegram values on first run, saves
-them in a local `.env`, and starts the bot again automatically on later runs.
+The launcher asks for the Telegram values on every interactive run. Existing
+values appear as defaults, so press **Enter** to keep them or enter a new bot
+token/session when one has been revoked; the answers are saved in `.env`.
 
 ## 🔌 Plugin System
 
