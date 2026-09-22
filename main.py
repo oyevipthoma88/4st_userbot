@@ -10805,6 +10805,18 @@ async def main():
                 await asstbot.disconnect()
             except Exception:
                 pass
+            # Telegram can revoke a bot token while the numeric bot id stays
+            # unchanged. In that case BOT_TOKEN_ID comparison cannot detect
+            # the stale cached StringSession; reset it before the one retry.
+            _bot_err = str(_e).lower()
+            if _bot_attempt == 0 and any(_needle in _bot_err for _needle in (
+                    "bot token expired", "importbotauthorization", "unauthorized")):
+                cfg["BOT_SESSION"] = ""
+                cfg["BOT_TOKEN_ID"] = _BOT_TOKEN_ID
+                save_config(cfg)
+                asstbot.session = StringSession()
+                bot_logger("BOT_TOKEN",
+                           "Cached assistant session cleared; retrying with current token.")
             if _bot_attempt == 0:
                 await asyncio.sleep(5)
                 continue
