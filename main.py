@@ -144,19 +144,20 @@ try:
 except ImportError:
     requests = None
 
-# Load dotenv before importing music_sources: that module snapshots
-# YTDLP_COOKIES and YOUTUBE_API_KEY during import. Loading it later made local
-# `.env` credentials silently invisible to the music resolver.
+# Load dotenv for all profiles. The music resolver is not imported on Termux:
+# this keeps yt-dlp/ffmpeg and all voice-chat-only code out of the Android run.
 try:
     from dotenv import load_dotenv
     load_dotenv()
 except ImportError:
     pass
 
-# Extra no-cookie/no-login fallback sources (SoundCloud, Audius, Internet
-# Archive, Jamendo, direct media URLs, iTunes metadata refine) + a small
-# on-disk stream cache and queue-dedupe helper. See music_sources.py.
-import music_sources
+if IS_TERMUX:
+    music_sources = None
+else:
+    # Extra no-cookie/no-login fallback sources plus stream cache and queue
+    # helpers. See music_sources.py.
+    import music_sources
 
 # GitHub-backed durable persistence — see github_store.py's module
 # docstring. No-op unless GITHUB_TOKEN + GITHUB_REPO are set.
@@ -407,19 +408,15 @@ SRAID_PATH   = os.path.join(DATA_DIR, "sraid.txt")
 # .otagall — Odisha flavoured group tagall pool (separate data file)
 ODISHA_PATH  = os.path.join(DATA_DIR, "odisha_tagall.txt")
 FUN_PATH     = os.path.join(DATA_DIR, "fun.txt")
+# Music cache/track folders are created only for cloud profiles that enable
+# the optional voice-chat engine. Termux keeps the local storage footprint low.
 MUSIC_CACHE  = os.path.join(DATA_DIR, "music_cache")
-os.makedirs(MUSIC_CACHE, exist_ok=True)
 TRACKS_DIR   = os.path.join(DATA_DIR, "tracks")
-os.makedirs(TRACKS_DIR, exist_ok=True)
-
-# Stream cache: replaying a song someone already requested reuses the file
-# already on disk instead of re-downloading/re-searching from scratch.
-_stream_cache = music_sources.StreamCache(MUSIC_CACHE, logger=lambda tag, msg: bot_logger(tag, msg))
-
-# NOTE: YouTube support (and the cookies.txt workaround it needed for its
-# "Sign in to confirm you're not a bot" wall) has been removed entirely.
-# The music engine is now 100% cookie-free / login-free — see
-# music_sources.py for the full list of sources it uses instead.
+if MUSIC_ENABLED:
+    os.makedirs(MUSIC_CACHE, exist_ok=True)
+_stream_cache = (music_sources.StreamCache(
+    MUSIC_CACHE, logger=lambda tag, msg: bot_logger(tag, msg)
+) if MUSIC_ENABLED else None)
 
 # ══════════════════════════════════════════
 # 100+ FUN ANIMATIONS GENERATOR
@@ -4669,8 +4666,8 @@ def _render_start_menu(sender_id: int, sender=None, is_owner: bool = None):
     _updates_url = cfg.get("UPDATES_LINK", "")
     # Per-account music status — each user sees only THEIR OWN Pyrogram
     # session state, not a shared/global one.
-    pyro_ok      = bool(cfg.get("PYRO_SESSIONS", {}).get(str(sender_id)))
-    music_st     = "\U0001f7e2 Active" if pyro_ok else "\U0001f534 Not Setup"
+    pyro_ok      = bool(cfg.get("PYRO_SESSIONS", {}).get(str(sender_id))) if MUSIC_ENABLED else False
+    music_st     = "\U0001f7e2 Active" if pyro_ok else ("\U0001f534 Not Setup" if MUSIC_ENABLED else "\u23ed Disabled")
 
     def _extra_link_row():
         """Only render link buttons whose URL is actually configured."""
@@ -4690,15 +4687,17 @@ def _render_start_menu(sender_id: int, sender=None, is_owner: bool = None):
             "<blockquote><b>\U0001f451 4ST PRIME \u2014 MASTER CONTROL</b>\n"
             "\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\n"
             "  Welcome back, Emperor. Grid is online.\n\n"
-            "  \u26a1 <b>Engine</b>  \u00b7 Ultra-Fast Telethon Core\n"
-            f"  \U0001f3b5 <b>Music</b>   \u00b7 {music_st}\n"
+            "  \u26a1 <b>Engine</b>  \u00b7 Ultra-Fast Telethon Core\n" +
+            (f"  \U0001f3b5 <b>Music</b>   \u00b7 {music_st}\n" if MUSIC_ENABLED
+             else "  \U0001f6e1 <b>Core</b>    \u00b7 Admin + AI modules\n") +
             f"  \U0001f465 <b>Cores</b>   \u00b7 <code>{len(active_user_ids)}</code> active\n"
             "\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\n"
             "  Full owner toolkit below \U0001f447</blockquote>"
         )
         buttons = [
             [Button.inline("\U0001f510 Login / Activate Core", b"login_activate")],
-            [Button.inline("\U0001f3b5 Music Setup",           b"music_setup")],
+            *([[Button.inline("\U0001f3b5 Music Setup", b"music_setup")]]
+              if MUSIC_ENABLED else []),
             [Button.inline("\u2796 Remove String", b"rm_str"),
              Button.inline("\u26a1 Active Grid Cores", b"act_users")],
             [Button.inline("\U0001f9f9 Clean Duplicates", b"clean_dup"),
@@ -4733,7 +4732,8 @@ def _render_start_menu(sender_id: int, sender=None, is_owner: bool = None):
         )
         buttons = [
             [Button.inline("\U0001f510 Login / Activate Core", b"login_activate")],
-            [Button.inline("\U0001f3b5 Music Setup",           b"music_setup")],
+            *([[Button.inline("\U0001f3b5 Music Setup", b"music_setup")]]
+              if MUSIC_ENABLED else []),
             [Button.inline("\u2796 Remove My String", b"rm_str"),
              Button.inline("\U0001f504 Reboot My Core", b"reboot_mine")],
             [Button.inline("\u26a1 Active Users", b"act_users")],
@@ -4749,8 +4749,8 @@ def _render_start_menu(sender_id: int, sender=None, is_owner: bool = None):
             "  <i>The fastest all-in-one Telegram userbot.</i>\n\n"
             "  \u2694\ufe0f <b>Combat Suite</b> \u2014 raid, spam, ow, sraid,\n"
             "     tagall, ghost \u00b7 speed tuned per command\n"
-            "  \U0001f3b5 <b>Music Engine</b> \u2014 VC streaming, zero-disk,\n"
-            "     YouTube \u00b7 JioSaavn \u00b7 SoundCloud failover\n"
+            "  \U0001f4e6 <b>Plugin Engine</b> \u2014 modular commands,\n"
+            "     custom features without changing the core\n"
             "  \U0001f6e1 <b>Admin Power</b> \u2014 ban, mute, promote,\n"
             "     mass-add + auto-promote (Grow)\n"
             "  \U0001f916 <b>AI + Tools</b> \u2014 AI replies, custom commands,\n"
@@ -5152,14 +5152,13 @@ async def _asst_callback_inner(event, data, sender_id, owner_id, is_owner):
             "  Koi step samajh na aaye \u2192 owner ko DM karo.\n\n"
             "  1\ufe0f\u20e3 <b>Login</b> \u2014 apna account connect karo\n"
             "  2\ufe0f\u20e3 <b>Commands</b> \u2014 rozmarra ke commands\n"
-            "  3\ufe0f\u20e3 <b>Music</b> \u2014 VC mein gaana bajao\n"
+            "  3\ufe0f\u20e3 <b>Tools</b> \u2014 admin, AI aur plugins\n"
             "  4\ufe0f\u20e3 <b>Problems</b> \u2014 common errors ka fix\n"
             "\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501</blockquote>",
             buttons=[
                 [Button.inline("1\ufe0f\u20e3 Login Guide", b"tut_login"),
                  Button.inline("2\ufe0f\u20e3 Commands", b"tut_cmds")],
-                [Button.inline("3\ufe0f\u20e3 Music Setup", b"tut_music"),
-                 Button.inline("4\ufe0f\u20e3 Problems", b"tut_help")],
+                [Button.inline("3\ufe0f\u20e3 Problems", b"tut_help")],
                 [Button.inline("\U0001f519 Back", b"back_start")],
             ])
         return
@@ -5193,13 +5192,12 @@ async def _asst_callback_inner(event, data, sender_id, owner_id, is_owner):
             "  (bot se nahi), kisi bhi group mein.\n\n"
             "  \u2022 <code>.alive</code> \u2014 core zinda hai ya nahi\n"
             "  \u2022 <code>.help</code> \u2014 poori command list\n"
-            "  \u2022 <code>.play song name</code> \u2014 VC mein gaana\n"
             "  \u2022 <code>.tagall msg</code> \u2014 sabko tag\n"
             "  \u2022 <code>.raid @user</code> \u2014 combat module\n"
             "  \u2022 <code>.forcejoin @channel all</code> \u2014 members add\n"
             "  \u2022 <code>.speed cmd 0.2</code> \u2014 speed tune\n"
             "\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501</blockquote>",
-            buttons=[[Button.inline("\u25b6\ufe0f Next: Music", b"tut_music")],
+            buttons=[[Button.inline("\u25b6\ufe0f Next: Problems", b"tut_help")],
                      [Button.inline("\U0001f519 Tutorial", b"tut_home")]])
         return
 
@@ -5248,7 +5246,7 @@ async def _asst_callback_inner(event, data, sender_id, owner_id, is_owner):
             "\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\n"
             "  \u26a1 <b>Speed</b> \u2014 har command ki speed tunable\n"
             "  \u2694\ufe0f <b>Combat</b> \u2014 raid \u00b7 sraid \u00b7 ow \u00b7 spam \u00b7 ghost\n"
-            "  \U0001f3b5 <b>Music</b> \u2014 VC streaming, zero-disk, multi-source\n"
+            "  \U0001f4e6 <b>Plugins</b> \u2014 modular custom commands\n"
             "  \U0001f6e1 <b>Admin</b> \u2014 ban \u00b7 mute \u00b7 promote \u00b7 purge\n"
             "  \U0001f331 <b>Grow</b> \u2014 mass add + auto promote\n"
             "  \U0001f4a5 <b>Auto Engagement</b> \u2014 last 15 + har nayi post\n"
@@ -5283,8 +5281,8 @@ async def _asst_callback_inner(event, data, sender_id, owner_id, is_owner):
                      [Button.inline("\U0001f519 Back", b"back_start")]])
         return
 
-    # ── MUSIC SETUP ──
-    if data == b"music_setup":
+    # ── MUSIC SETUP (cloud-only) ──
+    if data == b"music_setup" and MUSIC_ENABLED:
         pyro_ok = bool(cfg.get("PYRO_SESSIONS", {}).get(str(sender_id)))
         pyro_st = "🟢 Connected" if pyro_ok else "🔴 Not Connected"
         remove_btn = [Button.inline("🗑 Remove Music Session", b"pyro_remove")] if pyro_ok else []
@@ -6600,8 +6598,8 @@ def create_event_handler(client, core_id=None):
         # owner/sudo has run .forall in that chat — everything else (raid
         # tools, admin actions, custom cmds, etc.) still requires
         # verify_privileges like before.
-        _music_command = bool(_MUSIC_CMD_RE.match(text_probe))
-        _music_open = _is_music_open_chat(event.chat_id)
+        _music_command = MUSIC_ENABLED and bool(_MUSIC_CMD_RE.match(text_probe))
+        _music_open = _is_music_open_chat(event.chat_id) if MUSIC_ENABLED else False
         music_bypass = _music_command and (_MUSIC_PUBLIC or _music_open)
         # Userbot commands are strict owner/sudo-only by default. The sole
         # exception is a music command in a chat explicitly opened with
@@ -10691,9 +10689,9 @@ async def main():
 
     bot_logger("BOOT", f"4ST Prime Core starting — data dir: {DATA_DIR}")
 
-    # Warm yt-dlp/bgutil/Deno in the background. Never make the first user
-    # request pay for package installation or PO-token provider startup.
-    asyncio.create_task(music_sources.warm_up_music_runtime(logger=bot_logger))
+    # Warm the optional music runtime only on profiles that actually include it.
+    if MUSIC_ENABLED:
+        asyncio.create_task(music_sources.warm_up_music_runtime(logger=bot_logger))
     # ── Migrate NAME_HISTORY / USERNAME_HISTORY from config to data/tracks/ ──
     _did_migrate = False
     for _uid_k, _entries in list(cfg.get("NAME_HISTORY", {}).items()):
@@ -10719,9 +10717,12 @@ async def main():
         cfg.pop("USERNAME_HISTORY", None)
         save_config(cfg)
         bot_logger("BOOT", "Migrated name/username history from config → data/tracks/")
-    bot_logger("BOOT", f"yt-dlp:    {'✅' if YTDLP_AVAILABLE    else '❌ (pip install yt-dlp)'}")
-    bot_logger("BOOT", f"Pyrogram:  {'✅' if PYRO_AVAILABLE     else ('⏭️ skipped (Termux mode)' if IS_TERMUX else '❌ (pip install pyrogram tgcrypto)')}")
-    bot_logger("BOOT", f"PyTgCalls: {'✅' if PYTGCALLS_AVAILABLE else ('⏭️ skipped (Termux mode)' if IS_TERMUX else '❌ (pip install py-tgcalls)')}")
+    if MUSIC_ENABLED:
+        bot_logger("BOOT", f"yt-dlp:    {'✅' if YTDLP_AVAILABLE else '❌ (pip install yt-dlp)'}")
+        bot_logger("BOOT", f"Pyrogram:  {'✅' if PYRO_AVAILABLE else '❌ (pip install pyrogram tgcrypto)'}")
+        bot_logger("BOOT", f"PyTgCalls: {'✅' if PYTGCALLS_AVAILABLE else '❌ (pip install py-tgcalls)'}")
+    else:
+        bot_logger("BOOT", "Music:     ⏭️ disabled (Termux profile)")
     asyncio.create_task(background_cleanup_task())
 
     # Start assistant bot
@@ -10774,7 +10775,7 @@ async def main():
                     bot_logger("BOT", "Bot session saved to config — future restarts will skip sign_in.")
                 except Exception as _se:
                     bot_logger("BOT_WARN", f"Could not save bot session: {_se}")
-            bot_logger("BOT", "Assistant bot started. Send /start in DM for music setup.")
+            bot_logger("BOT", "Assistant bot started. Send /start in DM for the control panel.")
             asstbot_started = True
             break
         except errors.FloodWaitError as fw:
