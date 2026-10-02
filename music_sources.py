@@ -1098,6 +1098,46 @@ def _audius_hosts():
     return hosts
 
 
+async def zero_disk_audius_lookup(query: str, logger=None, allow_live: bool = False) -> dict | None:
+    """Zero-disk Audius: resolve the stream URL without downloading anything.
+    Audius stream URLs are directly playable by ffmpeg (no disk I/O needed)."""
+    logger = logger or (lambda *a: None)
+    if requests is None:
+        return None
+    def _resolve():
+        for host in _audius_hosts():
+            try:
+                resp = requests.get(
+                    f"{host}/v1/tracks/search",
+                    params={"query": query, "app_name": "TelegramMusicBot"},
+                    timeout=8,
+                )
+                if resp.status_code != 200:
+                    continue
+                results = (resp.json() or {}).get("data") or []
+                if not results:
+                    continue
+                track = results[0]
+                stream_url = (
+                    f"{host}/v1/tracks/{track['id']}/stream"
+                    "?app_name=TelegramMusicBot"
+                )
+                title = track.get("title") or query
+                artist = (track.get("user") or {}).get("name")
+                full_title = f"{title} - {artist}" if artist else title
+                return {
+                    "title": full_title,
+                    "stream_url": stream_url,
+                    "duration": int(track.get("duration") or 0),
+                    "thumbnail": (track.get("artwork") or {}).get("480x480"),
+                    "source": "audius-direct",
+                }
+            except Exception:
+                continue
+        return None
+    return await asyncio.to_thread(_resolve)
+
+
 async def audius_search_download(query: str, out_tmpl: str, logger=None):
     logger = logger or (lambda tag, msg: None)
     if requests is None:
@@ -3209,12 +3249,20 @@ async def zero_disk_soundcloud_lookup(query: str, logger=None, allow_live: bool 
 # alone costs 5-15s on a Heroku dyno — that is exactly why MUSIC_DIRECT_FAST
 # kept timing out and every .play fell back to the 20s disk download.
 # android_vr / ios / android need no JS at all and answer in ~1-2s.
+# MAX EFFORT: expanded client list — more YouTube client strategies racing
+# in parallel means a working direct stream URL is found even faster.
+# android_vr/ios/android need no JS, answer in ~1-2s. mediaconnect/external
+# are additional low-latency clients that bypass bot-gating on some edges.
 _DIRECT_STREAM_CLIENTS = [
     c.strip() for c in os.environ.get(
-        "MUSIC_DIRECT_CLIENTS", "android_vr,ios,android,tv,web_safari").split(",")
+        "MUSIC_DIRECT_CLIENTS",
+        "android_vr,ios,android,tv,mediaconnect,web_safari,external,mweb",
+    ).split(",")
     if c.strip()
 ]
-_DIRECT_STREAM_RETRIES = 1
+# MAX EFFORT: 3 retries (up from 1) — rotate clients each retry so a
+# transient failure on one client gets a fresh independent attempt.
+_DIRECT_STREAM_RETRIES = max(1, int(os.environ.get("MUSIC_DIRECT_RETRIES", "3")))
 try:
     _DIRECT_STREAM_TIMEOUT = max(1.5, float(
         os.environ.get("MUSIC_DIRECT_CLIENT_TIMEOUT", "4.0")))
@@ -3309,6 +3357,7 @@ async def _direct_stream_is_live(url: str) -> bool:
 # bada hissa wahi kha jaata tha.
 HTTP_STREAM_FFMPEG_FLAGS = (
     "-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5 "
+    "-reconnect_streamed 1 -reconnect_at_eof 1 "
     "-probesize 1000000 -analyzeduration 1500000"
 )
 LOCAL_FILE_FFMPEG_FLAGS = "-probesize 5000000 -analyzeduration 5000000"
@@ -3320,6 +3369,8 @@ FFPROBE_GATE_TIMEOUT = float(os.environ.get("MUSIC_PROBE_TIMEOUT", "2.5") or 2.5
 _TRUSTED_STREAM_HOSTS = (
     "googlevideo.com", "saavncdn.com", "aac.saavncdn.com",
     "sndcdn.com", "jiosaavn.com", "youtube.com",
+    "ytimg.com", "audioboom.com", "cdn.audius.co",
+    "archive.org", "hearthis.at", "bandcamp.com",
 )
 
 
@@ -3441,7 +3492,7 @@ async def youtube_direct_stream(query: str, logger=None) -> dict | None:
                     task.cancel()
             await asyncio.gather(*tasks, return_exceptions=True)
         if attempt < _DIRECT_STREAM_RETRIES:
-            await asyncio.sleep(0.15)
+            await asyncio.sleep(0.1)
     logger("MUSIC_DIRECT_MISS",
            f"direct audio unavailable after {_DIRECT_STREAM_RETRIES} retries: {query[:80]}")
     return None
@@ -3496,11 +3547,15 @@ async def resolve_zero_disk_stream(query: str, logger=None, allow_live: bool = F
 
     # Race independent zero-disk CDNs. The first valid URL wins; a slow or
     # dead mirror cannot block the other providers from starting immediately.
+    # MAX EFFORT: Audius direct stream added to the race — its CDN URLs are
+    # directly playable by ffmpeg with zero disk I/O, giving one more fast
+    # path for the sub-5s direct stream goal.
     direct_tasks = {
         asyncio.create_task(_safe(fn)): fn.__name__
         for fn in (
             _youtube_direct,           # ① authoritative YouTube CDN
             zero_disk_jiosaavn_lookup,   # ① fast Indian music CDN
+            zero_disk_audius_lookup,     # ① Audius direct CDN (zero-disk)
             zero_disk_piped_lookup,       # ② YouTube via Piped frontend
             zero_disk_invidious_lookup,   # ③ YouTube via Invidious frontend
         )

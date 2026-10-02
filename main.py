@@ -2547,6 +2547,53 @@ ALIAS_SILENT: "contextvars.ContextVar[bool]" = contextvars.ContextVar(
 )
 
 
+# ── FLOOD STATE TRACKING ────────────────────────────────────────────────────
+# Per-chat flood tracking: when FloodWait hits, we (1) log to the log channel,
+# (2) notify the affected chat that the bot is flood-limited, (3) queue all
+# pending messages, and (4) after the flood clears, flush the queue AND send a
+# "bot is back" notification.  This is the "flood lagne pe log + users ki msg
+# jana chahiye, aur limit hatne ke baad bhi bot khud bhejega notify" fix.
+_FLOOD_STATE: dict = {}   # {chat_id: {"wait_until": ts, "seconds": N, "queue": [(text, reply_to, ...)]}}
+_FLOOD_NOTIFY_LOCK = asyncio.Lock()
+
+
+async def _notify_flood_hit(chat_id: int, seconds: int):
+    """Log + notify chat when FloodWait strikes."""
+    flood_msg = (
+        "<blockquote>⏳ <b>Flood Limit Lag gaya!</b>\n"
+        f"  ⏱ Wait: <code>{seconds}s</code>\n"
+        "  📝 Aapki messages queue me hain — wait khatam hone pe sab bhej diye jayenge.\n"
+        "  🔄 Bot khud notify karega jab flood clear ho jayega.</blockquote>"
+    )
+    asyncio.create_task(send_module_log(
+        f"⏳ <b>FloodWait HIT</b>\n"
+        f"  Chat: <code>{chat_id}</code>\n"
+        f"  Wait: <code>{seconds}s</code>\n"
+        f"  Pending messages queued — will auto-flush after flood clears."))
+    # Best-effort: notify the affected chat (may itself fail if flood is active)
+    try:
+        await asstbot.send_message(chat_id, flood_msg, parse_mode='html')
+    except Exception:
+        pass
+
+
+async def _notify_flood_cleared(chat_id: int, flushed_count: int):
+    """Notify chat that flood limit has been removed and messages are sent."""
+    clear_msg = (
+        "<blockquote>✅ <b>Flood Limit Hat gaya!</b>\n"
+        f"  📤 Queue me pending the: <code>{flushed_count}</code> messages bhej diye.\n"
+        "  🟢 Bot ab full speed pe wapas online hai!</blockquote>"
+    )
+    asyncio.create_task(send_module_log(
+        f"✅ <b>FloodWait CLEARED</b>\n"
+        f"  Chat: <code>{chat_id}</code>\n"
+        f"  Flushed <code>{flushed_count}</code> queued messages."))
+    try:
+        await asstbot.send_message(chat_id, clear_msg, parse_mode='html')
+    except Exception:
+        pass
+
+
 async def safe_send_and_track(client, chat_id, text, reply_to=None, delay=0.0,
                               silent=False, track=True, formatting_entities=None):
     if ALIAS_SILENT.get() and isinstance(text, str) and text.lstrip().startswith("<blockquote>"):
@@ -2556,13 +2603,24 @@ async def safe_send_and_track(client, chat_id, text, reply_to=None, delay=0.0,
     try:
         me_id  = (await get_me_cached(client)).id
         istate = get_isolated_state(me_id)
+
+        # ── FLOOD QUEUE: if this chat is currently under flood, queue the msg ──
+        _fs = _FLOOD_STATE.get(chat_id)
+        if _fs and time.time() < _fs.get("wait_until", 0):
+            _fs.setdefault("queue", []).append((text, reply_to, silent, track, formatting_entities))
+            return None
+
         # BUG FIX: FloodWait ab HAMESHA respect hoga — SAFE_MODE ON/OFF se fark nahi.
         # Pehle SAFE_MODE OFF hone pe FloodWait silently `return None` kar deta tha,
         # jis se .ow/.fuck/.spam/.tagall bich mein band ho jaati thi bina koi error ke.
-        # Ab: 300s tak ka FloodWait automatically handle hoga, usse bada hua to skip.
-        # BUG FIX: 300s ka wait module ko "stuck" dikhata tha. Ab 75s tak wait,
-        # usse bada FloodWait hua to skip + log, module aage badh jaata hai.
+        # Ab: 75s tak ka FloodWait automatically handle hoga, usse bada hua to skip.
+        # BUG FIX (flood notify): FloodWait lagne pe ab:
+        #   1. Log channel me notify hota hai
+        #   2. Affected chat me "flood lag gaya" message jaata hai
+        #   3. Pending messages queue me store hoti hain
+        #   4. Flood clear hone pe queue flush + "bot wapas" notification
         _MAX_FLOOD_WAIT = 75
+        _flood_notified = False
         for _attempt in range(5):   # auto-retry up to 5× on FloodWait
             try:
                 if formatting_entities:
@@ -2580,14 +2638,40 @@ async def safe_send_and_track(client, chat_id, text, reply_to=None, delay=0.0,
                         parse_mode='html',
                         silent=silent,
                     )
+                # ── Flood cleared while we were waiting? Flush queue + notify ──
+                if _flood_notified:
+                    _flushed = await _flush_flood_queue(client, chat_id, me_id, istate)
+                    asyncio.create_task(_notify_flood_cleared(chat_id, _flushed))
                 break  # sent successfully
             except errors.FloodWaitError as fw:
                 if fw.seconds <= _MAX_FLOOD_WAIT:
+                    # First FloodWait for this attempt → log + notify chat + set up queue
+                    if not _flood_notified:
+                        _flood_notified = True
+                        _FLOOD_STATE[chat_id] = {
+                            "wait_until": time.time() + fw.seconds + 2,
+                            "seconds": fw.seconds,
+                            "queue": [],
+                        }
+                        asyncio.create_task(_notify_flood_hit(chat_id, fw.seconds))
                     asyncio.create_task(send_module_log(
                         f"⚠️ <b>FloodWait</b>: <code>{fw.seconds}s</code>  Chat: <code>{chat_id}</code>"))
                     await asyncio.sleep(fw.seconds + 2)
                     continue   # retry after waiting
-                # FloodWait bahut lamba hai (>5 min) — skip karo
+                # FloodWait bahut lamba hai (>75s) — queue me daal do, skip karo
+                if not _flood_notified:
+                    _flood_notified = True
+                    _FLOOD_STATE[chat_id] = {
+                        "wait_until": time.time() + fw.seconds + 2,
+                        "seconds": fw.seconds,
+                        "queue": [(text, reply_to, silent, track, formatting_entities)],
+                    }
+                    asyncio.create_task(_notify_flood_hit(chat_id, fw.seconds))
+                else:
+                    _FLOOD_STATE.setdefault(chat_id, {}).setdefault("queue", []).append(
+                        (text, reply_to, silent, track, formatting_entities))
+                # Schedule a background flush for when the long flood clears
+                asyncio.create_task(_delayed_flood_flush(client, chat_id, fw.seconds + 2, me_id, istate))
                 return None
         else:
             return None        # all 5 attempts failed
@@ -2599,6 +2683,45 @@ async def safe_send_and_track(client, chat_id, text, reply_to=None, delay=0.0,
     except (ValueError, Exception):
         # Swallow unresolvable peer errors (e.g. PeerUser(user_id=6) not in session)
         return None
+
+
+async def _flush_flood_queue(client, chat_id, me_id, istate) -> int:
+    """Send all messages that were queued while the chat was under FloodWait.
+    Returns the count of messages successfully flushed."""
+    _fs = _FLOOD_STATE.pop(chat_id, None)
+    if not _fs or not _fs.get("queue"):
+        return 0
+    flushed = 0
+    for item in _fs["queue"]:
+        _text, _reply_to, _silent, _track, _fe = item
+        try:
+            if _fe:
+                msg = await client.send_message(
+                    chat_id, _text, reply_to=_reply_to,
+                    formatting_entities=_fe, parse_mode=None, silent=_silent)
+            else:
+                msg = await client.send_message(
+                    chat_id, _text, reply_to=_reply_to,
+                    parse_mode='html', silent=_silent)
+            if _track:
+                istate.sent_unid_msgs.setdefault(chat_id, []).append(msg.id)
+            flushed += 1
+            await asyncio.sleep(_MIN_SEND_DELAY)
+        except Exception:
+            pass
+    return flushed
+
+
+async def _delayed_flood_flush(client, chat_id, wait_seconds, me_id, istate):
+    """For long FloodWaits (>75s): sleep until the flood clears, then flush
+    the queued messages and send the 'bot is back' notification."""
+    await asyncio.sleep(wait_seconds)
+    try:
+        flushed = await _flush_flood_queue(client, chat_id, me_id, istate)
+        if flushed >= 0:
+            await _notify_flood_cleared(chat_id, flushed)
+    except Exception as e:
+        bot_logger("FLOOD_FLUSH_ERR", f"chat {chat_id}: {e}")
 
 async def send_msg(client, chat_id, text, silent=False):
     try:
@@ -2759,9 +2882,9 @@ async def search_and_download_audio(query: str):
     # ko race karne me jata hai (blocked mirror pe turant dobara try) aur slow
     # yt-dlp disk fallback default me OFF hai.
     try:
-        _direct_budget = max(1.5, float(os.environ.get("MUSIC_DIRECT_BUDGET", "4.0")))
+        _direct_budget = max(1.5, float(os.environ.get("MUSIC_DIRECT_BUDGET", "6.0")))
     except (TypeError, ValueError):
-        _direct_budget = 4.0
+        _direct_budget = 6.0
     _strict_direct = os.environ.get("MUSIC_STRICT_DIRECT", "1").lower() not in {"0", "false", "no"}
     if os.environ.get("MUSIC_DIRECT_FAST", "1").lower() not in {"0", "false", "no"}:
         _attempt = 0
