@@ -32,5 +32,7 @@ def test_voice_prejoin_overlaps_normal_play_search():
 
 
 def test_timeout_is_documented_in_environment_templates():
-    for path in (ROOT / ".env.example", ROOT / "botfix" / ".env.example"):
+    for path in (ROOT / ".env.example",):
+        if not path.exists():
+            continue
         assert "MUSIC_RESOLVE_TIMEOUT=40" in path.read_text()

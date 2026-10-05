@@ -9025,31 +9025,120 @@ def create_event_handler(client, core_id=None):
             asyncio.create_task(event.delete())
             proc   = await safe_send_and_track(client, chat_id,
                 "<blockquote>🔨 <b>BANALL INITIATED...</b></blockquote>")
-            banned, failed = 0, 0
+            banned, failed, skipped = 0, 0, 0
             limit  = cfg.get("MAX_BAN_LIMIT", 300)
             _mod_begin(istate, "banall", chat_id, asyncio.current_task())
+            _banall_err = None
             try:
+                # Resolve to a concrete channel entity — EditBannedRequest
+                # needs the real channel/supergroup peer, and a bare chat_id
+                # int sometimes fails on Telethon versions that can't infer
+                # the peer type from a raw integer for megagroups.
+                _banall_chat = await event.get_chat()
+                _banall_peer = chat_id
+                if _banall_chat and hasattr(_banall_chat, "id"):
+                    _banall_peer = _banall_chat
+
+                # Collect admin + creator IDs first so we never try to ban
+                # someone who has ban rights (Telegram rejects it and wastes
+                # a FloodWait-budget API call).
                 admin_ids = set()
-                async for admin in client.iter_participants(
-                        chat_id, filter=types.ChannelParticipantsAdmins()):
-                    admin_ids.add(admin.id)
-                async for user in client.iter_participants(chat_id):
-                    if banned >= limit: break
-                    if user.bot or user.deleted or user.id in admin_ids: continue
+                try:
+                    async for admin in client.iter_participants(
+                            _banall_peer, filter=types.ChannelParticipantsAdmins()):
+                        admin_ids.add(admin.id)
+                except errors.FloodWaitError as _fw:
+                    _banall_err = f"FloodWait {_fw.seconds}s while fetching admins"
+                    bot_logger("BANALL", _banall_err)
+                    raise
+
+                # Skip our own account — banning self would kick the bot out
+                # mid-operation and leave the job half done.
+                try:
+                    _my_id = (await get_me_cached(client)).id
+                except Exception:
+                    _my_id = 0
+                admin_ids.add(_my_id)
+
+                _last_progress = time.monotonic()
+                async for user in client.iter_participants(_banall_peer, limit=limit * 2):
+                    if _mod_should_stop(istate, "banall", chat_id):
+                        bot_logger("BANALL", "Stopped by .stop")
+                        break
+                    if banned >= limit:
+                        break
+                    if user.bot or user.deleted:
+                        skipped += 1
+                        continue
+                    if user.id in admin_ids:
+                        skipped += 1
+                        continue
                     try:
-                        await client(EditBannedRequest(chat_id, user.id,
+                        await client(EditBannedRequest(_banall_peer, user.id,
                             ChatBannedRights(until_date=None, view_messages=True)))
                         banned += 1
-                        await asyncio.sleep(0.3)
-                    except Exception:
-                        failed += 1
-            except asyncio.CancelledError: pass
-            except Exception: pass
+                    except errors.FloodWaitError as _fw:
+                        bot_logger("BANALL",
+                            f"FloodWait {_fw.seconds}s — sleeping then resuming")
+                        if _fw.seconds <= 120:
+                            await asyncio.sleep(_fw.seconds + 2)
+                            # Retry this one user once after the wait
+                            try:
+                                await client(EditBannedRequest(_banall_peer, user.id,
+                                    ChatBannedRights(until_date=None, view_messages=True)))
+                                banned += 1
+                            except Exception:
+                                failed += 1
+                        else:
+                            failed += 1
+                            # Long flood — stop, don't risk a ban hammer
+                            _banall_err = f"FloodWait {_fw.seconds}s too long — aborting"
+                            break
+                    except Exception as _ban_e:
+                        _ban_msg = str(_ban_e).lower()
+                        if "admin" in _ban_msg and "invalid" in _ban_msg:
+                            skipped += 1
+                        elif "admin" in _ban_msg and "required" in _ban_msg:
+                            _banall_err = "Not enough rights to ban in this chat"
+                            break
+                        else:
+                            failed += 1
+                    # Throttle to stay under Telegram's flood radar
+                    await asyncio.sleep(0.35)
+                    # Live progress update every 20 bans
+                    if proc and banned > 0 and banned % 20 == 0:
+                        try:
+                            await _premium_edit(proc,
+                                f"<blockquote>🔨 <b>BANALL IN PROGRESS...</b>\n"
+                                f"Banned: <code>{banned}</code> | "
+                                f"Failed: <code>{failed}</code> | "
+                                f"Skipped: <code>{skipped}</code></blockquote>")
+                        except Exception:
+                            pass
+            except asyncio.CancelledError:
+                pass
+            except Exception as _be:
+                _banall_err = str(_be)
+                bot_logger("BANALL_ERR", _banall_err)
+            finally:
+                _mod_finish(istate, "banall", chat_id)
             if proc:
                 try:
-                    await _premium_edit(proc, f"<blockquote>✅ <b>BANALL DONE</b>\n"
-                        f"Banned: <code>{banned}</code> | Failed: <code>{failed}</code></blockquote>")
-                except Exception: pass
+                    _summary = (
+                        f"<blockquote>✅ <b>BANALL DONE</b>\n"
+                        f"Banned: <code>{banned}</code> | "
+                        f"Failed: <code>{failed}</code> | "
+                        f"Skipped: <code>{skipped}</code></blockquote>")
+                    if _banall_err:
+                        _summary = (
+                            f"<blockquote>⚠️ <b>BANALL PARTIAL</b>\n"
+                            f"Banned: <code>{banned}</code> | "
+                            f"Failed: <code>{failed}</code> | "
+                            f"Skipped: <code>{skipped}</code>\n"
+                            f"Error: <code>{_banall_err}</code></blockquote>")
+                    await _premium_edit(proc, _summary)
+                except Exception:
+                    pass
 
         elif re.match(r"(?i)^\.restart$", text):
             if not await verify_privileges(event, client=client, strict_owner_only=True): return
@@ -11003,6 +11092,18 @@ async def main():
             get_isolated_state(me.id)
             create_event_handler(userbot, core_id=me.id)
             attach_passive_monitors(userbot)
+            # Load optional plugins from plugins/ directory.
+            try:
+                from plugins import load_all_plugins
+                _plug_results = load_all_plugins(
+                    userbot, cfg=cfg, bot_logger=bot_logger)
+                for _fname, _ok, _err in _plug_results:
+                    if _ok:
+                        bot_logger("PLUGIN", f"Loaded {_fname}")
+                    else:
+                        bot_logger("PLUGIN_ERR", f"Failed {_fname}: {_err}")
+            except Exception as _plug_load_err:
+                bot_logger("PLUGIN_ERR", f"Plugin loader error: {_plug_load_err}")
             if me.id == cfg.get("OWNER_ID"):
                 try:
                     await userbot.send_message("me",

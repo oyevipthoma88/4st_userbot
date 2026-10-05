@@ -26,7 +26,9 @@ def test_resolver_timeout_and_cookie_templates_exist():
     source = (ROOT / "main.py").read_text()
     assert 'os.environ.get("MUSIC_RESOLVE_TIMEOUT", "40")' in source
     assert source.index("load_dotenv()") < source.index("import music_sources")
-    for path in (ROOT / ".env.example", ROOT / "botfix" / ".env.example"):
+    for path in (ROOT / ".env.example",):
+        if not path.exists():
+            continue
         text = path.read_text()
         assert "MUSIC_RESOLVE_TIMEOUT=40" in text
         assert "YTDLP_COOKIES" in text

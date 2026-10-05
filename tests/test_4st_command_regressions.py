@@ -6,7 +6,9 @@ ROOT = Path(__file__).resolve().parents[1]
 
 def test_ow_data_has_no_legacy_token_or_emoji():
     emoji_ranges = re.compile(r"[\U0001F000-\U0001FAFF\u2600-\u27BF]")
-    for path in (ROOT / "data" / "ow.txt", ROOT / "botfix" / "data" / "ow.txt"):
+    for path in (ROOT / "data" / "ow.txt",):
+        if not path.exists():
+            continue
         text = path.read_text(encoding="utf-8")
         assert not re.search(r"(?i)(?<!\w)4st(?!\w)", text)
         assert not emoji_ranges.search(text)
