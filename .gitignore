@@ -34,3 +34,8 @@ data/music_cache/
 # OS
 .DS_Store
 Thumbs.db
+
+# Stale duplicates / unrelated build artifacts
+botfix/
+lib/
+artifacts/

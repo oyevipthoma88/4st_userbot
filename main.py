@@ -10616,7 +10616,6 @@ async def deploy_new_session_string(session_str: str, is_startup: bool = False,
         bot_logger("DEPLOY_SKIP", "Skipping Pyrogram string in Telethon deployer")
         return False
     new_client = None
-    new_client = None
     try:
         new_client = TelegramClient(StringSession(session_str), cfg["API_ID"], cfg["API_HASH"])
         # Use connect() + is_user_authorized() instead of start() to prevent
@@ -11170,24 +11169,68 @@ async def main():
         except Exception as _re:
             bot_logger("USERBOT_ERROR", f"Userbot reconnect error: {_re}")
 
+    # Graceful shutdown on the SAME loop that started every client.
+    bot_logger("SYSTEM", "Running graceful shutdown of all cores...")
+    try:
+        await _graceful_shutdown()
+    except BaseException as _shut_err:
+        bot_logger("SYSTEM", f"Shutdown error: {_shut_err}")
+    bot_logger("SYSTEM", "Shutdown complete.")
+
+async def _graceful_shutdown():
+    """Stop every connected client on the SAME event loop that started them.
+
+    BUG FIX (Heroku SIGTERM crash): the old cleanup ran in a *new* event loop
+    via a second asyncio.run() after main()'s loop was already closed.
+    Pyrogram's stop() awaits internal tasks (updates_watchdog_task) bound to
+    the dead loop → asyncio.CancelledError, which is a BaseException in
+    Python 3.9+ and is NOT caught by `except Exception` → the worker exited
+    with status 1 on every Heroku restart. Now this runs inside main()'s
+    loop, and CancelledError is caught explicitly via BaseException.
+    """
+    # PyTgCalls 2.x has no global stop(); stopping the underlying pyrogram
+    # client tears down its group calls too. Stop every account's music
+    # client, then every Telethon core (extras + primary + assistant bot).
+    for _client in list(pyro_apps.values()):
+        try:
+            if _client is not None:
+                await _client.stop()
+        except BaseException:
+            pass
+    for _client in list(active_core_clients.values()):
+        try:
+            if _client is not None:
+                await _client.disconnect()
+        except BaseException:
+            pass
+    for _client in list(extra_clients):
+        try:
+            if _client is not None:
+                await _client.disconnect()
+        except BaseException:
+            pass
+    try:
+        if userbot is not None and userbot.is_connected():
+            await userbot.disconnect()
+    except BaseException:
+        pass
+    try:
+        if asstbot is not None and asstbot.is_connected():
+            await asstbot.disconnect()
+    except BaseException:
+        pass
+
+
 if __name__ == "__main__":
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
         bot_logger("SYSTEM", "Shutting down 4ST Prime Core...")
+    except BaseException as _boot_err:
+        bot_logger("SYSTEM", f"Boot error: {_boot_err}")
     finally:
-        async def _cleanup():
-            # PyTgCalls 2.x has no global stop(); stopping pyrogram disconnects
-            # any active group calls along with it. Stop every account's
-            # client — not just the legacy global one — since each userbot
-            # now runs its own independent Pyrogram/PyTgCalls session.
-            for _client in list(pyro_apps.values()):
-                try:
-                    if _client:
-                        await _client.stop()
-                except Exception:
-                    pass
-        try:
-            asyncio.run(_cleanup())
-        except Exception:
-            pass
+        # No second asyncio.run() — cleanup now happens inside main() before
+        # its loop closes, so client stop()/disconnect() calls succeed. If
+        # main() returned without cleaning up (KeyboardInterrupt path), the
+        # loop is already gone and there is nothing left to stop safely.
+        pass
