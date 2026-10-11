@@ -738,6 +738,22 @@ def load_config():
             json.dump(safe, f, indent=4)
         return dict(DEFAULT_CONFIG)
 
+import html as _brand_html
+
+
+def _user_brand(my_id, my_name=None) -> str:
+    """Per-account display name for .ping/.help (set with .setbrand).
+
+    Every logged-in core sees ITS OWN name, so the bot feels personal to
+    each user. Falls back to the account's first name. HTML-escaped."""
+    try:
+        _b = (cfg.get("BRAND_NAMES", {}) or {}).get(str(my_id), "")
+    except Exception:
+        _b = ""
+    name = (_b or my_name or str(my_id) or "User").strip()
+    return _brand_html.escape(name[:40])
+
+
 def save_config(c):
     safe = {k: v for k, v in c.items()
             if k not in ("API_HASH", "PRIMARY_SESSION", "BOT_TOKEN", "AI_API_KEY")}
@@ -1332,6 +1348,8 @@ def _get_session_pytgcalls(user_id: int):
 # Generated from the live command router during the maintenance audit.
 # Keep this index as the single source for Help/.how coverage checks.
 _CODE_COMMAND_INDEX = (
+    'resetbrand',
+    'setbrand',
     'addow',
     'addowline',
     'addtarget',
@@ -7574,110 +7592,104 @@ def create_event_handler(client, core_id=None):
             asyncio.create_task(send_module_log(
                 f"📢 <b>Broadcast ({_scope})</b>\nBy: <code>{my_id}</code>"))
 
+        elif re.match(r"(?i)^\.(setbrand|resetbrand)(?:\s+([\s\S]+))?$", text):
+            if not await verify_privileges(event, client=client, core_id=my_id):
+                return
+            asyncio.create_task(event.delete())
+            _m = re.match(r"(?i)^\.(setbrand|resetbrand)(?:\s+([\s\S]+))?$", text)
+            _brands = cfg.setdefault("BRAND_NAMES", {})
+            if _m.group(1).lower() == "resetbrand" or not (_m.group(2) or "").strip():
+                if _m.group(1).lower() == "setbrand":
+                    await safe_send_and_track(client, chat_id,
+                        "<blockquote>✏️ <b>Usage:</b> <code>.setbrand Your Name</code>\n"
+                        f"Current: <b>{_user_brand(my_id, my_name)}</b></blockquote>")
+                    return
+                _brands.pop(my_id_str, None)
+            else:
+                _brands[my_id_str] = _m.group(2).strip().splitlines()[0][:40]
+            save_config(cfg)
+            await safe_send_and_track(client, chat_id,
+                f"<blockquote>✅ <b>Name set:</b> {_user_brand(my_id, my_name)}\n"
+                "<i>Ab .ping aur .help me yahi naam dikhega.</i></blockquote>")
+
         elif re.match(r"(?i)^\.(help|h)$", text):
+            if not await verify_privileges(event, client=client, core_id=my_id):
+                return
             asyncio.create_task(event.delete())
             cmnd_count = len(cfg.get("CUSTOM_CMDS", {}).get(my_id_str, {}))
+            _brand = _user_brand(my_id, my_name)
+            _sections = [
+                ("🔥", "COMBAT", ".raid .rraid .spam .gspam .fuck .ow .ghost .sraid .stopsraid .multi .stop"),
+                ("📢", "BROADCAST", ".bcast .tagall .otagall .onetag .targetlist .addtarget .rmtarget .rmtargetall"),
+                ("🏷️", "OW CUSTOM", ".owtarget .addowline .stopow .stopfuck"),
+                ("👑", "ADMIN", ".ban .unban .mute .unmute .promote .demote .banall .pin .unpin .purge .warn .unwarn .warnlist .delall .forcepromote"),
+                ("🛡️", "SECURITY", ".dmsec .gcsec .safemode .sudoadd .sudoaddfull .sudorm .sudolist .mastersync .config"),
+                ("🔍", "SCAN", ".scan .scanbot .scanub .scanws .scanlog .scanids"),
+                ("🤖", "AI &amp; FUN", ".setmode .mimic .fun .dice .hack .magic .bomb .moon .rocket .hearts"),
+                ("🛠️", "TOOLS", ".tr .weather .ytdl .calc .kang .qout .rev .upper .lower .info .nh .id .afk"),
+                ("⚙️", "SETTINGS", ".setbrand .resetbrand .speed .font .typing .startpic .cmnd .rmcmnd .cmndrmall"),
+                ("🎵", "MUSIC", ".play .vplay .skip .pause .resume .playforce .queue .loop .mstatus .mend .forall .forme"),
+                ("🌱", "GROW", ".growadd .forcejoin .fjadd .fjrm"),
+            ]
+            _body = "\n\n".join(
+                f"{ic} <b>{title}</b>\n" + " ".join(f"<code>{c}</code>" for c in cmds.split())
+                for ic, title, cmds in _sections
+            )
             help_msg = (
-                f"<blockquote expandable>⚡  <b>4ST PRIME CORE</b>\n\n"
-                "🔥  <b>COMBAT</b>\n"
-                "  .raid  .rraid  .spam  .gspam\n"
-                "  .fuck  .ow  .ghost  .sraid\n"
-                "  .stopsraid  .multi  .stop\n\n"
-                "📢  <b>BROADCAST</b>\n"
-                "  .bcast myg|mydm|myall (your chats)\n"
-                "  .bcast gc|users|all|cores (owner)\n"
-                "  .tagall  .otagall  .onetag\n"
-                "  .targetlist  .addtarget\n"
-                "  .rmtarget  .rmtargetall\n\n"
-                "🏷️  <b>OW CUSTOM</b>\n"
-                "  .owtarget  .addowline\n"
-                "  .stopow  .stopfuck\n\n"
-                "👑  <b>ADMIN</b>\n"
-                "  .ban  .unban  .mute  .unmute\n"
-                "  .promote  .demote  .banall\n"
-                "  .pin  .unpin  .purge\n"
-                "  .warn  .unwarn  .warnlist\n"
-                "  .delall  .forcepromote\n\n"
-                "🛡️  <b>SECURITY</b>\n"
-                "  .dmsec  .gcsec  .safemode\n"
-                "  .sudoadd  .sudoaddfull\n"
-                "  .sudorm  .sudolist\n"
-                "  .mastersync  .config\n\n"
-                "🔍  <b>SCAN</b>\n"
-                "  .scan  .scanbot  .scanub\n"
-                "  .scanws  .scanlog  .scanids\n\n"
-                "🤖  <b>AI &amp; FUN</b>\n"
-                "  .setmode  .mimic  .fun\n"
-                "  .dice  .hack  .magic  .bomb\n"
-                "  .moon  .rocket  .hearts\n\n"
-                "🛠️  <b>TOOLS</b>\n"
-                "  .tr  .weather  .ytdl  .calc\n"
-                "  .kang  .qout  .rev  .upper\n"
-                "  .lower  .info  .nh  .id\n"
-                "  .ping  .afk  .restart\n\n"
-                "⚙️  <b>SETTINGS</b>\n"
-                "  .speed  .font  .typing\n"
-                "  .safemode  .startpic\n"
-                "  .cmnd  .rmcmnd  .cmndrmall\n"
-                f"  <i>({cmnd_count} custom cmds active)</i>\n\n"
-                "🎵  <b>MUSIC</b>\n"
-                "  .play    .vplay    .skip\n"
-                "  .pause   .resume   .playforce\n"
-                "  .queue   .loop     .mstatus\n"
-                "  .mend    .forall   .forme\n\n"
-                "🌱  <b>GROW</b>\n"
-                "  .growadd  .forcejoin\n"
-                "  .fjadd  .fjrm\n\n"
-                "──────────────────────\n"
-                "  <code>.how [cmd]</code>  —  detailed help\n"
-                "  <code>.ping</code>  ·  <code>.restart</code>\n\n"
-                f"📚  <b>{len(_CODE_COMMAND_INDEX)} commands</b>\n"
-                f"<code>{' '.join('.' + c for c in _CODE_COMMAND_INDEX)}</code>"
+                "<blockquote>"
+                f"✨ <b>{_brand}</b> ✨\n"
+                "<i>Personal Userbot · Command Center</i>"
+                "</blockquote>\n"
+                f"<blockquote expandable>{_body}</blockquote>\n"
+                "<blockquote>"
+                f"📚 <b>{len(_CODE_COMMAND_INDEX)}</b> commands · "
+                f"🧩 <b>{cmnd_count}</b> custom\n"
+                "💡 <code>.how [cmd]</code> — detailed help\n"
+                f"👤 <a href='tg://user?id={my_id}'>{_brand}</a>"
                 "</blockquote>"
             )
             await safe_send_and_track(client, chat_id, help_msg)
 
         elif re.match(r"(?i)^\.(ping|alive)$", text):
-            # Keep the Odishaubot user-facing status card, but retain the
-            # production per-core authorization for every logged-in account.
             if not await verify_privileges(event, client=client, core_id=my_id):
                 return
             asyncio.create_task(event.delete())
+            _brand = _user_brand(my_id, my_name)
+            # Real round-trip to Telegram (old code timed two adjacent
+            # monotonic() calls, so it always reported ~0 ms).
             t_start = time.monotonic()
+            try:
+                from telethon.tl.functions.updates import GetStateRequest as _PingReq
+                await asyncio.wait_for(client(_PingReq()), timeout=10)
+                real_ms = round((time.monotonic() - t_start) * 1000, 1)
+            except Exception:
+                real_ms = "timeout"
             uptime  = str(timedelta(seconds=int(time.monotonic() - BOOT_TIME)))
-            real_ms = round((time.monotonic() - t_start) * 1000, 2)
-            _music_state = (
-                "🟢 Active" if _account_has_own_pyro(my_id)
-                else "🔴 Pyrogram Not Setup"
-            )
-            if cfg.get("BOT_LANG", "en").lower() in ("od", "odia", "or"):
-                ping_payload = (
-                    "<blockquote expandable>"
-                    "✨ <b>𝟒𝐒𝐓 𝐏𝐑𝐈𝐌𝐄 𝐂𝐎𝐑𝐄</b> ✨\n"
-                    "┏━━━━━━━━━━━━━━━━━━━━┓\n"
-                    f"┃ 📡 <b>ପିଙ୍ଗ</b>     ⟶ <code>{real_ms} ms</code>\n"
-                    f"┃ ⏱️ <b>ଚାଲିଛି</b>   ⟶ <code>{uptime}</code>\n"
-                    "┃ ⚡ <b>ଇଞ୍ଜିନ</b>   ⟶ <code>Telethon + PyTgCalls</code>\n"
-                    "┃ 💠 <b>ସ୍ଥିତି</b>    ⟶ <code>ସମ୍ପୂର୍ଣ୍ଣ ସିଙ୍କ</code>\n"
-                    f"┃ 🎵 <b>ସଙ୍ଗୀତ</b>   ⟶ <code>{'🟢 ସକ୍ରିୟ' if _music_state.startswith('🟢') else '🔴 ଲଗଇନ ବାକି'}</code>\n"
-                    f"┃ 👤 <b>ମାଲିକ</b>    ⟶ <a href='tg://user?id={my_id}'>{my_name}</a>\n"
-                    "┗━━━━━━━━━━━━━━━━━━━━┛"
-                    "</blockquote>"
-                )
+            _music_ok = _account_has_own_pyro(my_id)
+            if isinstance(real_ms, float):
+                _q = "🟢 Excellent" if real_ms < 200 else ("🟡 Good" if real_ms < 600 else "🔴 Slow")
             else:
-                ping_payload = (
-                    "<blockquote expandable>"
-                    "✨ <b>𝟒𝐒𝐓 𝐏𝐑𝐈𝐌𝐄 𝐂𝐎𝐑𝐄</b> ✨\n"
-                    "┏━━━━━━━━━━━━━━━━━━━━┓\n"
-                    f"┃ 📡 <b>Ping</b>     ⟶ <code>{real_ms} ms</code>\n"
-                    f"┃ ⏱️ <b>Uptime</b>   ⟶ <code>{uptime}</code>\n"
-                    "┃ ⚡ <b>Engine</b>   ⟶ <code>Telethon + PyTgCalls</code>\n"
-                    "┃ 💠 <b>Status</b>   ⟶ <code>Perfect Sync</code>\n"
-                    f"┃ 🎵 <b>Music</b>    ⟶ <code>{_music_state}</code>\n"
-                    f"┃ 👤 <b>Master</b>   ⟶ <a href='tg://user?id={my_id}'>{my_name}</a>\n"
-                    "┗━━━━━━━━━━━━━━━━━━━━┛"
-                    "</blockquote>"
-                )
+                _q = "🔴 Offline"
+            if cfg.get("BOT_LANG", "en").lower() in ("od", "odia", "or"):
+                _L = ("ପିଙ୍ଗ", "ଗୁଣବତ୍ତା", "ଚାଲିଛି", "ସଙ୍ଗୀତ", "ମାଲିକ",
+                      "🟢 ସକ୍ରିୟ" if _music_ok else "🔴 ଲଗଇନ ବାକି")
+            else:
+                _L = ("Ping", "Quality", "Uptime", "Music", "Owner",
+                      "🟢 Active" if _music_ok else "🔴 Not Setup")
+            _ms = f"{real_ms} ms" if isinstance(real_ms, float) else real_ms
+            ping_payload = (
+                "<blockquote>"
+                f"✨ <b>{_brand}</b> ✨\n"
+                "<i>Personal Userbot · Online</i>"
+                "</blockquote>\n"
+                "<blockquote>"
+                f"📡 <b>{_L[0]}</b> · <code>{_ms}</code>\n"
+                f"📶 <b>{_L[1]}</b> · {_q}\n"
+                f"⏱️ <b>{_L[2]}</b> · <code>{uptime}</code>\n"
+                f"🎵 <b>{_L[3]}</b> · {_L[5]}\n"
+                f"👤 <b>{_L[4]}</b> · <a href='tg://user?id={my_id}'>{_brand}</a>"
+                "</blockquote>"
+            )
             await safe_send_and_track(client, chat_id, ping_payload)
 
         elif re.match(r"(?i)^\.fun(?:\s+(.+))?$", text):
@@ -9479,6 +9491,8 @@ def create_event_handler(client, core_id=None):
                 "upper":      ".upper [text] — Convert to UPPERCASE",
                 "lower":      ".lower [text] — Convert to lowercase",
                 "ping":       ".ping / .alive — Check bot latency",
+                "setbrand":   ".setbrand [name] — Set YOUR name shown in .ping/.help",
+                "resetbrand": ".resetbrand — Reset .ping/.help name to your profile name",
                 "targetlist": ".targetlist — Show active tracked targets",
                 "restart":    ".restart — Restart the userbot (owner only)",
                 "scanids":    ".scanids [-100chatid ...] — Set/show owner-only scan chats",
