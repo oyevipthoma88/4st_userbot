@@ -28,7 +28,7 @@ def test_every_long_running_module_is_stop_flag_aware():
 def test_ow_target_words_replace_the_default_stream():
     # .owtarget words used to fire only on every third message.
     assert '_word_idx % 3 == 0' not in SOURCE
-    assert 'if mode == "ow" and _ow_custom:' in SOURCE
+    assert '_use_custom = (mode == "ow" and _ow_custom' in SOURCE
     assert "_ow_pool = _ow_lines if (mode == \"ow\" and _ow_lines) else []" in SOURCE
 
 

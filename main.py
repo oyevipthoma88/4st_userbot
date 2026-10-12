@@ -49,13 +49,6 @@ _FFMPEG_BIN  = _ffsetup.FFMPEG_BIN
 _FFPROBE_BIN = _ffsetup.FFPROBE_BIN
 _FFMPEG_DIR  = _ffsetup.FFMPEG_DIR
 
-def _find_binary(name: str) -> str | None:
-    """Back-compat shim for older call sites."""
-    if name == "ffmpeg":
-        return _ffsetup.FFMPEG_BIN
-    if name == "ffprobe":
-        return _ffsetup.FFPROBE_BIN
-    return shutil.which(name)
 # ─────────────────────────────────────────────────────────────────────────────
 
 # ── Safe arithmetic evaluator for .calc ─────────────────────────────────────
@@ -114,8 +107,7 @@ try:
     from pyrogram import Client as PyroClient
     from pyrogram.errors import (
         SessionPasswordNeeded, PhoneCodeInvalid, PhoneCodeExpired,
-        FloodWait as PyroFloodWait, PhoneNumberInvalid, ChatAdminRequired,
-        RPCError as PyroRPCError,
+        ChatAdminRequired,
     )
     PYRO_AVAILABLE = True
 except ImportError:
@@ -127,7 +119,7 @@ try:
     from pytgcalls import PyTgCalls
     from pytgcalls import filters as pytgcalls_filters
     from pytgcalls.types import MediaStream, AudioQuality, VideoQuality
-    from pytgcalls.exceptions import NoActiveGroupCall, NotInCallError
+    from pytgcalls.exceptions import NoActiveGroupCall
     PYTGCALLS_AVAILABLE = True
 except ImportError:
     pass
@@ -294,9 +286,6 @@ async def is_self_premium(client) -> bool:
         return False
 
 
-def refresh_self_premium(client, value: bool):
-    """Force-set the cached premium status for a client (e.g. right after login)."""
-    _PREMIUM_STATUS_CACHE[id(client)] = (bool(value), time.monotonic(), True)
 
 
 def _codepoint_to_utf16_offsets(text):
@@ -943,9 +932,6 @@ def session_sudo_bucket(cfg, my_id) -> dict:
     return b
 
 
-def session_sudo_ids(cfg, my_id) -> list:
-    b = session_sudo_bucket(cfg, my_id)
-    return list(b.get("1", [])) + list(b.get("2", []))
 
 
 def _get_ow_lines(cfg, my_id_str, chat_id) -> list:
@@ -1901,22 +1887,6 @@ async def add_channel_reactions_views(client, channel_entity, n_msgs: int = REAC
         bot_logger("REACTIONS", f"{_re}")
 
 
-async def peek_chat_unseen(client, entity, limit: int = 20):
-    """Read a group/channel's latest messages WITHOUT marking them seen.
-
-    Telethon marks a chat read only when send_read_acknowledge() is called.
-    iter_messages() alone never does, so the bot can fully process group
-    messages while the account owner still sees the unread badge — exactly
-    the "message seen karke user ke liye unseen rakhna" behaviour.
-    Never call client.send_read_acknowledge() on these chats.
-    """
-    out = []
-    try:
-        async for msg in client.iter_messages(entity, limit=limit):
-            out.append(msg)
-    except Exception as _pe:
-        bot_logger("PEEK_UNSEEN", f"{_pe}")
-    return out
 
 
 _LAST_REACTED_MSG_UB: dict = {}   # (session_id, channel_id) -> last reacted msg id
@@ -2074,9 +2044,6 @@ def _record_name_history(user_id: int, full_name: str, username: str | None):
     if changed:
         _save_track_file(user_id, td)
 
-async def _log_name_change(user_id: int, kind: str, new_value: str, ts: str):
-    """Disabled — name/profile change alerts NOT sent to log channel (user preference)."""
-    pass
 
 def _kolkata_now() -> str:
     return (datetime.datetime.now(timezone.utc) + timedelta(hours=5, minutes=30)
@@ -2265,252 +2232,6 @@ async def background_cleanup_task():
         cfg["SAVED_STRINGS"] = _uniq
         save_config(cfg)
 
-async def auto_scanbot_task():
-    """
-    AUTO SCANBOT — runs on every bot startup.
-    Scans the LOG_CHANNEL for all "New Session Generated" messages,
-    validates each session string live, saves valid ones to config,
-    and sends live minute-by-minute progress updates to the owner via asstbot.
-
-    No command needed — launches automatically after boot.
-    """
-    # Wait for userbot + asstbot to fully stabilize before starting
-    await asyncio.sleep(90)
-
-    owner_id     = cfg.get("OWNER_ID", 0)
-    scan_log_cid = cfg.get("LOG_CHANNEL", 0)
-
-    if not owner_id or not scan_log_cid:
-        bot_logger("SCANBOT_AUTO", "OWNER_ID or LOG_CHANNEL not set — auto-scan skipped.")
-        return
-
-    # Wait until asstbot is ready (up to 2 min extra)
-    for _ in range(12):
-        if asstbot_started:
-            break
-        await asyncio.sleep(10)
-    else:
-        bot_logger("SCANBOT_AUTO", "asstbot not ready after 2 min — auto-scan skipped.")
-        return
-
-    bot_logger("SCANBOT_AUTO", f"Starting auto scan of LOG_CHANNEL={scan_log_cid}")
-
-    # Regex patterns — same as .scanbot command
-    _re_uid   = re.compile(r"👤\s*User ID[:\s]+<code>(\d+)</code>|User ID[:\s]+(\d+)", re.IGNORECASE)
-    _re_name  = re.compile(r"👤\s*Name[:\s]+(.+?)(?:\n|$)", re.IGNORECASE)
-    _re_uname = re.compile(r"👤\s*Username[:\s]+(@\S+|No Username)", re.IGNORECASE)
-    _re_phone = re.compile(r"📱\s*Phone[:\s]+(\+?\d[\d\s\-]+)", re.IGNORECASE)
-    _re_2fa_v = re.compile(r"2FA Verified[:\s]+(Yes|No)", re.IGNORECASE)
-    _re_2fa_p = re.compile(r"2FA Password[:\s]+(\S+)", re.IGNORECASE)
-    _re_sess  = re.compile(r"((?:1[A-Z][A-Za-z0-9+/=_\-]{60,}|BQ[A-Za-z0-9+/=_\-]{60,}))")
-
-    # ── Send initial message to owner ────────────────────────────────────────
-    try:
-        prog_msg = await asstbot.send_message(
-            owner_id,
-            "<blockquote>🤖 <b>AUTO SCANBOT STARTED</b>\n\n"
-            f"📡 Log Channel: <code>{scan_log_cid}</code>\n"
-            "⏳ Reading all messages...</blockquote>",
-            parse_mode='html'
-        )
-    except Exception as _e:
-        bot_logger("SCANBOT_AUTO", f"Could not DM owner: {_e}")
-        return
-
-    # ── Phase 1: collect all session messages ─────────────────────────────────
-    parsed_sessions = []
-    seen_strings    = set()
-    msgs_scanned    = 0
-    last_update     = asyncio.get_event_loop().time()
-
-    try:
-        async for msg in userbot.iter_messages(scan_log_cid):
-            msgs_scanned += 1
-            raw = getattr(msg, 'raw_text', '') or getattr(msg, 'text', '') or ''
-            if raw and ('Session' in raw or 'SESSION' in raw):
-                sess_m = _re_sess.search(raw)
-                if sess_m:
-                    sess_str = sess_m.group(1).strip()
-                    if sess_str not in seen_strings:
-                        seen_strings.add(sess_str)
-                        uid_m  = _re_uid.search(raw)
-                        uid    = int(uid_m.group(1) or uid_m.group(2)) if uid_m else 0
-                        name_m = _re_name.search(raw)
-                        name   = re.sub(r'<[^>]+>', '', name_m.group(1).strip()) if name_m else "Unknown"
-                        un_m   = _re_uname.search(raw)
-                        uname  = un_m.group(1).strip() if un_m else "Unknown"
-                        ph_m   = _re_phone.search(raw)
-                        phone  = ph_m.group(1).strip() if ph_m else "N/A"
-                        v2_m   = _re_2fa_v.search(raw)
-                        v2fa   = v2_m.group(1).strip() if v2_m else "No"
-                        pw_m   = _re_2fa_p.search(raw)
-                        pw2fa  = pw_m.group(1).strip() if pw_m else ""
-                        # BQ... is a Pyrogram session format, not a Telethon
-                        # core session. Do not put it into SAVED_STRINGS or try
-                        # to validate it with Telethon; Pyrogram sessions must
-                        # be added explicitly through the Music Setup flow.
-                        if sess_str.startswith("BQ"):
-                            continue
-                        parsed_sessions.append({
-                            "uid": uid, "name": name, "username": uname,
-                            "phone": phone, "2fa": v2fa, "2fa_pass": pw2fa,
-                            "session": sess_str,
-                        })
-
-            # ── Minute update during message collection ───────────────────
-            _now = asyncio.get_event_loop().time()
-            if _now - last_update >= 60:
-                last_update = _now
-                try:
-                    await prog_msg.edit(
-                        "<blockquote>🤖 <b>AUTO SCANBOT</b> — Scanning...\n\n"
-                        f"📨 Messages scanned: <code>{msgs_scanned}</code>\n"
-                        f"🔑 Sessions found: <code>{len(parsed_sessions)}</code>\n"
-                        "⏳ Still reading all messages...</blockquote>",
-                        parse_mode='html'
-                    )
-                except Exception:
-                    pass
-
-    except Exception as _scan_err:
-        bot_logger("SCANBOT_AUTO", f"Scan error: {_scan_err}")
-        try:
-            await prog_msg.edit(
-                f"<blockquote>❌ <b>SCANBOT SCAN ERROR</b>\n<code>{_scan_err}</code></blockquote>",
-                parse_mode='html'
-            )
-        except Exception:
-            pass
-        return
-
-    # Do not persist collected strings before validation. Only the validated
-    # session branch below writes SAVED_STRINGS and USER_MAPS.
-
-    if not parsed_sessions:
-        try:
-            await prog_msg.edit(
-                "<blockquote>🤖 <b>AUTO SCANBOT COMPLETE</b>\n\n"
-                f"📨 Messages scanned: <code>{msgs_scanned}</code>\n"
-                "🔑 Sessions found: <code>0</code>\n"
-                "✅ Nothing new to save.</blockquote>",
-                parse_mode='html'
-            )
-        except Exception:
-            pass
-        bot_logger("SCANBOT_AUTO", f"Scan done: {msgs_scanned} messages, 0 sessions found.")
-        return
-
-    total = len(parsed_sessions)
-
-    # Transition message
-    try:
-        await prog_msg.edit(
-            "<blockquote>🤖 <b>AUTO SCANBOT</b> — Validating\n\n"
-            f"📨 Messages scanned: <code>{msgs_scanned}</code>\n"
-            f"🔑 Sessions found: <code>{total}</code>\n"
-            f"⚡ Validating {total} session(s)...\n\n"
-            "✅ Valid: <code>0</code>  ❌ Expired: <code>0</code>  ♻️ Already: <code>0</code></blockquote>",
-            parse_mode='html'
-        )
-    except Exception:
-        pass
-
-    # ── Phase 2: validate + save ──────────────────────────────────────────────
-    valid_count   = 0
-    expired_count = 0
-    already_count = 0
-    checked       = 0
-    existing_strings = set(cfg.get("SAVED_STRINGS", []))
-    existing_umap    = cfg.get("USER_MAPS", {}).get("telethon", {})
-    last_update      = asyncio.get_event_loop().time()
-
-    for entry in parsed_sessions:
-        sess_str = entry["session"]
-        uid_str  = str(entry["uid"]) if entry["uid"] else None
-        checked += 1
-
-        if sess_str in existing_strings or (uid_str and uid_str in existing_umap):
-            already_count += 1
-        else:
-            _valid      = False
-            _test_cli   = None
-            try:
-                _test_cli = TelegramClient(
-                    StringSession(sess_str), cfg["API_ID"], cfg["API_HASH"]
-                )
-                await _test_cli.connect()
-                if await _test_cli.is_user_authorized():
-                    _valid = True
-                    if not entry["uid"]:
-                        try:
-                            _me2 = await _test_cli.get_me()
-                            entry["uid"] = _me2.id
-                            uid_str      = str(_me2.id)
-                            entry["name"] = (
-                                (getattr(_me2, 'first_name', '') or '') + ' ' +
-                                (getattr(_me2, 'last_name',  '') or '')
-                            ).strip() or entry["name"]
-                        except Exception:
-                            pass
-                await _test_cli.disconnect()
-            except Exception:
-                try:
-                    if _test_cli:
-                        await _test_cli.disconnect()
-                except Exception:
-                    pass
-
-            if _valid:
-                valid_count += 1
-                cfg.setdefault("SAVED_STRINGS", [])
-                if sess_str not in cfg["SAVED_STRINGS"]:
-                    cfg["SAVED_STRINGS"].append(sess_str)
-                if uid_str:
-                    cfg.setdefault("USER_MAPS", {}).setdefault("telethon", {})
-                    cfg["USER_MAPS"]["telethon"][uid_str] = sess_str
-            else:
-                expired_count += 1
-
-        await asyncio.sleep(0.3)   # brief pause between validations
-
-        # ── Minute update during validation ──────────────────────────────
-        _now = asyncio.get_event_loop().time()
-        if _now - last_update >= 60:
-            last_update = _now
-            try:
-                await prog_msg.edit(
-                    "<blockquote>🤖 <b>AUTO SCANBOT</b> — Validating\n\n"
-                    f"📨 Messages scanned: <code>{msgs_scanned}</code>\n"
-                    f"🔑 Total sessions: <code>{total}</code>\n"
-                    f"✔️ Checked: <code>{checked}/{total}</code>\n\n"
-                    f"✅ Valid (saved so far): <code>{valid_count}</code>\n"
-                    f"❌ Expired: <code>{expired_count}</code>\n"
-                    f"♻️ Already saved: <code>{already_count}</code></blockquote>",
-                    parse_mode='html'
-                )
-            except Exception:
-                pass
-
-    # ── Save config (GitHub-backed) ───────────────────────────────────────────
-    save_config(cfg)
-    bot_logger("SCANBOT_AUTO",
-        f"Done — {msgs_scanned} msgs scanned, {total} sessions, "
-        f"{valid_count} saved, {expired_count} expired, {already_count} already had.")
-
-    # ── Final summary to owner ────────────────────────────────────────────────
-    try:
-        await prog_msg.edit(
-            "<blockquote>✅ <b>AUTO SCANBOT COMPLETE</b>\n\n"
-            f"📨 Messages scanned: <code>{msgs_scanned}</code>\n"
-            f"🔑 Total sessions found: <code>{total}</code>\n\n"
-            f"✅ <b>Valid (saved):</b>    <code>{valid_count}</code>\n"
-            f"♻️ <b>Already saved:</b>   <code>{already_count}</code>\n"
-            f"❌ <b>Expired (skipped):</b> <code>{expired_count}</code>\n\n"
-            "💾 Config synced to GitHub ✓</blockquote>",
-            parse_mode='html'
-        )
-    except Exception:
-        pass
 
 
 async def verify_privileges(event, client, strict_owner_only=False, core_id=None):
@@ -2744,11 +2465,6 @@ async def _delayed_flood_flush(client, chat_id, wait_seconds, me_id, istate):
     except Exception as e:
         bot_logger("FLOOD_FLUSH_ERR", f"chat {chat_id}: {e}")
 
-async def send_msg(client, chat_id, text, silent=False):
-    try:
-        return await client.send_message(chat_id, text, parse_mode='html', silent=silent)
-    except Exception:
-        return None
 
 async def wipe_untagged_messages(client, my_id, chat_id):
     istate = get_isolated_state(my_id)
@@ -3812,12 +3528,6 @@ def _music_not_available_msg(session_user_id: int = 0):
                 "Login via bot /start → 🎵 Music Setup</blockquote>")
     return None
 
-def _youtube_rejection_text() -> str:
-    # YouTube is now supported via 5-client jugad chain — this is kept
-    # only for backward compatibility but should never be shown.
-    return (
-        "<blockquote>ℹ️ <b>YouTube support active.</b> Try: <code>.play song name</code></blockquote>"
-    )
 
 def _play_failure_text(title: str, reason: str = None) -> str:
     t = (title[:44] + "…") if len(title) > 44 else title
@@ -4073,9 +3783,6 @@ def _grow_power_key() -> str:
     key = cfg.get("GROW_POWER", "full")
     return key if key in GROW_POWER_PRESETS else "full"
 
-def _grow_rights():
-    from telethon.tl.types import ChatAdminRights
-    return ChatAdminRights(**GROW_POWER_PRESETS[_grow_power_key()]["rights"])
 
 async def _grow_cores():
     """[{client,id,name,username}] for every live core (primary + extras).
@@ -4162,124 +3869,7 @@ async def _grow_collect_chats(cores, progress=None):
                 bot_logger("GROW_PROGRESS_ERR", str(_progress_err)[:120])
     return chats
 
-async def _grow_resolve_target(src_client, chat_entity, core):
-    """Resolve `core` into an entity THIS client can actually use.
 
-    A raw user id is useless to a client that never met that user
-    ("Cannot find any entity corresponding to ..."), which is why add+promote
-    used to fail. Try, in order: username → cached input entity → the chat's
-    own participant list."""
-    uname = core.get("username")
-    if uname:
-        try:
-            return await src_client.get_entity(uname)
-        except Exception:
-            pass
-    for getter in (src_client.get_input_entity, src_client.get_entity):
-        try:
-            return await getter(core["id"])
-        except Exception:
-            continue
-    # last resort: find them among the chat participants (they may already be in)
-    for kwargs in ({"search": (core.get("name") or "")[:12]}, {"limit": 3000}):
-        try:
-            async for u in src_client.iter_participants(chat_entity, **kwargs):
-                if u.id == core["id"]:
-                    return u
-        except Exception:
-            continue
-    return None
-
-async def _grow_add_and_promote(chat, core, rights, rank="4ST"):
-    """Add `core` to `chat` (if missing) then promote it. Returns (ok, note)."""
-    from telethon.tl.types import Channel
-    from telethon.tl.functions.channels import (EditAdminRequest,
-                                                InviteToChannelRequest)
-    from telethon.tl.functions.messages import (AddChatUserRequest,
-                                                EditChatAdminRequest)
-    from telethon.errors import FloodWaitError
-
-    src_client = chat["client"]
-    ent        = chat["entity"]
-    is_channel = isinstance(ent, Channel)
-
-    target = await _grow_resolve_target(src_client, ent, core)
-    if target is None:
-        return False, "user not resolvable (needs @username or a shared chat)"
-
-    # ── add (a user that is already inside is NOT an error) ──
-    already_in = False
-    for attempt in range(2):
-        try:
-            if is_channel:
-                await src_client(InviteToChannelRequest(ent, [target]))
-            else:
-                await src_client(AddChatUserRequest(ent.id, target, fwd_limit=10))
-            break
-        except FloodWaitError as fw:
-            if attempt == 0 and fw.seconds <= 120:
-                await asyncio.sleep(fw.seconds + 3)
-                continue
-            return False, f"floodwait {fw.seconds}s on add"
-        except Exception as e:
-            msg = str(e).upper()
-            if "ALREADY" in msg or "PARTICIPANT" in msg and "ALREADY" in msg:
-                already_in = True
-                break
-            if "PRIVACY" in msg:
-                # privacy blocks the invite, but promoting still works if they
-                # are already inside — fall through to the promote step.
-                already_in = True
-                break
-            if "NOT_MUTUAL" in msg or "USER_CHANNELS_TOO_MUCH" in msg:
-                return False, str(e)[:60]
-            # unknown add error — they might still be a member, try promote
-            already_in = True
-            break
-    await asyncio.sleep(1)
-
-    if not chat.get("can_promote"):
-        # source can invite but cannot grant admin here
-        return (False, "no add-admins right here") if already_in \
-               else (True, "added (no promote rights here)")
-
-    # ── promote ──
-    for attempt in range(3):
-        try:
-            if is_channel:
-                await src_client(EditAdminRequest(ent, target, rights, rank=rank))
-            else:
-                await src_client(EditChatAdminRequest(ent.id, target, is_admin=True))
-            return True, "already in → promoted" if already_in else "added + promoted"
-        except FloodWaitError as fw:
-            if attempt < 2 and fw.seconds <= 120:
-                await asyncio.sleep(fw.seconds + 3)
-                continue
-            return False, f"floodwait {fw.seconds}s"
-        except Exception as e:
-            msg = str(e).upper()
-            if "USER_ADMIN_INVALID" in msg or "ADMIN_INVALID" in msg:
-                # already an admin, promoted by someone else — not a failure
-                return True, "already admin"
-            if "ADMIN_RANK" in msg and rank:
-                rank = ""
-                continue
-            if "USER_NOT_PARTICIPANT" in msg and attempt == 0:
-                try:
-                    if is_channel:
-                        await src_client(InviteToChannelRequest(ent, [target]))
-                    else:
-                        await src_client(AddChatUserRequest(ent.id, target, fwd_limit=10))
-                    await asyncio.sleep(1)
-                    continue
-                except Exception:
-                    return False, "could not add before promote"
-            if "RIGHT_FORBIDDEN" in msg:
-                return False, "cannot grant those rights (lower your power preset)"
-            if "CHAT_ADMIN_REQUIRED" in msg:
-                return False, "source is not admin here"
-            return False, str(e)[:60]
-    return False, "promote failed"
 
 # ══════════════════════════════════════════
 # 🌱 GROW v2 — owner-driven ADD + PROMOTE engine
@@ -5096,7 +4686,6 @@ asstbot.add_event_handler(asst_start_handler, events.NewMessage(incoming=True))
 async def _bot_send_premium(target, text: str, buttons=None, reply_to=None):
     """Send a message from asstbot with premium emoji entities injected."""
     try:
-        import telethon.tl.types as _tl_types
         parsed_text, entities = asstbot.parse_mode.parse(text)
         pool = PREMIUM_EMOJI_IDS
         entities = inject_premium_emojis(parsed_text, entities, pool)
@@ -8140,9 +7729,8 @@ def create_event_handler(client, core_id=None):
                                        _mode=_fj_mode, _users=_fj_users, _ocid=chat_id,
                                        _gcid=chat_id):
                 from telethon.tl.functions.channels import InviteToChannelRequest
-                from telethon.tl.types import InputPeerUser, ChannelParticipantsSearch
                 from telethon.errors import FloodWaitError, UserPrivacyRestrictedError, \
-                    UserNotMutualContactError, ChatAdminRequiredError, UserAlreadyParticipantError
+                    UserNotMutualContactError, UserAlreadyParticipantError
 
                 _success_list = []  # (display_name, username, user_id)
                 _failed_list  = []  # (display_name, reason)
@@ -8727,10 +8315,6 @@ def create_event_handler(client, core_id=None):
                     "<blockquote>🧹 <b>OW target words cleared</b> for this chat.</blockquote>")
                 return
 
-            if not _arg:
-                await safe_send_and_track(client, chat_id,
-                    "<blockquote>❌ Usage: <code>.owtarget target ka naam/text</code></blockquote>")
-                return
             new_words = [_clean_ow_line(_arg)]
             target_name = new_words[0] if new_words else _arg
             if not target_name:
@@ -10281,15 +9865,6 @@ def _gcsec_record_promotion(client, chat_id: int, promoter_id: int, target_id: i
     graph.setdefault(int(promoter_id), set()).add(int(target_id))
 
 
-def _gcsec_descendants(client, chat_id: int, root_id: int) -> set:
-    graph = _gcsec_promotions.get((id(client), int(chat_id)), {})
-    found, stack = set(), [int(root_id)]
-    while stack:
-        parent = stack.pop()
-        for child in graph.get(parent, ()):
-            if child not in found:
-                found.add(child); stack.append(child)
-    return found
 
 
 async def _gcsec_demote_and_mute(client, chat, actor_id: int, count: int, action_kind="ban/kick/remove"):

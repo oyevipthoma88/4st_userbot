@@ -26,8 +26,8 @@ def test_owtarget_stores_exact_user_text_and_firing_uses_custom_word():
         'elif re.match(r"(?i)^\\.mastersync', 1
     )[0]
     assert "resolve_target" not in target_block
-    assert "new_words = [_arg]" in target_block
-    assert "target_name = _arg" in target_block
+    assert "new_words = [_clean_ow_line(_arg)]" in target_block
+    assert "target_name = new_words[0]" in target_block
     assert "_humanize_ow_line(" in source
     assert "_ow_custom[_cust_idx % len(_ow_custom)]" in source
 
