@@ -154,10 +154,13 @@ except ImportError:
 
 if IS_TERMUX:
     music_sources = None
+    shruti_api = None
 else:
     # Extra no-cookie/no-login fallback sources plus stream cache and queue
     # helpers. See music_sources.py.
     import music_sources
+    # ShrutiBots YouTube API — primary .play/.vplay source (shruti_api.py).
+    import shruti_api
 
 # GitHub-backed durable persistence — see github_store.py's module
 # docstring. No-op unless GITHUB_TOKEN + GITHUB_REPO are set.
@@ -2828,164 +2831,88 @@ def _video_stream_flags() -> dict:
 
 
 async def search_and_download_audio(query: str):
-    """Resolve audio with a fast path and a bounded download fallback.
+    """.play resolver — ShrutiBots API first (target < 5s), old ladder as backup.
 
-    A hard ten-second end-to-end cap could cancel a healthy cloud download
-    after direct providers consumed most of the budget. Keep resolution
-    bounded, but give yt-dlp enough time to finish and allow configuration.
+    Order:
+      1. Local cache
+      2. ShrutiBots API (SHRUTI_API_KEY) — YouTube ID search + small audio file
+      3. Zero-disk direct CDN race (bounded by MUSIC_DIRECT_BUDGET)
+      4. yt-dlp disk download (bounded by MUSIC_RESOLVE_TIMEOUT)
     """
-    if not YTDLP_AVAILABLE:
-        return None
+    started = time.perf_counter()
     cached = _stream_cache.get(query)
     if cached and cached.get("file_path") and os.path.exists(cached["file_path"]):
-        return MusicTrack(title=cached["title"], file_path=cached["file_path"],
-                          duration=cached.get("duration", 0), is_video=False,
-                          thumbnail=cached.get("thumbnail"), source=cached.get("source", "youtube"))
-    started = time.perf_counter()
-    # YouTube Data API v3 is the authoritative fast search path. Resolve the
-    # video ID before starting the CDN race, then give yt-dlp the exact watch
-    # URL instead of making it scrape ytsearch1: all over again.
-    _youtube_target = None
-    if not query.startswith(("http://", "https://")):
-        # Data API v3 aur key-free InnerTube search ko SAATH me race karo.
-        # Quota khatam (HTTP 429) hone par bhi InnerTube ~0.3s me videoId de
-        # deta hai, isliye yt-dlp ko kabhi slow `ytsearch1:` scrape nahi
-        # karna padta — yahi 20s -> sub-5s ka asli fix hai.
-        _target_jobs = [asyncio.create_task(
-            music_sources.youtube_innertube_search(query, logger=bot_logger))]
-        if music_sources.yt_api_enabled():
-            _target_jobs.insert(0, asyncio.create_task(
-                music_sources.yt_api_search(query, logger=bot_logger, video=False)))
+        t = MusicTrack(title=cached["title"], file_path=cached["file_path"],
+                       duration=cached.get("duration", 0), is_video=False,
+                       thumbnail=cached.get("thumbnail"), source=cached.get("source", "cache"))
+        t.probe_verified = True
+        return t
+
+    # ── 1. ShrutiBots API (primary) ─────────────────────────────
+    if shruti_api and shruti_api.enabled():
         try:
-            # Keep the API/InnerTube target lookup bounded to timeout=1.2s by
-            # default; deployments can still raise it with MUSIC_TARGET_TIMEOUT.
-            _deadline = float(os.environ.get("MUSIC_TARGET_TIMEOUT", "1.2"))
-            _done, _left_jobs = await asyncio.wait(
-                _target_jobs, timeout=_deadline,
-                return_when=asyncio.FIRST_COMPLETED)
-            _hit = None
-            for _job in _target_jobs:          # API result ko preference
-                if _job in _done:
-                    with contextlib.suppress(Exception):
-                        _r = _job.result()
-                        if _r and _r.get("url"):
-                            _hit = _r
-                            break
-            if _hit is None and _left_jobs:
-                _done2, _left_jobs = await asyncio.wait(
-                    _left_jobs, timeout=max(0.2, _deadline / 2),
-                    return_when=asyncio.FIRST_COMPLETED)
-                for _job in _done2:
-                    with contextlib.suppress(Exception):
-                        _r = _job.result()
-                        if _r and _r.get("url"):
-                            _hit = _r
-                            break
-            for _job in _target_jobs:
-                if not _job.done():
-                    _job.cancel()
-            if _hit and _hit.get("url"):
-                _youtube_target = _hit["url"]
-                bot_logger("MUSIC_YT_API_FAST",
-                           f"direct target ready in {time.perf_counter() - started:.2f}s: "
-                           f"{_hit.get('video_id', '?')}")
+            res = await shruti_api.fetch_audio(query, MUSIC_CACHE, logger=bot_logger)
         except Exception as exc:
-            bot_logger("MUSIC_YT_API_FAST_MISS", repr(exc))
-    # Fast direct path: resolve_zero_disk_stream already performs a bounded
-    # HTTP liveness check. A second header-less FFmpeg probe falsely rejects
-    # some valid CDN URLs and burns the playback budget.
-    # ── STRICT SUB-5s DIRECT-STREAM MODE ───────────────────────
-    # Requirement: .play ko 5 second ke andar bajna hai. Sirf zero-disk direct
-    # CDN stream itni jaldi ready hota hai, isliye pura budget direct providers
-    # ko race karne me jata hai (blocked mirror pe turant dobara try) aur slow
-    # yt-dlp disk fallback default me OFF hai.
-    try:
-        _direct_budget = max(1.5, float(os.environ.get("MUSIC_DIRECT_BUDGET", "6.0")))
-    except (TypeError, ValueError):
-        _direct_budget = 6.0
-    _strict_direct = os.environ.get("MUSIC_STRICT_DIRECT", "1").lower() not in {"0", "false", "no"}
-    if os.environ.get("MUSIC_DIRECT_FAST", "1").lower() not in {"0", "false", "no"}:
-        _attempt = 0
-        while True:
-            _attempt += 1
-            _left = _direct_budget - (time.perf_counter() - started)
-            if _left <= 0.6:
-                break
-            try:
-                direct = await asyncio.wait_for(
-                    music_sources.resolve_zero_disk_stream(
-                        query, logger=bot_logger, youtube_target=_youtube_target),
-                    timeout=_left)
-            except Exception as exc:
-                direct = None
-                bot_logger("MUSIC_DIRECT_FAST_MISS", f"attempt {_attempt}: {exc!r}")
-            if direct and direct.get("stream_url"):
-                bot_logger(
-                    "MUSIC_DIRECT_FAST",
-                    f"live direct stream in {time.perf_counter() - started:.2f}s "
-                    f"(attempt {_attempt}): {direct.get('title', query)!r}",
-                )
-                _fast_track = MusicTrack(title=direct.get("title", query),
-                                  file_path="",
-                                  stream_url=direct["stream_url"],
-                                  duration=direct.get("duration", 0), is_video=False,
-                                  thumbnail=direct.get("thumbnail"), source=direct.get("source", "direct"))
-                # Provider ne already ffprobe gate paas kiya hai — dobara probe
-                # karke 0.5s barbaad na karo.
-                _fast_track.probe_verified = bool(direct.get("probe_verified"))
-                return _fast_track
-    # Default badla: pehle "0" tha, isliye direct stream miss hone par gaana
-    # BILKUL nahi bajta tha (log me MUSIC_STRICT_MISS). Direct budget (4.2s)
-    # pehle hi try ho chuka hai; uske baad disk se bajana hi sahi hai.
-    if _strict_direct and os.environ.get(
-            "MUSIC_ALLOW_SLOW_FALLBACK", "1").lower() not in {"1", "true", "yes"}:
-        bot_logger(
-            "MUSIC_STRICT_MISS",
-            f"no direct stream within {_direct_budget:.1f}s for {query!r} — "
-            f"slow disk fallback disabled (MUSIC_ALLOW_SLOW_FALLBACK=1 to allow)",
-        )
-        bot_logger("MUSIC_TIMING",
-                   f"strict audio race took {time.perf_counter() - started:.2f}s for {query!r} | result=miss")
+            res = None
+            bot_logger("SHRUTI_ERR", repr(exc))
+        if res and res.get("file_path"):
+            t = MusicTrack(title=res["title"], file_path=res["file_path"],
+                           duration=res.get("duration", 0), is_video=False,
+                           thumbnail=res.get("thumbnail"), source="shruti")
+            t.probe_verified = True   # API returns a real media file — skip 2nd probe
+            _stream_cache.put(query, t.title, t.file_path, t.duration,
+                              False, t.thumbnail, t.source)
+            bot_logger("MUSIC_TIMING", f"shruti audio {time.perf_counter() - started:.2f}s for {query!r}")
+            return t
+
+    if not YTDLP_AVAILABLE:
         return None
-    tmpl = os.path.join(MUSIC_CACHE, f"audio_{int(time.time()*1000)}_strict.%(ext)s")
-    # Bounded end-to-end budget: after direct lookup/probe, only the remaining
-    # time may be spent on the local fallback. The old ten-second cap made
-    # normal cloud extraction fail on slower providers.
+
+    # ── 2. Zero-disk direct stream (backup) ─────────────────────
     try:
-        _resolve_budget = max(15.0, float(os.environ.get("MUSIC_RESOLVE_TIMEOUT", "40")))
+        budget = max(1.5, float(os.environ.get("MUSIC_DIRECT_BUDGET", "6.0")))
     except (TypeError, ValueError):
-        _resolve_budget = 40.0
-    _elapsed = time.perf_counter() - started
-    _remaining = max(0.5, _resolve_budget - _elapsed)
-    if _remaining <= 0.5:
-        bot_logger("MUSIC_RACE_TIMEOUT", f"{_resolve_budget:.0f}s budget: no fallback time for {query!r}")
-        return None
+        budget = 6.0
+    left = budget - (time.perf_counter() - started)
+    if left > 0.6:
+        try:
+            direct = await asyncio.wait_for(
+                music_sources.resolve_zero_disk_stream(query, logger=bot_logger),
+                timeout=left)
+        except Exception as exc:
+            direct = None
+            bot_logger("MUSIC_DIRECT_MISS", repr(exc))
+        if direct and direct.get("stream_url"):
+            t = MusicTrack(title=direct.get("title", query), stream_url=direct["stream_url"],
+                           duration=direct.get("duration", 0), is_video=False,
+                           thumbnail=direct.get("thumbnail"), source=direct.get("source", "direct"))
+            t.probe_verified = bool(direct.get("probe_verified"))
+            return t
+
+    # ── 3. yt-dlp disk download (last resort) ───────────────────
+    try:
+        resolve_budget = max(15.0, float(os.environ.get("MUSIC_RESOLVE_TIMEOUT", "40")))
+    except (TypeError, ValueError):
+        resolve_budget = 40.0
+    tmpl = os.path.join(MUSIC_CACHE, f"audio_{int(time.time()*1000)}.%(ext)s")
     try:
         result = await asyncio.wait_for(
             music_sources.youtube_search_download(query, tmpl, logger=bot_logger),
-            timeout=_remaining)
-    except asyncio.TimeoutError:
-        bot_logger("MUSIC_RACE_TIMEOUT", f"{_resolve_budget:.0f}s budget exhausted: {query!r}")
-        result = None
+            timeout=max(1.0, resolve_budget - (time.perf_counter() - started)))
     except Exception as exc:
-        bot_logger("MUSIC_DL_ERR", repr(exc)); result = None
-    elapsed = time.perf_counter() - started
-    bot_logger("MUSIC_TIMING", f"strict audio race took {elapsed:.2f}s for {query!r} | result={'ok' if result else 'miss'}")
+        bot_logger("MUSIC_DL_ERR", repr(exc))
+        result = None
+    bot_logger("MUSIC_TIMING", f"audio resolve {time.perf_counter() - started:.2f}s for {query!r} "
+                               f"| result={'ok' if result else 'miss'}")
     if not result:
         return None
-    track = MusicTrack(
-        title=result.get("title", query),
-        file_path=result.get("file_path", ""),
-        stream_url=result.get("stream_url"),
-        duration=result.get("duration", 0),
-        is_video=False,
-        thumbnail=result.get("thumbnail"),
-        source=result.get("source", "youtube"),
-    )
-    if not track.is_zero_disk() and track.file_path and os.path.exists(track.file_path):
-        _stream_cache.put(query, track.title, track.file_path, track.duration,
-                          False, track.thumbnail, track.source)
-    return track
+    t = MusicTrack(title=result.get("title", query), file_path=result.get("file_path", ""),
+                   stream_url=result.get("stream_url"), duration=result.get("duration", 0),
+                   is_video=False, thumbnail=result.get("thumbnail"),
+                   source=result.get("source", "youtube"))
+    if not t.is_zero_disk() and t.file_path and os.path.exists(t.file_path):
+        _stream_cache.put(query, t.title, t.file_path, t.duration, False, t.thumbnail, t.source)
+    return t
 
 
 async def _search_and_download_audio_core(query: str):
@@ -3023,63 +2950,48 @@ async def _search_and_download_audio_core(query: str):
 
 
 async def search_and_download_video(query: str):
-    """Download video from YouTube using cookies (YTDLP_COOKIES env var).
+    """.vplay resolver — ShrutiBots video stream URL first (plays instantly,
+    no full download), yt-dlp download as backup."""
+    started = time.perf_counter()
+    cached = _stream_cache.get(f"video::{query}")
+    if cached and cached.get("file_path") and os.path.exists(cached["file_path"]):
+        return MusicTrack(title=cached["title"], file_path=cached["file_path"],
+                          duration=cached["duration"], is_video=True,
+                          thumbnail=cached.get("thumbnail"), source=cached["source"])
 
-    Strictly YouTube-only — mirrors the working Musicbot pattern.
-    YTDLP_COOKIES must be set on Heroku (Netscape format).
+    if shruti_api and shruti_api.enabled():
+        try:
+            res = await shruti_api.video_stream(query, logger=bot_logger)
+        except Exception as exc:
+            res = None
+            bot_logger("SHRUTI_ERR", repr(exc))
+        if res and res.get("stream_url"):
+            t = MusicTrack(title=res["title"], stream_url=res["stream_url"],
+                           duration=res.get("duration", 0), is_video=True,
+                           thumbnail=res.get("thumbnail"), source="shruti")
+            t.probe_verified = True   # PyTgCalls probes it once itself
+            bot_logger("MUSIC_TIMING", f"shruti video ready {time.perf_counter() - started:.2f}s")
+            return t
 
-    Flow:
-      1. Stream cache
-      2. YouTube video download via music_sources.youtube_video_download()
-      3. One retry after 2 s if the first attempt fails
-    """
     if not YTDLP_AVAILABLE:
         return None
-
-    cached = _stream_cache.get(f"video::{query}")
-    if cached:
-        bot_logger("MUSIC_CACHE_HIT", f"Reusing cached video for: {query}")
-        return MusicTrack(
-            title=cached["title"], file_path=cached["file_path"],
-            duration=cached["duration"], is_video=True,
-            thumbnail=cached.get("thumbnail"), source=cached["source"],
-        )
-
-    async def _ytv_download(suffix: str) -> MusicTrack | None:
-        ets  = int(time.time() * 1000)
-        tmpl = os.path.join(MUSIC_CACHE, f"video_{ets}_{suffix}.%(ext)s")
-        try:
-            result = await asyncio.wait_for(
-                music_sources.youtube_video_download(query, tmpl, logger=bot_logger),
-                timeout=300.0,
-            )
-        except asyncio.TimeoutError:
-            bot_logger("MUSIC_YT_TIMEOUT", f"YouTube video timed out (120s) for: {query!r}")
-            return None
-        if not result:
-            return None
-        return MusicTrack(
-            title=result["title"], file_path=result["file_path"],
-            duration=result["duration"], is_video=True,
-            thumbnail=result.get("thumbnail"), source=result["source"],
-        )
-
-    track = await _ytv_download("ytv")
-    if track:
-        _stream_cache.put(f"video::{query}", track.title, track.file_path,
-                           track.duration, True, track.thumbnail, track.source)
-        return track
-
-    bot_logger("MUSIC_RETRY", f"YouTube video attempt 1 failed — retrying in 2s for: {query!r}")
-    await asyncio.sleep(2.0)
-    track = await _ytv_download("ytv2")
-    if track:
-        _stream_cache.put(f"video::{query}", track.title, track.file_path,
-                           track.duration, True, track.thumbnail, track.source)
-        return track
-
-    bot_logger("MUSIC_DL_FAIL", f"YouTube video failed for: {query!r}. Check YTDLP_COOKIES.")
-    return None
+    tmpl = os.path.join(MUSIC_CACHE, f"video_{int(time.time()*1000)}.%(ext)s")
+    try:
+        result = await asyncio.wait_for(
+            music_sources.youtube_video_download(query, tmpl, logger=bot_logger),
+            timeout=float(os.environ.get("MUSIC_VIDEO_TIMEOUT", "60")))
+    except Exception as exc:
+        bot_logger("MUSIC_DL_ERR", f"video: {exc!r}")
+        result = None
+    if not result:
+        bot_logger("MUSIC_DL_FAIL", f"video failed for {query!r}")
+        return None
+    t = MusicTrack(title=result["title"], file_path=result["file_path"],
+                   duration=result["duration"], is_video=True,
+                   thumbnail=result.get("thumbnail"), source=result["source"])
+    _stream_cache.put(f"video::{query}", t.title, t.file_path, t.duration,
+                      True, t.thumbnail, t.source)
+    return t
 
 
 async def _search_and_download_video_core(query: str):
@@ -3323,7 +3235,7 @@ async def _resolve_music_session_id(requested_id: int):
 
 async def music_play_track(chat_id: int, track: MusicTrack, session_user_id: int,
                            _retry: bool = True, _attempt: int = 0):
-    session_user_id = _resolve_music_session_id(session_user_id)
+    session_user_id = await _resolve_music_session_id(session_user_id)
     if session_user_id is None:
         return False, "not_ready"
     """Starts streaming `track` into the chat's voice call using the
@@ -3566,6 +3478,9 @@ async def music_play_track(chat_id: int, track: MusicTrack, session_user_id: int
         # ── Strategy 3: Refresh direct URL before abandoning playback ─────
         # Signed CDN URLs expire and edges can reject one IP/connection.
         # Re-extract a fresh URL and retry the same track without leaving VC.
+        if track.is_video and track.source == "shruti" and _attempt < 3:
+            return await _play_via_source_switch(chat_id, track, session_user_id,
+                                                 _attempt, err_repr[:60])
         if track.is_zero_disk() and _attempt < 3:
             try:
                 fresh = await asyncio.wait_for(
@@ -3647,6 +3562,23 @@ async def _play_via_source_switch(chat_id: int, track: "MusicTrack",
                                       f"for {track.title[:50]!r}")
     if _attempt >= 3:
         bot_logger("MUSIC_PLAY_ERR", "Source switch budget exhausted — giving up.")
+        return False, "generic"
+
+    # (0) ShrutiBots video stream failed -> download the same video once
+    if shruti_api and track.is_video and track.source == "shruti" and track.is_zero_disk():
+        try:
+            res = await shruti_api.fetch_video(track.title, MUSIC_CACHE, logger=bot_logger)
+        except Exception as exc:
+            res = None
+            bot_logger("SHRUTI_ERR", repr(exc))
+        if res and res.get("file_path"):
+            vt = MusicTrack(title=res["title"], file_path=res["file_path"],
+                            duration=res.get("duration", 0) or track.duration,
+                            is_video=True, thumbnail=res.get("thumbnail"),
+                            source="shruti-disk", requester=track.requester)
+            vt.probe_verified = True
+            return await music_play_track(chat_id, vt, session_user_id,
+                                          _retry=False, _attempt=_attempt + 1)
         return False, "generic"
 
     # (a) fresh direct URL — already probe-verified by music_sources
@@ -10917,6 +10849,7 @@ async def main():
     # Warm the optional music runtime only on profiles that actually include it.
     if MUSIC_ENABLED:
         asyncio.create_task(music_sources.warm_up_music_runtime(logger=bot_logger))
+        asyncio.create_task(shruti_api.warm_up(logger=bot_logger))
     # ── Migrate NAME_HISTORY / USERNAME_HISTORY from config to data/tracks/ ──
     _did_migrate = False
     for _uid_k, _entries in list(cfg.get("NAME_HISTORY", {}).items()):

@@ -62,13 +62,16 @@ def test_process_lookup_error_switches_source_instead_of_rebuild_loop():
 
 def test_disk_fallback_is_allowed_by_default():
     s = (ROOT / "main.py").read_text()
-    assert 'os.environ.get(\n            "MUSIC_ALLOW_SLOW_FALLBACK", "1")' in s
+    body = s.split("async def search_and_download_audio", 1)[1].split(
+        "async def _search_and_download_audio_core", 1)[0]
+    assert "music_sources.youtube_search_download" in body
+    assert "MUSIC_ALLOW_SLOW_FALLBACK" not in body
 
 
 def test_verified_direct_track_is_not_probed_twice():
     s = (ROOT / "main.py").read_text()
     assert "self.probe_verified = False" in s
-    assert '_fast_track.probe_verified = bool(direct.get("probe_verified"))' in s
+    assert 't.probe_verified = bool(direct.get("probe_verified"))' in s
     assert 'if not getattr(track, "probe_verified", False):' in s
 
 
