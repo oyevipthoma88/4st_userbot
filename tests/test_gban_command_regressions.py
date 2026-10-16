@@ -50,10 +50,16 @@ def test_gban_reports_progress_and_actionable_failures():
     assert "GBAN SCANNING" in block
     assert "getattr(_p, \"ban_users\", False)" in block
     assert "await client(_req)" in block
-    assert "FloodWaitError as _fe" in block
+    assert "errors.FloodWaitError as _fe" in block
     assert "No chats where this account can ban users" in block
     assert "_remaining = max(0, int(_fe.seconds)) + 2" in block
     assert "TELEGRAM RATE LIMIT" in block
     assert "then continuing channel scan" in block
     assert "_failed_chats[-5:]" in block
     assert "_skipped_chats[-5:]" in block
+    assert "GetParticipantRequest" in block
+    assert "promoted_by" in block
+    assert '"target is an admin promoted by another account"' in block
+    assert "ChatAdminRights()" in block
+    assert "👑 Demoted" in block
+    assert "if _banned or _demoted:" in block

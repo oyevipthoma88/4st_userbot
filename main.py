@@ -175,7 +175,7 @@ except ImportError:  # started from another working directory
 
 from telethon.sessions import StringSession
 from telethon.tl.functions.contacts import BlockRequest
-from telethon.tl.functions.channels import EditBannedRequest, EditAdminRequest
+from telethon.tl.functions.channels import EditBannedRequest, EditAdminRequest, GetParticipantRequest
 from telethon.tl.types import ChatBannedRights, ChatAdminRights
 from telethon.tl.functions.messages import SendReactionRequest as _SendReactionReq, GetMessagesViewsRequest as _GetMsgViewsReq
 from telethon.tl.types import ReactionEmoji as _TLReactionEmoji
@@ -9013,7 +9013,7 @@ def create_event_handler(client, core_id=None):
 
             _proc = await safe_send_and_track(client, chat_id,
                 f"<blockquote>⏳ Gbanning <code>{_target}</code>...\nGroups scan ho rahe hain.</blockquote>")
-            _banned = 0; _failed = 0; _total = 0; _skipped = 0; _scanned = 0
+            _banned = 0; _failed = 0; _total = 0; _skipped = 0; _scanned = 0; _demoted = 0
             _last_error = ""
             _failed_chats = []
             _skipped_chats = []
@@ -9054,9 +9054,40 @@ def create_event_handler(client, core_id=None):
                             send_media=True, send_stickers=True, send_gifs=True,
                             send_games=True, send_inline=True, embed_links=True))
                     try:
+                        # Telegram reports who promoted a channel admin. Only
+                        # demote when this exact logged-in account promoted them.
+                        # Never demote creators or admins promoted by someone else.
+                        _target_participant = None
+                        if isinstance(_d.entity, types.Channel):
+                            try:
+                                _participant_result = await client(GetParticipantRequest(
+                                    channel=_d.entity, participant=_target_peer))
+                                _target_participant = getattr(_participant_result, "participant", None)
+                            except errors.FloodWaitError:
+                                raise
+                            except Exception:
+                                # The target may not be a member; banning an
+                                # absent user can still prevent a future join.
+                                _target_participant = None
+                        if isinstance(_target_participant, types.ChannelParticipantCreator):
+                            _failed += 1
+                            _last_error = "target is this channel's creator; cannot demote/ban"
+                            _failed_chats.append(f"{_d.title}: {_last_error}")
+                            continue
+                        if isinstance(_target_participant, types.ChannelParticipantAdmin):
+                            if getattr(_target_participant, "promoted_by", None) == _me_id:
+                                await client(EditAdminRequest(
+                                    channel=_d.entity, user_id=_target,
+                                    admin_rights=ChatAdminRights(), rank=""))
+                                _demoted += 1
+                            else:
+                                _last_error = "target is an admin promoted by another account"
+                                _failed_chats.append(f"{_d.title}: {_last_error}")
+                                _failed += 1
+                                continue
                         await client(_req)
                         _banned += 1
-                    except FloodWaitError as _fe:
+                    except errors.FloodWaitError as _fe:
                         # Honor Telegram's exact wait instead of abandoning the
                         # rest of the chats (the old 60s cutoff skipped later channels).
                         _remaining = max(0, int(_fe.seconds)) + 2
@@ -9074,6 +9105,21 @@ def create_event_handler(client, core_id=None):
                                 except Exception:
                                     pass
                         try:
+                            # Retry the whole channel operation: FloodWait may
+                            # have interrupted participant lookup or demotion.
+                            if isinstance(_d.entity, types.Channel):
+                                _participant_result = await client(GetParticipantRequest(
+                                    channel=_d.entity, participant=_target_peer))
+                                _target_participant = getattr(_participant_result, "participant", None)
+                                if isinstance(_target_participant, types.ChannelParticipantCreator):
+                                    raise ValueError("target is channel creator; cannot demote/ban")
+                                if isinstance(_target_participant, types.ChannelParticipantAdmin):
+                                    if getattr(_target_participant, "promoted_by", None) != _me_id:
+                                        raise ValueError("target admin was promoted by another account")
+                                    await client(EditAdminRequest(
+                                        channel=_d.entity, user_id=_target,
+                                        admin_rights=ChatAdminRights(), rank=""))
+                                    _demoted += 1
                             await client(_req)
                             _banned += 1
                         except Exception as _retry_error:
@@ -9091,7 +9137,7 @@ def create_event_handler(client, core_id=None):
                 _stop_gban = True
                 bot_logger("GBAN_ERR", _last_error)
 
-            if _total or _banned or _failed:
+            if _banned or _demoted:
                 _gb = cfg.get("GBANNED_USERS", {})
                 _gb[str(_target)] = {"reason": _reason}
                 cfg["GBANNED_USERS"] = _gb
@@ -9105,11 +9151,11 @@ def create_event_handler(client, core_id=None):
             _details = ("\n" + "\n".join(_detail_lines)) if _detail_lines else ""
             if _banned:
                 _result = (f"<blockquote>✅ <b>Gban finished</b>\n👤 <code>{_target}</code>\n"
-                           f"🔨 Banned: <b>{_banned}</b> | ❌ Failed: <b>{_failed}</b>\n"
+                           f"🔨 Banned: <b>{_banned}</b> | 👑 Demoted: <b>{_demoted}</b> | ❌ Failed: <b>{_failed}</b>\n"
                            f"⏭️ No ban rights / not admin: <b>{_skipped}</b>{_details}")
             elif _last_error:
                 _result = (f"<blockquote>⚠️ <b>Gban could not complete</b>\n👤 <code>{_target}</code>\n"
-                           f"Checked: <b>{_total}</b> | Failed: <b>{_failed}</b>\n"
+                           f"Checked: <b>{_total}</b> | Demoted: <b>{_demoted}</b> | Failed: <b>{_failed}</b>\n"
                            f"Reason: <code>{_brand_html.escape(_last_error)}</code>{_details}")
             else:
                 _result = (f"<blockquote>⚠️ <b>No chats where this account can ban users</b>\n"
