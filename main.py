@@ -8973,10 +8973,15 @@ def create_event_handler(client, core_id=None):
             asyncio.create_task(event.delete())
             _gm_args = (re.match(r"(?i)^\.gban(?:\s+(.*))?$", text).group(1) or "").strip()
             _target = None
+            _target_peer = None
             _reason = "No reason"
             if event.reply_to_msg_id:
                 _r = await event.get_reply_message()
                 _target = _r.sender_id
+                try:
+                    _target_peer = await _r.get_input_sender()
+                except Exception:
+                    _target_peer = None
                 if _gm_args: _reason = _gm_args
             elif _gm_args:
                 _parts = _gm_args.split(None, 1)
@@ -8986,6 +8991,7 @@ def create_event_handler(client, core_id=None):
                     try:
                         _ent = await client.get_entity(_parts[0])
                         _target = _ent.id
+                        _target_peer = await client.get_input_entity(_ent)
                     except Exception:
                         await safe_send_and_track(client, chat_id, f"<blockquote>❌ User not found: <code>{_parts[0]}</code></blockquote>")
                         return
@@ -8994,39 +9000,104 @@ def create_event_handler(client, core_id=None):
                 await safe_send_and_track(client, chat_id, "<blockquote>❌ Reply ya <code>.gban &lt;id|@user&gt; [reason]</code></blockquote>")
                 return
 
-            await safe_send_and_track(client, chat_id, f"<blockquote>⏳ Gbanning <code>{_target}</code>...</blockquote>")
-            _banned = 0; _failed = 0; _total = 0
-            async for _d in client.iter_dialogs():
-                if not (_d.is_group or _d.is_channel): continue
+            if not _target:
+                await safe_send_and_track(client, chat_id, "<blockquote>❌ Reply mein user identify nahi hua.</blockquote>")
+                return
+            if _target_peer is None:
                 try:
-                    _me = await client.get_me()
-                    _p = await client.get_permissions(_d.id, _me.id)
-                    if not (_p.is_admin or _p.is_creator): continue
-                except Exception: continue
-                _total += 1
-                try:
-                    await client(EditBannedRequest(
-                        channel=_d.id, participant=_target,
+                    _target_peer = await client.get_input_entity(_target)
+                except Exception:
+                    await safe_send_and_track(client, chat_id,
+                        f"<blockquote>❌ ID <code>{_target}</code> is account ke Telegram entity cache mein nahi hai. User ko username se resolve karein ya uske message par reply karke command bhejein.</blockquote>")
+                    return
+
+            _proc = await safe_send_and_track(client, chat_id,
+                f"<blockquote>⏳ Gbanning <code>{_target}</code>...\nGroups scan ho rahe hain.</blockquote>")
+            _banned = 0; _failed = 0; _total = 0; _skipped = 0; _scanned = 0
+            _last_error = ""
+            _last_progress = time.monotonic()
+            _stop_gban = False
+            try:
+                _me_id = (await get_me_cached(client)).id
+                async for _d in client.iter_dialogs():
+                    if not (_d.is_group or _d.is_channel):
+                        continue
+                    _scanned += 1
+                    if _proc and (time.monotonic() - _last_progress >= 8):
+                        try:
+                            await _premium_edit(_proc,
+                                f"<blockquote>⏳ <b>GBAN SCANNING</b>\n"
+                                f"User: <code>{_target}</code>\n"
+                                f"Chats scanned: <code>{_scanned}</code> | Eligible: <code>{_total}</code>\n"
+                                f"Banned: <code>{_banned}</code> | Failed: <code>{_failed}</code></blockquote>")
+                        except Exception:
+                            pass
+                        _last_progress = time.monotonic()
+                    try:
+                        _p = await client.get_permissions(_d.entity, _me_id)
+                    except Exception:
+                        _skipped += 1
+                        continue
+                    if not (getattr(_p, "is_creator", False) or
+                            (getattr(_p, "is_admin", False) and getattr(_p, "ban_users", False))):
+                        _skipped += 1
+                        continue
+                    _total += 1
+                    _req = EditBannedRequest(
+                        channel=_d.entity, participant=_target_peer,
                         banned_rights=ChatBannedRights(
                             until_date=None, view_messages=True, send_messages=True,
                             send_media=True, send_stickers=True, send_gifs=True,
-                            send_games=True, send_inline=True, embed_links=True)))
-                    _banned += 1
-                except FloodWaitError as _fe:
-                    await asyncio.sleep(_fe.seconds + 2)
-                    continue
+                            send_games=True, send_inline=True, embed_links=True))
+                    try:
+                        await client(_req)
+                        _banned += 1
+                    except FloodWaitError as _fe:
+                        if _fe.seconds > 60:
+                            _last_error = f"Telegram FloodWait {_fe.seconds}s; stopped to avoid leaving a silent long-running command"
+                            _stop_gban = True
+                            break
+                        await asyncio.sleep(_fe.seconds + 2)
+                        try:
+                            await client(_req)
+                            _banned += 1
+                        except Exception as _retry_error:
+                            _failed += 1
+                            _last_error = str(_retry_error)[:180]
+                    except Exception as _ban_error:
+                        _failed += 1
+                        _last_error = str(_ban_error)[:180]
+
+                    await asyncio.sleep(0.25)
+            except Exception as _scan_error:
+                _last_error = str(_scan_error)[:180]
+                _stop_gban = True
+                bot_logger("GBAN_ERR", _last_error)
+
+            if _total or _banned or _failed:
+                _gb = cfg.get("GBANNED_USERS", {})
+                _gb[str(_target)] = {"reason": _reason}
+                cfg["GBANNED_USERS"] = _gb
+                save_config(cfg)
+
+            if _banned:
+                _result = (f"<blockquote>✅ <b>Gban finished</b>\n👤 <code>{_target}</code>\n"
+                           f"🔨 Banned: <b>{_banned}</b> | ❌ Failed: <b>{_failed}</b>\n"
+                           f"⏭️ No ban rights / not admin: <b>{_skipped}</b>")
+            elif _last_error:
+                _result = (f"<blockquote>⚠️ <b>Gban could not complete</b>\n👤 <code>{_target}</code>\n"
+                           f"Checked: <b>{_total}</b> | Failed: <b>{_failed}</b>\n"
+                           f"Reason: <code>{_last_error}</code>")
+            else:
+                _result = (f"<blockquote>⚠️ <b>No chats where this account can ban users</b>\n"
+                           f"Chats skipped: <b>{_skipped}</b>. Ensure the account is an admin with ban-user rights.")
+            if _proc:
+                try:
+                    await _premium_edit(_proc, _result + ("\n<i>Stopped early after a Telegram limit.</i>" if _stop_gban else "") + "</blockquote>")
                 except Exception:
-                    _failed += 1
-                    continue
-                await asyncio.sleep(1.2)
-
-            _gb = cfg.get("GBANNED_USERS", {})
-            _gb[str(_target)] = {"reason": _reason}
-            cfg["GBANNED_USERS"] = _gb
-            save_config(cfg)
-
-            await safe_send_and_track(client, chat_id,
-                f"<blockquote>✅ <b>Gban Complete</b>\n👤 <code>{_target}</code>\n📝 {_reason}\n🔨 Banned: <b>{_banned}</b>\n❌ Failed: <b>{_failed}</b>\n📊 Total: <b>{_total}</b></blockquote>")
+                    await safe_send_and_track(client, chat_id, _result + "</blockquote>")
+            else:
+                await safe_send_and_track(client, chat_id, _result + "</blockquote>")
             return
 
         # ─────── GMUTE ───────

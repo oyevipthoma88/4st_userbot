@@ -38,3 +38,17 @@ def test_runtime_global_moderation_handlers_are_authorized_and_persisted():
         assert "verify_privileges(event, client=client)" in block
     assert "save_config(cfg)" in block
     assert "github_store.push_config_async(cfg" not in block
+
+
+def test_gban_reports_progress_and_actionable_failures():
+    source = (ROOT / "main.py").read_text(encoding="utf-8")
+    block = source.split("# ─────── GBAN ───────", 1)[1].split(
+        "# ─────── GMUTE ───────", 1
+    )[0]
+    assert "get_input_entity(_target)" in block
+    assert "entity cache mein nahi hai" in block
+    assert "GBAN SCANNING" in block
+    assert "getattr(_p, \"ban_users\", False)" in block
+    assert "await client(_req)" in block
+    assert "FloodWaitError as _fe" in block
+    assert "No chats where this account can ban users" in block
