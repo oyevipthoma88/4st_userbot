@@ -52,3 +52,8 @@ def test_gban_reports_progress_and_actionable_failures():
     assert "await client(_req)" in block
     assert "FloodWaitError as _fe" in block
     assert "No chats where this account can ban users" in block
+    assert "_remaining = max(0, int(_fe.seconds)) + 2" in block
+    assert "TELEGRAM RATE LIMIT" in block
+    assert "then continuing channel scan" in block
+    assert "_failed_chats[-5:]" in block
+    assert "_skipped_chats[-5:]" in block

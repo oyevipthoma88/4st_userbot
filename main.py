@@ -9015,6 +9015,8 @@ def create_event_handler(client, core_id=None):
                 f"<blockquote>⏳ Gbanning <code>{_target}</code>...\nGroups scan ho rahe hain.</blockquote>")
             _banned = 0; _failed = 0; _total = 0; _skipped = 0; _scanned = 0
             _last_error = ""
+            _failed_chats = []
+            _skipped_chats = []
             _last_progress = time.monotonic()
             _stop_gban = False
             try:
@@ -9035,12 +9037,14 @@ def create_event_handler(client, core_id=None):
                         _last_progress = time.monotonic()
                     try:
                         _p = await client.get_permissions(_d.entity, _me_id)
-                    except Exception:
+                    except Exception as _perm_error:
                         _skipped += 1
+                        _skipped_chats.append(f"{_d.title}: permissions unavailable ({str(_perm_error)[:80]})")
                         continue
                     if not (getattr(_p, "is_creator", False) or
                             (getattr(_p, "is_admin", False) and getattr(_p, "ban_users", False))):
                         _skipped += 1
+                        _skipped_chats.append(f"{_d.title}: this account lacks ban-users permission")
                         continue
                     _total += 1
                     _req = EditBannedRequest(
@@ -9053,20 +9057,33 @@ def create_event_handler(client, core_id=None):
                         await client(_req)
                         _banned += 1
                     except FloodWaitError as _fe:
-                        if _fe.seconds > 60:
-                            _last_error = f"Telegram FloodWait {_fe.seconds}s; stopped to avoid leaving a silent long-running command"
-                            _stop_gban = True
-                            break
-                        await asyncio.sleep(_fe.seconds + 2)
+                        # Honor Telegram's exact wait instead of abandoning the
+                        # rest of the chats (the old 60s cutoff skipped later channels).
+                        _remaining = max(0, int(_fe.seconds)) + 2
+                        while _remaining > 0:
+                            _chunk = min(15, _remaining)
+                            await asyncio.sleep(_chunk)
+                            _remaining -= _chunk
+                            if _proc:
+                                try:
+                                    await _premium_edit(_proc,
+                                        f"<blockquote>⏳ <b>TELEGRAM RATE LIMIT</b>\n"
+                                        f"User: <code>{_target}</code>\n"
+                                        f"Waiting <code>{_remaining}s</code>, then continuing channel scan.\n"
+                                        f"Banned: <code>{_banned}</code> | Failed: <code>{_failed}</code></blockquote>")
+                                except Exception:
+                                    pass
                         try:
                             await client(_req)
                             _banned += 1
                         except Exception as _retry_error:
                             _failed += 1
                             _last_error = str(_retry_error)[:180]
+                            _failed_chats.append(f"{_d.title}: {_last_error}")
                     except Exception as _ban_error:
                         _failed += 1
                         _last_error = str(_ban_error)[:180]
+                        _failed_chats.append(f"{_d.title}: {_last_error}")
 
                     await asyncio.sleep(0.25)
             except Exception as _scan_error:
@@ -9080,24 +9097,33 @@ def create_event_handler(client, core_id=None):
                 cfg["GBANNED_USERS"] = _gb
                 save_config(cfg)
 
+            _detail_lines = []
+            for _detail in _failed_chats[-5:]:
+                _detail_lines.append("❌ " + _brand_html.escape(_detail))
+            for _detail in _skipped_chats[-5:]:
+                _detail_lines.append("⏭️ " + _brand_html.escape(_detail))
+            _details = ("\n" + "\n".join(_detail_lines)) if _detail_lines else ""
             if _banned:
                 _result = (f"<blockquote>✅ <b>Gban finished</b>\n👤 <code>{_target}</code>\n"
                            f"🔨 Banned: <b>{_banned}</b> | ❌ Failed: <b>{_failed}</b>\n"
-                           f"⏭️ No ban rights / not admin: <b>{_skipped}</b>")
+                           f"⏭️ No ban rights / not admin: <b>{_skipped}</b>{_details}")
             elif _last_error:
                 _result = (f"<blockquote>⚠️ <b>Gban could not complete</b>\n👤 <code>{_target}</code>\n"
                            f"Checked: <b>{_total}</b> | Failed: <b>{_failed}</b>\n"
-                           f"Reason: <code>{_last_error}</code>")
+                           f"Reason: <code>{_brand_html.escape(_last_error)}</code>{_details}")
             else:
                 _result = (f"<blockquote>⚠️ <b>No chats where this account can ban users</b>\n"
-                           f"Chats skipped: <b>{_skipped}</b>. Ensure the account is an admin with ban-user rights.")
+                           f"Chats skipped: <b>{_skipped}</b>. Ensure the account is an admin with ban-user rights.{_details}")
+            if _stop_gban and _last_error:
+                _result += f"\n⚠️ Scan stopped: <code>{_brand_html.escape(_last_error)}</code>"
+            _result += "</blockquote>"
             if _proc:
                 try:
-                    await _premium_edit(_proc, _result + ("\n<i>Stopped early after a Telegram limit.</i>" if _stop_gban else "") + "</blockquote>")
+                    await _premium_edit(_proc, _result)
                 except Exception:
-                    await safe_send_and_track(client, chat_id, _result + "</blockquote>")
+                    await safe_send_and_track(client, chat_id, _result)
             else:
-                await safe_send_and_track(client, chat_id, _result + "</blockquote>")
+                await safe_send_and_track(client, chat_id, _result)
             return
 
         # ─────── GMUTE ───────
