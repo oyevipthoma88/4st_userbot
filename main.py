@@ -8968,9 +8968,10 @@ def create_event_handler(client, core_id=None):
 
 
         # ─────── GBAN ───────
-        if re.match(r"(?i)^\.gban(?:\\s+(.*))?$", text):
+        if re.match(r"(?i)^\.gban(?:\s+(.*))?$", text):
+            if not await verify_privileges(event, client=client): return
             asyncio.create_task(event.delete())
-            _gm_args = (re.match(r"(?i)^\\.gban(?:\\s+(.*))?$", text).group(1) or "").strip()
+            _gm_args = (re.match(r"(?i)^\.gban(?:\s+(.*))?$", text).group(1) or "").strip()
             _target = None
             _reason = "No reason"
             if event.reply_to_msg_id:
@@ -9022,17 +9023,17 @@ def create_event_handler(client, core_id=None):
             _gb = cfg.get("GBANNED_USERS", {})
             _gb[str(_target)] = {"reason": _reason}
             cfg["GBANNED_USERS"] = _gb
-            try: github_store.push_config_async(cfg, logger=bot_logger)
-            except Exception: pass
+            save_config(cfg)
 
             await safe_send_and_track(client, chat_id,
-                f"<blockquote>✅ <b>Gban Complete</b>\\n👤 <code>{_target}</code>\\n📝 {_reason}\\n🔨 Banned: <b>{_banned}</b>\\n❌ Failed: <b>{_failed}</b>\\n📊 Total: <b>{_total}</b></blockquote>")
+                f"<blockquote>✅ <b>Gban Complete</b>\n👤 <code>{_target}</code>\n📝 {_reason}\n🔨 Banned: <b>{_banned}</b>\n❌ Failed: <b>{_failed}</b>\n📊 Total: <b>{_total}</b></blockquote>")
             return
 
         # ─────── GMUTE ───────
-        if re.match(r"(?i)^\\.gmute(?:\\s+(.*))?$", text):
+        if re.match(r"(?i)^\.gmute(?:\s+(.*))?$", text):
+            if not await verify_privileges(event, client=client): return
             asyncio.create_task(event.delete())
-            _gm_args = (re.match(r"(?i)^\\.gmute(?:\\s+(.*))?$", text).group(1) or "").strip()
+            _gm_args = (re.match(r"(?i)^\.gmute(?:\s+(.*))?$", text).group(1) or "").strip()
             _target = None
             _reason = "No reason"
             if event.reply_to_msg_id:
@@ -9057,15 +9058,15 @@ def create_event_handler(client, core_id=None):
             _gm = cfg.get("GMUTED_USERS", {})
             _gm[str(_target)] = {"reason": _reason}
             cfg["GMUTED_USERS"] = _gm
-            try: github_store.push_config_async(cfg, logger=bot_logger)
-            except Exception: pass
-            await safe_send_and_track(client, chat_id, f"<blockquote>✅ <b>Gmuted</b> <code>{_target}</code>\\n📝 {_reason}\\n🗑️ Auto-delete ON</blockquote>")
+            save_config(cfg)
+            await safe_send_and_track(client, chat_id, f"<blockquote>✅ <b>Gmuted</b> <code>{_target}</code>\n📝 {_reason}\n🗑️ Auto-delete ON</blockquote>")
             return
 
         # ─────── UNGBAN ───────
-        if re.match(r"(?i)^\\.ungban(?:\\s+(.*))?$", text):
+        if re.match(r"(?i)^\.ungban(?:\s+(.*))?$", text):
+            if not await verify_privileges(event, client=client): return
             asyncio.create_task(event.delete())
-            _gm_args = (re.match(r"(?i)^\\.ungban(?:\\s+(.*))?$", text).group(1) or "").strip()
+            _gm_args = (re.match(r"(?i)^\.ungban(?:\s+(.*))?$", text).group(1) or "").strip()
             _target = None
             if event.reply_to_msg_id:
                 _r = await event.get_reply_message(); _target = _r.sender_id
@@ -9081,17 +9082,17 @@ def create_event_handler(client, core_id=None):
             _gb = cfg.get("GBANNED_USERS", {})
             if str(_target) in _gb:
                 del _gb[str(_target)]; cfg["GBANNED_USERS"] = _gb
-                try: github_store.push_config_async(cfg, logger=bot_logger)
-                except Exception: pass
+                save_config(cfg)
                 await safe_send_and_track(client, chat_id, f"<blockquote>✅ <code>{_target}</code> ungban</blockquote>")
             else:
                 await safe_send_and_track(client, chat_id, f"<blockquote>⚠️ <code>{_target}</code> list mein nahi</blockquote>")
             return
 
         # ─────── UNGMUTE ───────
-        if re.match(r"(?i)^\\.ungmute(?:\\s+(.*))?$", text):
+        if re.match(r"(?i)^\.ungmute(?:\s+(.*))?$", text):
+            if not await verify_privileges(event, client=client): return
             asyncio.create_task(event.delete())
-            _gm_args = (re.match(r"(?i)^\\.ungmute(?:\\s+(.*))?$", text).group(1) or "").strip()
+            _gm_args = (re.match(r"(?i)^\.ungmute(?:\s+(.*))?$", text).group(1) or "").strip()
             _target = None
             if event.reply_to_msg_id:
                 _r = await event.get_reply_message(); _target = _r.sender_id
@@ -9107,36 +9108,37 @@ def create_event_handler(client, core_id=None):
             _gm = cfg.get("GMUTED_USERS", {})
             if str(_target) in _gm:
                 del _gm[str(_target)]; cfg["GMUTED_USERS"] = _gm
-                try: github_store.push_config_async(cfg, logger=bot_logger)
-                except Exception: pass
+                save_config(cfg)
                 await safe_send_and_track(client, chat_id, f"<blockquote>✅ <code>{_target}</code> ungmute</blockquote>")
             else:
                 await safe_send_and_track(client, chat_id, f"<blockquote>⚠️ <code>{_target}</code> list mein nahi</blockquote>")
             return
 
         # ─────── GBANLIST ───────
-        if re.match(r"(?i)^\\.gbanlist$", text):
+        if re.match(r"(?i)^\.gbanlist$", text):
+            if not await verify_privileges(event, client=client): return
             asyncio.create_task(event.delete())
             _gb = cfg.get("GBANNED_USERS", {})
             if not _gb:
                 await safe_send_and_track(client, chat_id, "<blockquote>📭 Gban list khaali</blockquote>")
             else:
-                _txt = "<b>🚫 Gbanned Users</b>\\n\\n"
+                _txt = "<b>🚫 Gbanned Users</b>\n\n"
                 for _u, _d in _gb.items():
-                    _txt += f"• <code>{_u}</code> — {_d.get('reason','N/A')}\\n"
+                    _txt += f"• <code>{_u}</code> — {_d.get('reason','N/A')}\n"
                 await safe_send_and_track(client, chat_id, _txt)
             return
 
         # ─────── GMUTELIST ───────
-        if re.match(r"(?i)^\\.gmutelist$", text):
+        if re.match(r"(?i)^\.gmutelist$", text):
+            if not await verify_privileges(event, client=client): return
             asyncio.create_task(event.delete())
             _gm = cfg.get("GMUTED_USERS", {})
             if not _gm:
                 await safe_send_and_track(client, chat_id, "<blockquote>📭 Gmute list khaali</blockquote>")
             else:
-                _txt = "<b>🔇 Gmuted Users</b>\\n\\n"
+                _txt = "<b>🔇 Gmuted Users</b>\n\n"
                 for _u, _d in _gm.items():
-                    _txt += f"• <code>{_u}</code> — {_d.get('reason','N/A')}\\n"
+                    _txt += f"• <code>{_u}</code> — {_d.get('reason','N/A')}\n"
                 await safe_send_and_track(client, chat_id, _txt)
             return
 
