@@ -1,9 +1,19 @@
+# plugins/gban_gmute.py — v2.0.0
 from telethon import events
 from telethon.tl.functions.channels import EditBannedRequest
 from telethon.tl.types import ChatBannedRights
 from telethon.errors import FloodWaitError
 import asyncio
 
+PLUGIN_NAME = "Gban & Gmute"
+PLUGIN_CMDS = [
+    ".gban [id/@user/reply] [reason] — Global ban",
+    ".ungban [id/@user/reply] — Unban",
+    ".gmute [id/@user/reply] [reason] — Global mute",
+    ".ungmute [id/@user/reply] — Unmute",
+    ".gbanlist — Show gbanned users",
+    ".gmutelist — Show gmuted users",
+]
 
 async def _is_admin(client, chat_id):
     try:
@@ -13,31 +23,69 @@ async def _is_admin(client, chat_id):
     except Exception:
         return False
 
-
 async def _save(cfg, log):
     try:
-        from main import save_config
-        save_config(cfg)
+        import github_store
+        if hasattr(github_store, "push_config_async"):
+            await github_store.push_config_async(cfg, logger=log)
+        elif hasattr(github_store, "push_config"):
+            github_store.push_config(cfg)
+        log("GBAN", "Config saved")
     except Exception as e:
         log("GBAN", f"save fail: {e}")
 
+async def _resolve_target(event, client, args):
+    """(user_id, reason) — reply, ID, @username sab handle karta hai."""
+    target_id = None
+    reason = "No reason"
+
+    # Reply check
+    if event.reply_to_msg_id:
+        r = await event.get_reply_message()
+        target_id = r.sender_id
+        if args:
+            reason = args
+        return target_id, reason
+
+    if not args:
+        return None, "❌ Reply karo ya `.gban <id|@user> [reason]` likho."
+
+    parts = args.split(None, 1)
+    first = parts[0]
+
+    # Numeric ID try
+    try:
+        target_id = int(first)
+    except ValueError:
+        # Username try
+        try:
+            entity = await client.get_entity(first)
+            target_id = entity.id
+        except Exception as e:
+            return None, f"❌ User nahi mila: `{first}`\n{type(e).__name__}"
+
+    if len(parts) > 1:
+        reason = parts[1]
+
+    return target_id, reason
 
 def setup(client, cfg=None, bot_logger=None, **kwargs):
     log = bot_logger or (lambda t, m: print(f"[{t}] {m}"))
     if cfg is None:
         cfg = {}
+    log("PLUGIN", f"Loading {PLUGIN_NAME}")
 
-    @client.on(events.NewMessage(outgoing=True, pattern=r"(?i)^\.gban(?:\s+(.+))?$"))
+    # ─────── GBAN ───────
+    @client.on(events.NewMessage(outgoing=True, pattern=r"(?i)^\.gban(?:\s+(.*))?$"))
     async def cmd_gban(event):
-        if not event.reply_to_msg_id:
-            return await event.edit("Reply karke .gban likho.")
-        r = await event.get_reply_message()
-        uid = r.sender_id
-        reason = event.pattern_match.group(1) or "No reason"
-        await event.edit(f"Gbanning {uid}...")
-        banned = 0
-        failed = 0
-        total = 0
+        args = (event.pattern_match.group(1) or "").strip()
+        target_id, reason = await _resolve_target(event, client, args)
+        if target_id is None:
+            return await event.edit(reason)
+
+        await event.edit(f"⏳ Gbanning `{target_id}`...\n📝 Reason: {reason}")
+
+        banned = failed = total = 0
         async for d in client.iter_dialogs():
             if not (d.is_group or d.is_channel):
                 continue
@@ -46,11 +94,20 @@ def setup(client, cfg=None, bot_logger=None, **kwargs):
             total += 1
             try:
                 await client(EditBannedRequest(
-                    channel=d.id, participant=uid,
+                    channel=d.id,
+                    participant=target_id,
                     banned_rights=ChatBannedRights(
-                        until_date=None, view_messages=True, send_messages=True,
-                        send_media=True, send_stickers=True, send_gifs=True,
-                        send_games=True, send_inline=True, embed_links=True)))
+                        until_date=None,
+                        view_messages=True,
+                        send_messages=True,
+                        send_media=True,
+                        send_stickers=True,
+                        send_gifs=True,
+                        send_games=True,
+                        send_inline=True,
+                        embed_links=True,
+                    ),
+                ))
                 banned += 1
             except FloodWaitError as e:
                 await asyncio.sleep(e.seconds + 2)
@@ -59,75 +116,95 @@ def setup(client, cfg=None, bot_logger=None, **kwargs):
                 failed += 1
                 continue
             await asyncio.sleep(1.2)
+
         gb = cfg.get("GBANNED_USERS", {})
-        gb[str(uid)] = {"reason": reason}
+        gb[str(target_id)] = {"reason": reason}
         cfg["GBANNED_USERS"] = gb
         await _save(cfg, log)
-        await event.edit(f"Gban done\nUser: {uid}\nReason: {reason}\nBanned: {banned}\nFailed: {failed}\nTotal: {total}")
 
-    @client.on(events.NewMessage(outgoing=True, pattern=r"(?i)^\.ungban$"))
+        await event.edit(
+            f"✅ **Gban Complete**\n"
+            f"👤 User: `{target_id}`\n"
+            f"📝 Reason: {reason}\n"
+            f"🔨 Banned: **{banned}**\n"
+            f"❌ Failed: **{failed}**\n"
+            f"📊 Total checked: **{total}**"
+        )
+
+    # ─────── UNGBAN ───────
+    @client.on(events.NewMessage(outgoing=True, pattern=r"(?i)^\.ungban(?:\s+(.*))?$"))
     async def cmd_ungban(event):
-        if not event.reply_to_msg_id:
-            return await event.edit("Reply karke .ungban likho.")
-        r = await event.get_reply_message()
-        uid = str(r.sender_id)
+        args = (event.pattern_match.group(1) or "").strip()
+        target_id, _ = await _resolve_target(event, client, args)
+        if target_id is None:
+            return await event.edit("❌ Reply karo ya `.ungban <id|@user>` likho.")
+        uid = str(target_id)
         gb = cfg.get("GBANNED_USERS", {})
         if uid in gb:
             del gb[uid]
             cfg["GBANNED_USERS"] = gb
             await _save(cfg, log)
-            await event.edit(f"{uid} ungban.")
+            await event.edit(f"✅ `{uid}` ungban (list se hata).")
         else:
-            await event.edit(f"{uid} list mein nahi.")
+            await event.edit(f"⚠️ `{uid}` list mein nahi tha.")
 
-    @client.on(events.NewMessage(outgoing=True, pattern=r"(?i)^\.gmute(?:\s+(.+))?$"))
+    # ─────── GMUTE ───────
+    @client.on(events.NewMessage(outgoing=True, pattern=r"(?i)^\.gmute(?:\s+(.*))?$"))
     async def cmd_gmute(event):
-        if not event.reply_to_msg_id:
-            return await event.edit("Reply karke .gmute likho.")
-        r = await event.get_reply_message()
-        uid = str(r.sender_id)
-        reason = event.pattern_match.group(1) or "No reason"
+        args = (event.pattern_match.group(1) or "").strip()
+        target_id, reason = await _resolve_target(event, client, args)
+        if target_id is None:
+            return await event.edit(reason)
+        uid = str(target_id)
         gm = cfg.get("GMUTED_USERS", {})
         gm[uid] = {"reason": reason}
         cfg["GMUTED_USERS"] = gm
         await _save(cfg, log)
-        await event.edit(f"Gmuted {uid}\nReason: {reason}\nAuto-delete ON")
+        await event.edit(
+            f"✅ **Gmuted** `{uid}`\n"
+            f"📝 Reason: {reason}\n"
+            f"🗑️ Auto-delete ON (0 sec)"
+        )
 
-    @client.on(events.NewMessage(outgoing=True, pattern=r"(?i)^\.ungmute$"))
+    # ─────── UNGMUTE ───────
+    @client.on(events.NewMessage(outgoing=True, pattern=r"(?i)^\.ungmute(?:\s+(.*))?$"))
     async def cmd_ungmute(event):
-        if not event.reply_to_msg_id:
-            return await event.edit("Reply karke .ungmute likho.")
-        r = await event.get_reply_message()
-        uid = str(r.sender_id)
+        args = (event.pattern_match.group(1) or "").strip()
+        target_id, _ = await _resolve_target(event, client, args)
+        if target_id is None:
+            return await event.edit("❌ Reply karo ya `.ungmute <id|@user>` likho.")
+        uid = str(target_id)
         gm = cfg.get("GMUTED_USERS", {})
         if uid in gm:
             del gm[uid]
             cfg["GMUTED_USERS"] = gm
             await _save(cfg, log)
-            await event.edit(f"{uid} ungmute.")
+            await event.edit(f"✅ `{uid}` ungmute.")
         else:
-            await event.edit(f"{uid} list mein nahi.")
+            await event.edit(f"⚠️ `{uid}` list mein nahi tha.")
 
+    # ─────── LISTS ───────
     @client.on(events.NewMessage(outgoing=True, pattern=r"(?i)^\.gbanlist$"))
     async def cmd_gbanlist(event):
         gb = cfg.get("GBANNED_USERS", {})
         if not gb:
-            return await event.edit("Gban list khaali.")
-        t = "Gbanned Users:\n"
+            return await event.edit("📭 Gban list khaali.")
+        t = "**🚫 Gbanned Users**\n\n"
         for u, d in gb.items():
-            t += f"- {u} : {d.get('reason','N/A')}\n"
+            t += f"• `{u}` — {d.get('reason', 'N/A')}\n"
         await event.edit(t)
 
     @client.on(events.NewMessage(outgoing=True, pattern=r"(?i)^\.gmutelist$"))
     async def cmd_gmutelist(event):
         gm = cfg.get("GMUTED_USERS", {})
         if not gm:
-            return await event.edit("Gmute list khaali.")
-        t = "Gmuted Users:\n"
+            return await event.edit("📭 Gmute list khaali.")
+        t = "**🔇 Gmuted Users**\n\n"
         for u, d in gm.items():
-            t += f"- {u} : {d.get('reason','N/A')}\n"
+            t += f"• `{u}` — {d.get('reason', 'N/A')}\n"
         await event.edit(t)
 
+    # ─────── AUTO-DELETE gmuted messages ───────
     @client.on(events.NewMessage(incoming=True))
     async def auto_del(event):
         try:
@@ -137,4 +214,4 @@ def setup(client, cfg=None, bot_logger=None, **kwargs):
         except Exception:
             pass
 
-    log("PLUGIN", "Gban & Gmute loaded")
+    log("PLUGIN", f"{PLUGIN_NAME} loaded")
