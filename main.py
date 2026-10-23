@@ -5036,9 +5036,50 @@ async def _asst_callback_inner(event, data, sender_id, owner_id, is_owner):
             "──────────────────────\n"
             "  Send number with country code:\n"
             "  Example: <code>+919876543210</code>\n"
+            "  OTP Telegram app me aayega (notification check karo)\n"
             "──────────────────────</blockquote>",
             buttons=[[Button.inline("🔙 Cancel", b"login_activate")]]
         )
+
+    elif data == b"login_resend_otp":
+        ustate_r = state.asst_conversation_state.get(sender_id)
+        if not ustate_r or ustate_r.get("step") != "waiting_otp":
+            await event.answer("Login session expired. Start again.", alert=True)
+            return
+        _phone = ustate_r.get("phone", "")
+        _client_r = state.auth_clients.get(sender_id)
+        if not _client_r or not _phone:
+            state.asst_conversation_state[sender_id] = None
+            await event.answer("Login session lost. Start again.", alert=True)
+            return
+        try:
+            await event.answer("Sending new code...", alert=False)
+            _result = await _client_r.send_code_request(_phone)
+            ustate_r["phone_code_hash"] = _result.phone_code_hash
+            await _safe_bot_edit(event, sender_id,
+                "<blockquote>╭━━━📩 <b>OTP RESENT</b> ━━━╮\n"
+                "┃\n"
+                f"┃ Phone: <code>{_phone}</code>\n"
+                "┃ Enter the NEW OTP: <code>1 2 3 4 5</code>\n"
+                "┃\n"
+                "╰━━━━━━━━━━━━━━━━━━━━━━━╯</blockquote>",
+                buttons=[[Button.inline("🔄 Resend OTP", b"login_resend_otp")],
+                         [Button.inline("❌ Cancel", b"login_cancel")]])
+        except errors.FloodWaitError as _fw:
+            await event.answer(f"Rate limited! Wait {_fw.seconds}s.", alert=True)
+        except Exception as _re:
+            await event.answer(f"Resend failed: {str(_re)[:80]}", alert=True)
+
+    elif data == b"login_cancel":
+        _cl = state.auth_clients.pop(sender_id, None)
+        if _cl:
+            try: await _cl.disconnect()
+            except Exception: pass
+        state.asst_conversation_state[sender_id] = None
+        await _safe_bot_edit(event, sender_id,
+            "<blockquote>❌ <b>Login cancelled.</b></blockquote>",
+            buttons=[[Button.inline("🔐 Login Again", b"login_activate")],
+                     [Button.inline("🔙 Back", b"back_start")]])
 
     elif data == b"add_str":
         state.asst_conversation_state[sender_id] = {"step": "waiting_str"}
@@ -6070,26 +6111,49 @@ async def assistant_input_listener(event):
                 "┃\n"
                 f"┃ Phone: <code>{raw_phone}</code>\n"
                 "┃ Enter OTP with spaces: <code>1 2 3 4 5</code>\n"
+                "┃ (Telegram in-app notification may take a few seconds)\n"
                 "┃\n"
-                "╰━━━━━━━━━━━━━━━━━━━━━━━╯</blockquote>")
+                "╰━━━━━━━━━━━━━━━━━━━━━━━╯</blockquote>",
+                buttons=[[Button.inline("🔄 Resend OTP", b"login_resend_otp")],
+                         [Button.inline("❌ Cancel", b"login_cancel")]])
         except errors.FloodWaitError as e:
             if client_auth:
                 try: await client_auth.disconnect()
                 except Exception: pass
             state.asst_conversation_state[sender_id] = None
-            await _premium_edit(proc, f"<blockquote>⏳ <b>Rate Limit!</b> Wait <code>{e.seconds}</code>s then try again.</blockquote>")
+            await _premium_edit(proc, f"<blockquote>⏳ <b>Rate Limit!</b>\nWait <code>{e.seconds}</code>s then try again.</blockquote>")
+        except errors.PhoneNumberBannedError:
+            if client_auth:
+                try: await client_auth.disconnect()
+                except Exception: pass
+            state.asst_conversation_state[sender_id] = None
+            await _premium_edit(proc, "<blockquote>❌ <b>This phone number is banned from Telegram.</b>\nUse a different number.</blockquote>")
+        except errors.PhoneNumberUnoccupiedError:
+            if client_auth:
+                try: await client_auth.disconnect()
+                except Exception: pass
+            state.asst_conversation_state[sender_id] = None
+            await _premium_edit(proc, "<blockquote>❌ <b>This phone number is not registered on Telegram.</b>\nCreate a Telegram account first.</blockquote>")
         except Exception as e:
             if client_auth:
                 try: await client_auth.disconnect()
                 except Exception: pass
             state.asst_conversation_state[sender_id] = None
-            await _premium_edit(proc, f"<blockquote>❌ <b>Failed:</b> <code>{str(e)[:150]}</code></blockquote>")
+            _err_msg = str(e)[:150]
+            if "api_id" in _err_msg.lower() or "api_hash" in _err_msg.lower():
+                _err_msg = "API credentials invalid. Contact the owner."
+            await _premium_edit(proc, f"<blockquote>❌ <b>Failed:</b> <code>{_err_msg}</code></blockquote>")
 
     elif step == "waiting_otp":
         otp         = event.text.strip().replace(" ", "")
         client_auth = state.auth_clients.get(sender_id)
         if not client_auth:
             state.asst_conversation_state[sender_id] = None
+            return
+        if not otp.isdigit() or len(otp) < 4:
+            await _bot_reply(event,
+                "<blockquote>⚠️ <b>Invalid OTP format.</b>\n"
+                "Send only digits, e.g. <code>1 2 3 4 5</code></blockquote>")
             return
         proc = await _bot_reply(event, "<blockquote>🔄 <b>Verifying OTP...</b></blockquote>")
         try:
@@ -6116,12 +6180,32 @@ async def assistant_input_listener(event):
                     "Check deployment logs.</blockquote>")
         except errors.SessionPasswordNeededError:
             ustate["step"] = "waiting_2fa"
-            await _premium_edit(proc, "<blockquote>🔐 <b>2FA required. Send your password:</b></blockquote>")
-        except (errors.PhoneCodeInvalidError, errors.PhoneCodeExpiredError):
-            state.asst_conversation_state[sender_id] = None
-            await _premium_edit(proc, "<blockquote>❌ Invalid/Expired OTP. Try again via /start.</blockquote>")
+            await _premium_edit(proc, "<blockquote>🔐 <b>2FA required. Send your password:</b></blockquote>",
+                buttons=[[Button.inline("❌ Cancel", b"login_cancel")]])
+        except errors.PhoneCodeInvalidError:
+            await _premium_edit(proc,
+                "<blockquote>❌ <b>Invalid OTP.</b>\n"
+                "Send the correct code again: <code>1 2 3 4 5</code></blockquote>",
+                buttons=[[Button.inline("🔄 Resend OTP", b"login_resend_otp")],
+                         [Button.inline("❌ Cancel", b"login_cancel")]])
+        except errors.PhoneCodeExpiredError:
+            await _premium_edit(proc,
+                "<blockquote>⏰ <b>OTP Expired.</b>\n"
+                "Tap resend to get a new code:</blockquote>",
+                buttons=[[Button.inline("🔄 Resend OTP", b"login_resend_otp")],
+                         [Button.inline("❌ Cancel", b"login_cancel")]])
+        except errors.PhoneCodeEmptyError:
+            await _premium_edit(proc,
+                "<blockquote>❌ <b>Empty code received.</b> Try again.</blockquote>")
+        except errors.FloodWaitError as _fw:
+            await _premium_edit(proc,
+                f"<blockquote>⏳ <b>Rate limited.</b> Wait <code>{_fw.seconds}s</code> then try again.</blockquote>")
         except Exception as e:
             state.asst_conversation_state[sender_id] = None
+            _cl = state.auth_clients.pop(sender_id, None)
+            if _cl:
+                try: await _cl.disconnect()
+                except Exception: pass
             await _premium_edit(proc, f"<blockquote>❌ Error: <code>{str(e)[:150]}</code></blockquote>")
 
     elif step == "waiting_2fa":
@@ -6153,8 +6237,16 @@ async def assistant_input_listener(event):
                 await _premium_edit(proc, f"<blockquote>⚠️ <b>Login saved, but core is not active.</b>\n"
                     f"Account: <code>{user_info.id}</code>\n"
                     "Check deployment logs.</blockquote>")
+        except errors.PasswordHashInvalidError:
+            await _premium_edit(proc,
+                "<blockquote>❌ <b>Wrong 2FA password.</b> Try again:</blockquote>",
+                buttons=[[Button.inline("❌ Cancel", b"login_cancel")]])
         except Exception as e:
             state.asst_conversation_state[sender_id] = None
+            _cl = state.auth_clients.pop(sender_id, None)
+            if _cl:
+                try: await _cl.disconnect()
+                except Exception: pass
             await _premium_edit(proc, f"<blockquote>❌ 2FA Error: <code>{str(e)[:150]}</code></blockquote>")
 
 # ══════════════════════════════════════════
@@ -7406,6 +7498,7 @@ def create_event_handler(client, core_id=None):
                 "<i>.gcsec on|off|status</i></blockquote>")
 
         elif re.match(r"(?i)^\.dmsec$", text):
+            if not await verify_privileges(event, client=client, core_id=my_id): return
             asyncio.create_task(event.delete())
             istate.dmsec_active = not istate.dmsec_active
             st = "ENABLED ✅" if istate.dmsec_active else "DISABLED ❌"
@@ -7413,6 +7506,7 @@ def create_event_handler(client, core_id=None):
                 f"<blockquote>🛡️ <b>DM Security: {st}</b></blockquote>")
 
         elif re.match(r"(?i)^\.config$", text):
+            if not await verify_privileges(event, client=client, core_id=my_id): return
             asyncio.create_task(event.delete())
             speeds  = cfg.get("DEFAULT_SPEEDS", {})
             fonts   = cfg.get("ACTIVE_FONTS", {})
@@ -7436,6 +7530,7 @@ def create_event_handler(client, core_id=None):
             await safe_send_and_track(client, chat_id, msg)
 
         elif re.match(r"(?i)^\.speed\s+(\w+)\s+([\d.]+)$", text):
+            if not await verify_privileges(event, client=client, core_id=my_id): return
             asyncio.create_task(event.delete())
             m   = re.search(r"(?i)^\.speed\s+(\w+)\s+([\d.]+)$", text)
             cmd = m.group(1).lower()
@@ -7451,6 +7546,7 @@ def create_event_handler(client, core_id=None):
                 f"Module: <code>{cmd}</code>  →  <code>{spd}s</code>"))
 
         elif re.match(r"(?i)^\.font\s+(\w+)\s+([0-5])$", text):
+            if not await verify_privileges(event, client=client, core_id=my_id): return
             asyncio.create_task(event.delete())
             m   = re.search(r"(?i)^\.font\s+(\w+)\s+([0-5])$", text)
             cmd = m.group(1).lower()
@@ -7462,6 +7558,7 @@ def create_event_handler(client, core_id=None):
                 f"Module: <code>{cmd}</code>  →  Font <code>{idx}</code>"))
 
         elif re.match(r"(?i)^\.typing\s+(\w+)\s+(on|off)$", text):
+            if not await verify_privileges(event, client=client, core_id=my_id): return
             asyncio.create_task(event.delete())
             m   = re.search(r"(?i)^\.typing\s+(\w+)\s+(on|off)$", text)
             cmd = m.group(1).lower()
@@ -7473,6 +7570,7 @@ def create_event_handler(client, core_id=None):
                 f"Module: <code>{cmd}</code>  →  <code>{'ON' if val else 'OFF'}</code>"))
 
         elif re.match(r"(?i)^\.safemode(?:\s+(on|off))?$", text):
+            if not await verify_privileges(event, client=client, core_id=my_id): return
             asyncio.create_task(event.delete())
             m_sf = re.search(r"(?i)^\.safemode(?:\s+(on|off))?$", text)
             sub  = (m_sf.group(1) or "").lower()
@@ -7491,6 +7589,7 @@ def create_event_handler(client, core_id=None):
                 f"<blockquote>🛡️ <b>Safe Mode: {st}</b></blockquote>")
 
         elif re.match(r"(?i)^\.purge$", text):
+            if not await verify_privileges(event, client=client, core_id=my_id): return
             asyncio.create_task(event.delete())
             reply_msg = await event.get_reply_message()
             if not reply_msg:
