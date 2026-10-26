@@ -26,6 +26,8 @@ the bot behaves exactly as before; it just won't survive a filesystem wipe.
 """
 
 import os
+import copy
+from concurrent.futures import ThreadPoolExecutor
 import threading
 import time
 
@@ -37,6 +39,8 @@ except ImportError:
 _MONGO_URI = os.environ.get("MONGO_URI", "")
 _MONGO_DB  = os.environ.get("MONGO_DB", "4st_userbot")
 _CONFIG_KEY = os.environ.get("MONGO_CONFIG_KEY", "config")
+
+_sync_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="mongo-config-sync")
 
 _client = None
 _client_lock = threading.Lock()
@@ -101,9 +105,4 @@ def push_config_async(data: dict, logger=None):
     """Fire-and-forget config sync — never blocks the bot's event loop."""
     if not is_enabled():
         return
-    threading.Thread(
-        target=_push_config_sync,
-        args=(data, logger),
-        daemon=True,
-        name="mongo-config-sync",
-    ).start()
+    return _sync_executor.submit(_push_config_sync, copy.deepcopy(data), logger)

@@ -23,6 +23,7 @@ import contextlib
 import os
 import re
 import time
+import uuid
 from urllib.parse import urlencode
 
 try:
@@ -167,7 +168,7 @@ async def fetch_audio(query: str, cache_dir: str, logger=None) -> dict | None:
 
     timeout = aiohttp.ClientTimeout(
         total=float(os.environ.get("SHRUTI_AUDIO_TIMEOUT", "12")), sock_connect=4)
-    tmp = os.path.join(cache_dir, f"shruti_{vid}.part")
+    tmp = os.path.join(cache_dir, f"shruti_{vid}_{uuid.uuid4().hex}.part")
     try:
         sess = await _get_session()
         async with sess.get(download_url(vid, "audio"), timeout=timeout) as resp:
@@ -189,6 +190,9 @@ async def fetch_audio(query: str, cache_dir: str, logger=None) -> dict | None:
         with contextlib.suppress(Exception):
             os.remove(tmp)
         return None
+    finally:
+        with contextlib.suppress(FileNotFoundError):
+            os.remove(tmp)
     _log(logger, "SHRUTI_AUDIO_OK",
          f"{vid} ready in {time.perf_counter() - t0:.2f}s ({os.path.getsize(final)//1024} KB)")
     return {**meta, "file_path": final, "source": "shruti"}
@@ -214,7 +218,7 @@ async def fetch_video(query: str, cache_dir: str, logger=None) -> dict | None:
         return None
     vid = meta["video_id"]
     os.makedirs(cache_dir, exist_ok=True)
-    tmp = os.path.join(cache_dir, f"shruti_v_{vid}.part")
+    tmp = os.path.join(cache_dir, f"shruti_v_{vid}_{uuid.uuid4().hex}.part")
     try:
         sess = await _get_session()
         async with sess.get(download_url(vid, "video"),
@@ -237,7 +241,17 @@ async def fetch_video(query: str, cache_dir: str, logger=None) -> dict | None:
         with contextlib.suppress(Exception):
             os.remove(tmp)
         return None
+    finally:
+        with contextlib.suppress(FileNotFoundError):
+            os.remove(tmp)
     return {**meta, "file_path": final, "source": "shruti"}
+
+
+async def close() -> None:
+    global _session
+    session, _session = _session, None
+    if session is not None and not session.closed:
+        await session.close()
 
 
 async def warm_up(logger=None) -> None:
