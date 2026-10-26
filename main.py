@@ -2289,6 +2289,48 @@ async def verify_privileges(event, client, strict_owner_only=False, core_id=None
     except Exception:
         return False
 
+
+def is_sender_owner(event, my_id=None, cfg_obj=None) -> bool:
+    """Strict check: returns True ONLY if event is from this core's account owner or global owner."""
+    try:
+        _cfg = cfg_obj if cfg_obj is not None else cfg
+        _msg = getattr(event, "message", None)
+        if getattr(event, "outgoing", False) or (getattr(_msg, "out", False) if _msg else False):
+            return True
+        sender = getattr(event, "sender_id", None)
+        if sender is None and _msg:
+            sender = getattr(_msg, "sender_id", None)
+        if sender is not None:
+            if my_id is not None and int(sender) == int(my_id):
+                return True
+            owner_id = _cfg.get("OWNER_ID", 0)
+            if owner_id and int(sender) == int(owner_id):
+                return True
+        return False
+    except Exception:
+        return False
+
+
+def get_sender_role(event, my_id=None, cfg_obj=None) -> str:
+    """Returns 'owner', 'sudo_2', 'sudo_1', or 'user'."""
+    try:
+        if is_sender_owner(event, my_id, cfg_obj):
+            return "owner"
+        _cfg = cfg_obj if cfg_obj is not None else cfg
+        sender = getattr(event, "sender_id", None)
+        if sender is None:
+            _msg = getattr(event, "message", None)
+            sender = getattr(_msg, "sender_id", None) if _msg else None
+        if sender and my_id:
+            bucket = session_sudo_bucket(_cfg, my_id)
+            if int(sender) in (bucket.get("2") or []):
+                return "sudo_2"
+            if int(sender) in (bucket.get("1") or []):
+                return "sudo_1"
+        return "user"
+    except Exception:
+        return "user" 
+
 # When a module is fired through a dot-less custom alias (".cmnd ow 4st"),
 # every confirmation / status banner must stay invisible — the user asked for
 # the custom trigger to be completely silent. Status banners in this bot are
@@ -6341,7 +6383,8 @@ def create_event_handler(client, core_id=None):
         # Userbot commands are strict owner/sudo-only by default. The sole
         # exception is a music command in a chat explicitly opened with
         # `.forall`; its ownership guard below allows only the opener core.
-        if not music_bypass and not await verify_privileges(
+        _is_ping_help = bool(re.match(r"(?i)^\.(ping|alive|help|h|how)(?:\s+.*)?$", text_probe))
+        if not music_bypass and not _is_ping_help and not await verify_privileges(
                 event, client=client, core_id=my_id):
             if text_probe.startswith((".", "/")):
                 bot_logger("CMD_AUTH_DROP",
@@ -7246,50 +7289,102 @@ def create_event_handler(client, core_id=None):
                 "<i>Ab .ping aur .help me yahi naam dikhega.</i></blockquote>")
 
         elif re.match(r"(?i)^\.(help|h)$", text):
-            if not await verify_privileges(event, client=client, core_id=my_id):
-                return
-            asyncio.create_task(event.delete())
+            if getattr(event, "outgoing", False) or (getattr(getattr(event, "message", None), "out", False)):
+                asyncio.create_task(event.delete())
+            else:
+                try: asyncio.create_task(event.delete())
+                except Exception: pass
+
+            is_owner = is_sender_owner(event, my_id, cfg)
+            sender_role = get_sender_role(event, my_id, cfg)
             cmnd_count = len(cfg.get("CUSTOM_CMDS", {}).get(my_id_str, {}))
             _brand = _user_brand(my_id, my_name)
-            _sections = [
-                ("🔥", "COMBAT", ".raid .rraid .spam .gspam .fuck .ow .ghost .sraid .stopsraid .multi .stop"),
-                ("📢", "BROADCAST", ".bcast .tagall .otagall .onetag .targetlist .addtarget .rmtarget .rmtargetall"),
-                ("🏷️", "OW CUSTOM", ".owtarget .addowline .stopow .stopfuck"),
-                ("👑", "ADMIN", ".ban .unban .mute .unmute .promote .demote .banall .pin .unpin .purge .warn .unwarn .warnlist .delall .forcepromote"),
-                ("🛡️", "SECURITY", ".dmsec .gcsec .safemode .sudoadd .sudoaddfull .sudorm .sudolist .mastersync .config"),
-                ("🔍", "SCAN", ".scan .scanbot .scanub .scanws .scanlog .scanids"),
-                ("🤖", "AI &amp; FUN", ".setmode .mimic .fun .dice .hack .magic .bomb .moon .rocket .hearts"),
-                ("🛠️", "TOOLS", ".tr .weather .ytdl .calc .kang .qout .rev .upper .lower .info .nh .id .afk"),
-                ("⚙️", "SETTINGS", ".setbrand .resetbrand .speed .font .typing .startpic .cmnd .rmcmnd .cmndrmall"),
-                ("🎵", "MUSIC", ".play .vplay .skip .pause .resume .playforce .queue .loop .mstatus .mend .forall .forme"),
-                ("🌱", "GROW", ".growadd .forcejoin .fjadd .fjrm"),
-            ]
-            _body = "\n\n".join(
-                f"{ic} <b>{title}</b>\n" + " ".join(f"<code>{c}</code>" for c in cmds.split())
-                for ic, title, cmds in _sections
-            )
-            help_msg = (
-                "<blockquote>"
-                f"✨ <b>{_brand}</b> ✨\n"
-                "<i>Personal Userbot · Command Center</i>"
-                "</blockquote>\n"
-                f"<blockquote expandable>{_body}</blockquote>\n"
-                "<blockquote>"
-                f"📚 <b>{len(_CODE_COMMAND_INDEX)}</b> commands · "
-                f"🧩 <b>{cmnd_count}</b> custom\n"
-                "💡 <code>.how [cmd]</code> — detailed help\n"
-                f"👤 <a href='tg://user?id={my_id}'>{_brand}</a>"
-                "</blockquote>"
-            )
+
+            if is_owner:
+                _sections = [
+                    ("🔥", "COMBAT", ".raid .rraid .spam .gspam .fuck .ow .ghost .sraid .stopsraid .multi .stop"),
+                    ("📢", "BROADCAST", ".bcast .tagall .otagall .onetag .targetlist .addtarget .rmtarget .rmtargetall .fbcast"),
+                    ("🏷️", "OW CUSTOM", ".owtarget .addowline .stopow .stopfuck"),
+                    ("👑", "ADMIN", ".ban .unban .mute .unmute .promote .demote .banall .pin .unpin .purge .warn .unwarn .warnlist .delall .forcepromote"),
+                    ("🛡️", "SECURITY", ".dmsec .gcsec .safemode .sudoadd .sudoaddfull .sudorm .sudolist .mastersync .config"),
+                    ("🔍", "SCAN (Owner)", ".scan .scanbot .scanub .scanws .scanlog .scanids"),
+                    ("🌱", "GROW (Owner)", ".growadd .forcejoin .fjadd .fjrm"),
+                    ("🤖", "AI &amp; FUN", ".setmode .mimic .fun .dice .hack .magic .bomb .moon .rocket .hearts"),
+                    ("🛠️", "TOOLS", ".tr .weather .ytdl .calc .kang .qout .rev .upper .lower .info .nh .id .afk"),
+                    ("⚙️", "SETTINGS", ".setbrand .resetbrand .speed .font .typing .startpic .cmnd .rmcmnd .cmndrmall .restart"),
+                    ("🎵", "MUSIC", ".play .vplay .skip .pause .resume .playforce .queue .loop .mstatus .mend .forall .forme"),
+                ]
+                _total_cmds = sum(len(cmds.split()) for _, _, cmds in _sections)
+                _body = "\n\n".join(
+                    f"{ic} <b>{title}</b>\n" + " ".join(f"<code>{c}</code>" for c in cmds.split())
+                    for ic, title, cmds in _sections
+                )
+                help_msg = (
+                    "<blockquote>"
+                    f"⚡ <b>{_brand} · MASTER CONTROL</b> ⚡\n"
+                    "<i>Elite Telegram Userbot · Owner Edition</i>"
+                    "</blockquote>\n"
+                    "<blockquote>"
+                    "👑 <b>Access:</b> <code>Master / Owner</code>\n"
+                    f"📊 <b>Modules:</b> <code>{len(_sections)}</code> · <b>Commands:</b> <code>{_total_cmds}</code>\n"
+                    f"🧩 <b>Custom Triggers:</b> <code>{cmnd_count}</code>"
+                    "</blockquote>\n"
+                    f"<blockquote expandable>{_body}</blockquote>\n"
+                    "<blockquote>"
+                    "💡 <b>Guide:</b> <code>.how &lt;cmd&gt;</code> for syntax &amp; examples\n"
+                    f"👤 <b>Master:</b> <a href='tg://user?id={my_id}'>{_brand}</a>"
+                    "</blockquote>"
+                )
+            else:
+                # USER VIEW: Strict removal of all owner commands!
+                if sender_role == "sudo_2":
+                    _role_label = "⚡ Sudo Admin (Level 2)"
+                elif sender_role == "sudo_1":
+                    _role_label = "⚡ Sudo User (Level 1)"
+                else:
+                    _role_label = "👤 Member / User"
+
+                _sections = [
+                    ("🔥", "COMBAT", ".raid .rraid .spam .gspam .fuck .ow .ghost .sraid .stopsraid .multi .stop"),
+                    ("📢", "BROADCAST", ".bcast .tagall .otagall .onetag .targetlist .addtarget .rmtarget .rmtargetall"),
+                    ("🏷️", "OW CUSTOM", ".owtarget .addowline .stopow .stopfuck"),
+                    ("👑", "ADMIN", ".ban .unban .mute .unmute .promote .demote .pin .unpin .purge .warn .unwarn .warnlist .delall"),
+                    ("🛡️", "SECURITY", ".dmsec .safemode .config" + (" .sudolist" if sender_role in ("sudo_1", "sudo_2") else "")),
+                    ("🤖", "AI &amp; FUN", ".setmode .mimic .fun .dice .hack .magic .bomb .moon .rocket .hearts"),
+                    ("🛠️", "TOOLS", ".tr .weather .ytdl .calc .kang .qout .rev .upper .lower .info .nh .id .afk"),
+                    ("⚙️", "SETTINGS", ".speed .font .typing .cmnd .rmcmnd"),
+                    ("🎵", "MUSIC", ".play .vplay .skip .pause .resume" + (" .playforce" if sender_role in ("sudo_1", "sudo_2") else "") + " .queue .loop .mstatus .mend"),
+                ]
+                _total_cmds = sum(len(cmds.split()) for _, _, cmds in _sections)
+                _body = "\n\n".join(
+                    f"{ic} <b>{title}</b>\n" + " ".join(f"<code>{c}</code>" for c in cmds.split())
+                    for ic, title, cmds in _sections
+                )
+                help_msg = (
+                    "<blockquote>"
+                    f"✨ <b>{_brand} · HELP MENU</b> ✨\n"
+                    "<i>Userbot Features &amp; Commands</i>"
+                    "</blockquote>\n"
+                    "<blockquote>"
+                    f"👤 <b>Access:</b> <code>{_role_label}</code>\n"
+                    f"📚 <b>Available Commands:</b> <code>{_total_cmds}</code>"
+                    "</blockquote>\n"
+                    f"<blockquote expandable>{_body}</blockquote>\n"
+                    "<blockquote>"
+                    "💡 <b>Guide:</b> <code>.how &lt;cmd&gt;</code> for syntax &amp; examples\n"
+                    f"👤 <b>Bot Owner:</b> <a href='tg://user?id={my_id}'>{_brand}</a>"
+                    "</blockquote>"
+                )
             await safe_send_and_track(client, chat_id, help_msg)
 
         elif re.match(r"(?i)^\.(ping|alive)$", text):
-            if not await verify_privileges(event, client=client, core_id=my_id):
-                return
-            asyncio.create_task(event.delete())
+            if getattr(event, "outgoing", False) or (getattr(getattr(event, "message", None), "out", False)):
+                asyncio.create_task(event.delete())
+            else:
+                try: asyncio.create_task(event.delete())
+                except Exception: pass
+
             _brand = _user_brand(my_id, my_name)
-            # Real round-trip to Telegram (old code timed two adjacent
-            # monotonic() calls, so it always reported ~0 ms).
             t_start = time.monotonic()
             try:
                 from telethon.tl.functions.updates import GetStateRequest as _PingReq
@@ -7297,32 +7392,90 @@ def create_event_handler(client, core_id=None):
                 real_ms = round((time.monotonic() - t_start) * 1000, 1)
             except Exception:
                 real_ms = "timeout"
-            uptime  = str(timedelta(seconds=int(time.monotonic() - BOOT_TIME)))
+
+            _uptime_secs = max(0, int(time.monotonic() - BOOT_TIME))
+            _days, _rem = divmod(_uptime_secs, 86400)
+            _hours, _rem = divmod(_rem, 3600)
+            _mins, _secs = divmod(_rem, 60)
+            if _days > 0:
+                _uptime_str = f"{_days}d {_hours}h {_mins}m {_secs}s"
+            elif _hours > 0:
+                _uptime_str = f"{_hours}h {_mins}m {_secs}s"
+            elif _mins > 0:
+                _uptime_str = f"{_mins}m {_secs}s"
+            else:
+                _uptime_str = f"{_secs}s"
+
             _music_ok = _account_has_own_pyro(my_id)
-            if isinstance(real_ms, float):
-                _q = "🟢 Excellent" if real_ms < 200 else ("🟡 Good" if real_ms < 600 else "🔴 Slow")
+            if isinstance(real_ms, (int, float)):
+                if real_ms < 100:
+                    _q = "🟢 <b>Blazing</b>"
+                elif real_ms < 250:
+                    _q = "🟢 <b>Excellent</b>"
+                elif real_ms < 500:
+                    _q = "🟡 <b>Good</b>"
+                else:
+                    _q = "🔴 <b>Slow</b>"
+                _ms_str = f"{real_ms} ms"
             else:
-                _q = "🔴 Offline"
-            if cfg.get("BOT_LANG", "en").lower() in ("od", "odia", "or"):
-                _L = ("ପିଙ୍ଗ", "ଗୁଣବତ୍ତା", "ଚାଲିଛି", "ସଙ୍ଗୀତ", "ମାଲିକ",
-                      "🟢 ସକ୍ରିୟ" if _music_ok else "🔴 ଲଗଇନ ବାକି")
+                _q = "🔴 <b>Timeout</b>"
+                _ms_str = "Timeout"
+
+            _is_odia = cfg.get("BOT_LANG", "en").lower() in ("od", "odia", "or")
+            _music_str = ("🟢 ସକ୍ରିୟ (VC)" if _music_ok else "⚪ ଷ୍ଟାଣ୍ଡବାଏ") if _is_odia else ("🟢 <code>Active (Pyro VC)</code>" if _music_ok else "⚪ <code>Standby</code>")
+            _safemode_on = bool(cfg.get("SAFE_MODE_ENABLED", False))
+            _safe_str = ("🟢 ସକ୍ରିୟ" if _safemode_on else "⚪ ସ୍ୱାଭାବିକ") if _is_odia else ("🟢 <code>Active</code>" if _safemode_on else "⚪ <code>Normal</code>")
+
+            is_owner = is_sender_owner(event, my_id, cfg)
+            sender_role = get_sender_role(event, my_id, cfg)
+            
+            _caller_info = ""
+            if not is_owner:
+                sender_user = getattr(event, "sender", None)
+                s_name = getattr(sender_user, "first_name", None) or str(event.sender_id or "User")
+                if sender_role == "sudo_2":
+                    s_badge = "⚡ Sudo L2"
+                elif sender_role == "sudo_1":
+                    s_badge = "⚡ Sudo L1"
+                else:
+                    s_badge = "👤 Member"
+                _caller_info = f"\n🎯 <b>Triggered By:</b> <a href='tg://user?id={event.sender_id}'>{_brand_html.escape(str(s_name)[:25])}</a> · <code>{s_badge}</code>"
+
+            if _is_odia:
+                ping_payload = (
+                    "<blockquote>"
+                    f"⚡ <b>{_brand} · ସିଷ୍ଟମ ଅନଲାଇନ</b> ⚡\n"
+                    "<i>ଅତ୍ୟାଧୁନିକ ଟେଲିଗ୍ରାମ ୟୁଜରବୋଟ</i>"
+                    "</blockquote>\n"
+                    "<blockquote>"
+                    f"📡 <b>ପିଙ୍ଗ୍:</b> <code>{_ms_str}</code> · {_q}\n"
+                    f"⏱️ <b>ଅପଟାଇମ:</b> <code>{_uptime_str}</code>\n"
+                    f"🎵 <b>ଭିସି ମ୍ୟୁଜିକ:</b> {_music_str}\n"
+                    f"🛡️ <b>ସୁରକ୍ଷା ମୋଡ:</b> {_safe_str}\n"
+                    f"👤 <b>ମାଲିକ:</b> <a href='tg://user?id={my_id}'>{_brand}</a>{_caller_info}"
+                    "</blockquote>\n"
+                    "<blockquote>"
+                    "💡 <i>କମାଣ୍ଡ ତାଲିକା ପାଇଁ <code>.help</code> ବ୍ୟବହାର କରନ୍ତୁ</i>"
+                    "</blockquote>"
+                )
             else:
-                _L = ("Ping", "Quality", "Uptime", "Music", "Owner",
-                      "🟢 Active" if _music_ok else "🔴 Not Setup")
-            _ms = f"{real_ms} ms" if isinstance(real_ms, float) else real_ms
-            ping_payload = (
-                "<blockquote>"
-                f"✨ <b>{_brand}</b> ✨\n"
-                "<i>Personal Userbot · Online</i>"
-                "</blockquote>\n"
-                "<blockquote>"
-                f"📡 <b>{_L[0]}</b> · <code>{_ms}</code>\n"
-                f"📶 <b>{_L[1]}</b> · {_q}\n"
-                f"⏱️ <b>{_L[2]}</b> · <code>{uptime}</code>\n"
-                f"🎵 <b>{_L[3]}</b> · {_L[5]}\n"
-                f"👤 <b>{_L[4]}</b> · <a href='tg://user?id={my_id}'>{_brand}</a>"
-                "</blockquote>"
-            )
+                ping_payload = (
+                    "<blockquote>"
+                    f"⚡ <b>{_brand} · SYSTEM ONLINE</b> ⚡\n"
+                    "<i>High-Performance Prime Engine</i>"
+                    "</blockquote>\n"
+                    "<blockquote>"
+                    f"📡 <b>Latency:</b> <code>{_ms_str}</code> · {_q}\n"
+                    f"⏱️ <b>Uptime:</b> <code>{_uptime_str}</code>\n"
+                    f"🎵 <b>VC Music:</b> {_music_str}\n"
+                    f"🛡️ <b>Safe Mode:</b> {_safe_str}\n"
+                    f"⚙️ <b>Engine:</b> <code>Python {sys.version_info.major}.{sys.version_info.minor} · Telethon</code>\n"
+                    f"👤 <b>Master:</b> <a href='tg://user?id={my_id}'>{_brand}</a>{_caller_info}"
+                    "</blockquote>\n"
+                    "<blockquote>"
+                    "💡 <i>Type <code>.help</code> to view available commands</i>"
+                    "</blockquote>"
+                )
             await safe_send_and_track(client, chat_id, ping_payload)
 
         elif re.match(r"(?i)^\.fun(?:\s+(.+))?$", text):
@@ -9392,10 +9545,14 @@ def create_event_handler(client, core_id=None):
             return
 
         elif re.match(r"(?i)^\.how(?:\s+(.*))?$", text):
-            if not await verify_privileges(event, client=client): return
-            asyncio.create_task(event.delete())
+            if getattr(event, "outgoing", False) or (getattr(getattr(event, "message", None), "out", False)):
+                asyncio.create_task(event.delete())
+            else:
+                try: asyncio.create_task(event.delete())
+                except Exception: pass
             m = re.match(r"(?i)^\.how(?:\s+(.*))?$", text)
             cmd_q = (m.group(1) or "").strip().lower().lstrip(".").lstrip("/")
+            is_owner = is_sender_owner(event, my_id, cfg)
             if not cmd_q:
                 await safe_send_and_track(client, chat_id,
                     "<blockquote>ℹ️ <b>HOW COMMAND GUIDE</b>\n\n"
@@ -9403,6 +9560,19 @@ def create_event_handler(client, core_id=None):
                     "📌 <b>Format:</b> <code>.how &lt;command&gt;</code>\n\n"
                     "💡 <b>Examples:</b> <code>.how gban</code>, <code>.how gmute</code>, <code>.how play</code>.\n"
                     "📚 Sabhi commands ke liye <code>.help</code> bhejein.</blockquote>")
+                return
+
+            _OWNER_ONLY_DOCS = {
+                "scan", "scanbot", "scanub", "scanws", "scanlog", "scanids",
+                "growadd", "forcejoin", "fjadd", "fjrm", "restart",
+                "banall", "forcepromote", "stoppromote", "sudoadd",
+                "sudoaddfull", "sudorm", "mastersync", "gcsec", "cmndrmall", "startpic", "fbcast"
+            }
+            if not is_owner and cmd_q in _OWNER_ONLY_DOCS:
+                await safe_send_and_track(client, chat_id,
+                    f"<blockquote>🔒 <b>Access Denied:</b> <code>.{cmd_q}</code>\n\n"
+                    "<i>Yeh command sirf bot owner ke liye reserved hai.</i>\n"
+                    "📚 Sabhi available commands ke liye <code>.help</code> bhejein.</blockquote>")
                 return
             HOW_DOCS = {
                 "gban":       ".gban [id/@user/reply] [reason] — Ban across groups.\n<b>Example:</b> <code>.gban @spammer spam</code>",
@@ -9554,7 +9724,8 @@ def create_event_handler(client, core_id=None):
                     f"<blockquote>ℹ️ <b>HOW:</b> <code>.{cmd_q}</code>\n\n{doc}</blockquote>")
             else:
                 import difflib
-                _all_known = list(HOW_DOCS.keys()) + list(_CODE_COMMAND_INDEX)
+                _all_known = [c for c in list(HOW_DOCS.keys()) + list(_CODE_COMMAND_INDEX)
+                              if is_owner or c not in _OWNER_ONLY_DOCS]
                 _suggestions = difflib.get_close_matches(cmd_q, _all_known, n=3, cutoff=0.45)
                 if _suggestions:
                     _sug_text = ", ".join(f"<code>.{name}</code>" for name in _suggestions)
