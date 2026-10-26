@@ -2270,22 +2270,31 @@ async def verify_privileges(event, client, strict_owner_only=False, core_id=None
         sender = event.sender_id
         if sender is None:
             sender = getattr(getattr(event, "message", None), "sender_id", None)
+        try:
+            sender = int(sender) if sender is not None else None
+        except (TypeError, ValueError):
+            return False
+        if sender is None:
+            return False
         if sender == my_id:
             return True
         # Global owner controls every core only after explicitly enabling
         # `.mastersync on`. With it OFF, the owner can command only the core
         # whose own Telegram account is the owner account.
-        if sender == cfg.get("OWNER_ID", 0):
-            if my_id == cfg.get("OWNER_ID", 0):
+        _owner = int(cfg.get("OWNER_ID", 0) or 0)
+        if _owner and sender == _owner:
+            if my_id == _owner:
                 return True
             if cfg.get("MASTER_SYNC", False) and not strict_owner_only:
                 return True
         if strict_owner_only:
             return False
         bucket = session_sudo_bucket(cfg, my_id)
-        if sender in (bucket.get("2") or []) or sender in (bucket.get("1") or []):
-            return True
-        return False
+        _allowed = set()
+        for _x in (bucket.get("2") or []) + (bucket.get("1") or []):
+            try: _allowed.add(int(_x))
+            except (TypeError, ValueError): pass
+        return sender in _allowed
     except Exception:
         return False
 
@@ -2304,7 +2313,10 @@ def is_sender_owner(event, my_id=None, cfg_obj=None) -> bool:
             if my_id is not None and int(sender) == int(my_id):
                 return True
             owner_id = _cfg.get("OWNER_ID", 0)
-            if owner_id and int(sender) == int(owner_id):
+            # Global owner is "owner" on another core only with MASTER_SYNC ON.
+            if owner_id and int(sender) == int(owner_id) and (
+                    my_id is None or int(my_id) == int(owner_id)
+                    or _cfg.get("MASTER_SYNC", False)):
                 return True
         return False
     except Exception:
@@ -6383,8 +6395,10 @@ def create_event_handler(client, core_id=None):
         # Userbot commands are strict owner/sudo-only by default. The sole
         # exception is a music command in a chat explicitly opened with
         # `.forall`; its ownership guard below allows only the opener core.
-        _is_ping_help = bool(re.match(r"(?i)^\.(ping|alive|help|h|how)(?:\s+.*)?$", text_probe))
-        if not music_bypass and not _is_ping_help and not await verify_privileges(
+        # BUG FIX: .ping/.alive/.help/.how used to bypass this gate, so every
+        # connected core replied to ANY user's ping (even with MASTER_SYNC off
+        # and without sudo). They are now owner/sudo-only like every command.
+        if not music_bypass and not await verify_privileges(
                 event, client=client, core_id=my_id):
             if text_probe.startswith((".", "/")):
                 bot_logger("CMD_AUTH_DROP",
