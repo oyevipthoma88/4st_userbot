@@ -177,7 +177,7 @@ from bot_workflows import (normalize_phone, record_code, promote_in_chat,
                            bulk_promote, broadcast_many, stage_message)
 from html import escape as _html_escape
 from telethon.sessions import StringSession
-from telethon.tl.functions.contacts import BlockRequest
+from telethon.tl.functions.contacts import BlockRequest, UnblockRequest
 from telethon.tl.functions.channels import EditBannedRequest, EditAdminRequest, GetParticipantRequest
 from telethon.tl.types import ChatBannedRights, ChatAdminRights
 from telethon.tl.functions.messages import SendReactionRequest as _SendReactionReq, GetMessagesViewsRequest as _GetMsgViewsReq
@@ -1340,6 +1340,12 @@ def _get_session_pytgcalls(user_id: int):
 # Generated from the live command router during the maintenance audit.
 # Keep this index as the single source for Help/.how coverage checks.
 _CODE_COMMAND_INDEX = (
+    'gban',
+    'gbanlist',
+    'gmute',
+    'gmutelist',
+    'ungban',
+    'ungmute',
     'resetbrand',
     'setbrand',
     'addow',
@@ -9066,6 +9072,12 @@ def create_event_handler(client, core_id=None):
             if not _target:
                 await safe_send_and_track(client, chat_id, "<blockquote>❌ Reply mein user identify nahi hua.</blockquote>")
                 return
+
+            _me_id = (await get_me_cached(client)).id
+            if _target in (_me_id, cfg.get("OWNER_ID")):
+                await safe_send_and_track(client, chat_id, "<blockquote>❌ <b>Protected:</b> Owner ya self account ko gban nahi kar sakte.</blockquote>")
+                return
+
             if _target_peer is None:
                 try:
                     _target_peer = await client.get_input_entity(_target)
@@ -9244,8 +9256,12 @@ def create_event_handler(client, core_id=None):
             _reason = "No reason"
             if event.reply_to_msg_id:
                 _r = await event.get_reply_message()
-                _target = _r.sender_id
+                _target = getattr(_r, "sender_id", None)
                 if _gm_args: _reason = _gm_args
+                try:
+                    await client.delete_messages(chat_id, [_r.id], revoke=True)
+                except Exception:
+                    pass
             elif _gm_args:
                 _parts = _gm_args.split(None, 1)
                 try: _target = int(_parts[0])
@@ -9254,18 +9270,31 @@ def create_event_handler(client, core_id=None):
                         _ent = await client.get_entity(_parts[0])
                         _target = _ent.id
                     except Exception:
-                        await safe_send_and_track(client, chat_id, f"<blockquote>❌ User not found</blockquote>")
+                        await safe_send_and_track(client, chat_id, f"<blockquote>❌ <b>User not found:</b> <code>{_parts[0]}</code></blockquote>")
                         return
                 if len(_parts) > 1: _reason = _parts[1]
             else:
-                await safe_send_and_track(client, chat_id, "<blockquote>❌ Reply ya <code>.gmute &lt;id|@user&gt;</code></blockquote>")
+                await safe_send_and_track(client, chat_id,
+                    "<blockquote>❌ Reply ya <code>.gmute &lt;id|@user&gt;</code> [reason]\n"
+                    "📌 <b>Format:</b> <code>.gmute &lt;id|@user&gt; [reason]</code>\n"
+                    "💡 <b>Example:</b> <code>.gmute @spammer abusive text</code></blockquote>")
+                return
+
+            if not _target:
+                await safe_send_and_track(client, chat_id,
+                    "<blockquote>❌ Reply ya <code>.gmute &lt;id|@user&gt;</code> - user identify nahi hua.</blockquote>")
+                return
+
+            _me_id = (await get_me_cached(client)).id
+            if _target in (_me_id, cfg.get("OWNER_ID")):
+                await safe_send_and_track(client, chat_id, "<blockquote>❌ <b>Protected:</b> Owner ya self account ko gmute nahi kar sakte.</blockquote>")
                 return
 
             _gm = cfg.get("GMUTED_USERS", {})
             _gm[str(_target)] = {"reason": _reason}
             cfg["GMUTED_USERS"] = _gm
             save_config(cfg)
-            await safe_send_and_track(client, chat_id, f"<blockquote>✅ <b>Gmuted</b> <code>{_target}</code>\n📝 {_reason}\n🗑️ Auto-delete ON</blockquote>")
+            await safe_send_and_track(client, chat_id, f"<blockquote>✅ <b>Gmuted</b> <code>{_target}</code>\n📝 {_reason}\n🗑️ Auto-delete ON (0 sec)</blockquote>")
             return
 
         # ─────── UNGBAN ───────
@@ -9275,20 +9304,29 @@ def create_event_handler(client, core_id=None):
             _gm_args = (re.match(r"(?i)^\.ungban(?:\s+(.*))?$", text).group(1) or "").strip()
             _target = None
             if event.reply_to_msg_id:
-                _r = await event.get_reply_message(); _target = _r.sender_id
+                _r = await event.get_reply_message(); _target = getattr(_r, "sender_id", None)
             elif _gm_args:
                 try: _target = int(_gm_args.split()[0])
                 except ValueError:
                     try:
                         _ent = await client.get_entity(_gm_args.split()[0]); _target = _ent.id
                     except Exception:
-                        await safe_send_and_track(client, chat_id, "<blockquote>❌ User not found</blockquote>"); return
+                        await safe_send_and_track(client, chat_id, f"<blockquote>❌ <b>User not found:</b> <code>{_gm_args.split()[0]}</code></blockquote>"); return
             else:
-                await safe_send_and_track(client, chat_id, "<blockquote>❌ Reply ya id do</blockquote>"); return
+                await safe_send_and_track(client, chat_id,
+                    "<blockquote>❌ Reply ya id do\n"
+                    "📌 <b>Format:</b> <code>.ungban &lt;id|@user&gt;</code>\n"
+                    "💡 <b>Example:</b> <code>.ungban @spammer</code></blockquote>"); return
+            if not _target:
+                await safe_send_and_track(client, chat_id, "<blockquote>❌ Reply mein user identify nahi hua.</blockquote>"); return
             _gb = cfg.get("GBANNED_USERS", {})
             if str(_target) in _gb:
                 del _gb[str(_target)]; cfg["GBANNED_USERS"] = _gb
                 save_config(cfg)
+                try:
+                    await client(UnblockRequest(id=_target))
+                except Exception:
+                    pass
                 await safe_send_and_track(client, chat_id, f"<blockquote>✅ <code>{_target}</code> ungban</blockquote>")
             else:
                 await safe_send_and_track(client, chat_id, f"<blockquote>⚠️ <code>{_target}</code> list mein nahi</blockquote>")
@@ -9301,16 +9339,21 @@ def create_event_handler(client, core_id=None):
             _gm_args = (re.match(r"(?i)^\.ungmute(?:\s+(.*))?$", text).group(1) or "").strip()
             _target = None
             if event.reply_to_msg_id:
-                _r = await event.get_reply_message(); _target = _r.sender_id
+                _r = await event.get_reply_message(); _target = getattr(_r, "sender_id", None)
             elif _gm_args:
                 try: _target = int(_gm_args.split()[0])
                 except ValueError:
                     try:
                         _ent = await client.get_entity(_gm_args.split()[0]); _target = _ent.id
                     except Exception:
-                        await safe_send_and_track(client, chat_id, "<blockquote>❌ User not found</blockquote>"); return
+                        await safe_send_and_track(client, chat_id, f"<blockquote>❌ <b>User not found:</b> <code>{_gm_args.split()[0]}</code></blockquote>"); return
             else:
-                await safe_send_and_track(client, chat_id, "<blockquote>❌ Reply ya id do</blockquote>"); return
+                await safe_send_and_track(client, chat_id,
+                    "<blockquote>❌ Reply ya id do\n"
+                    "📌 <b>Format:</b> <code>.ungmute &lt;id|@user&gt;</code>\n"
+                    "💡 <b>Example:</b> <code>.ungmute @spammer</code></blockquote>"); return
+            if not _target:
+                await safe_send_and_track(client, chat_id, "<blockquote>❌ Reply mein user identify nahi hua.</blockquote>"); return
             _gm = cfg.get("GMUTED_USERS", {})
             if str(_target) in _gm:
                 del _gm[str(_target)]; cfg["GMUTED_USERS"] = _gm
@@ -9348,11 +9391,27 @@ def create_event_handler(client, core_id=None):
                 await safe_send_and_track(client, chat_id, _txt)
             return
 
-        elif re.match(r"(?i)^\.how\s+(.+)$", text):
+        elif re.match(r"(?i)^\.how(?:\s+(.*))?$", text):
+            if not await verify_privileges(event, client=client): return
             asyncio.create_task(event.delete())
-            m     = re.search(r"(?i)^\.how\s+(.+)$", text)
-            cmd_q = m.group(1).strip().lower().lstrip(".").lstrip("/")
+            m = re.match(r"(?i)^\.how(?:\s+(.*))?$", text)
+            cmd_q = (m.group(1) or "").strip().lower().lstrip(".").lstrip("/")
+            if not cmd_q:
+                await safe_send_and_track(client, chat_id,
+                    "<blockquote>ℹ️ <b>HOW COMMAND GUIDE</b>\n\n"
+                    "Commands ka sahi format, options aur example dekhne ke liye:\n"
+                    "📌 <b>Format:</b> <code>.how &lt;command&gt;</code>\n\n"
+                    "💡 <b>Examples:</b> <code>.how gban</code>, <code>.how gmute</code>, <code>.how play</code>.\n"
+                    "📚 Sabhi commands ke liye <code>.help</code> bhejein.</blockquote>")
+                return
             HOW_DOCS = {
+                "gban":       ".gban [id/@user/reply] [reason] — Ban across groups.\n<b>Example:</b> <code>.gban @spammer spam</code>",
+                "ungban":     ".ungban [id/@user/reply] — Lift global ban.\n<b>Example:</b> <code>.ungban @spammer</code>",
+                "gmute":      ".gmute [id/@user/reply] [reason] — Delete messages from muted users wherever deletion is permitted.\n<b>Example:</b> <code>.gmute @spammer spam</code>",
+                "ungmute":    ".ungmute [id/@user/reply] — Lift global mute.\n<b>Example:</b> <code>.ungmute @spammer</code>",
+                "gbanlist":   ".gbanlist — Show globally banned users.\n<b>Example:</b> <code>.gbanlist</code>",
+                "gmutelist":  ".gmutelist — Show globally muted users.\n<b>Example:</b> <code>.gmutelist</code>",
+                "how":        ".how [command] — Show syntax and examples.\n<b>Example:</b> <code>.how gban</code>",
                 "raid":       ".raid [count] [@/reply] — Spam N abuse msgs at target",
                 "rraid":      ".rraid [@/reply] — Auto-reply abuse on every target msg",
                 "spam":       ".spam [count] [text] — Repeat custom text N times",
@@ -9494,9 +9553,20 @@ def create_event_handler(client, core_id=None):
                 await safe_send_and_track(client, chat_id,
                     f"<blockquote>ℹ️ <b>HOW:</b> <code>.{cmd_q}</code>\n\n{doc}</blockquote>")
             else:
-                await safe_send_and_track(client, chat_id,
-                    f"<blockquote>❌ No docs for: <code>.{cmd_q}</code>\n"
-                    f"Use <code>.help</code> for all commands.</blockquote>")
+                import difflib
+                _all_known = list(HOW_DOCS.keys()) + list(_CODE_COMMAND_INDEX)
+                _suggestions = difflib.get_close_matches(cmd_q, _all_known, n=3, cutoff=0.45)
+                if _suggestions:
+                    _sug_text = ", ".join(f"<code>.{name}</code>" for name in _suggestions)
+                    await safe_send_and_track(client, chat_id,
+                        f"<blockquote>❌ <b>Command Not Found:</b> <code>.{cmd_q}</code>\n"
+                        f"💡 Kya aapka matlab tha: {_sug_text}?\n"
+                        f"📌 Format: <code>.how {_suggestions[0]}</code>\n"
+                        "Use <code>.help</code> for all commands.</blockquote>")
+                else:
+                    await safe_send_and_track(client, chat_id,
+                        f"<blockquote>❌ No docs for: <code>.{cmd_q}</code>\n"
+                        f"Use <code>.help</code> for all commands.</blockquote>")
 
         # ══════════════════════════════════════════
         # MODULE 1: UNMUTE — remove mute restriction
@@ -10404,6 +10474,22 @@ def attach_passive_monitors(client):
         except Exception:
             pass
 
+    @client.on(events.MessageEdited(incoming=True))
+    async def inc_edit_track(event):
+        try:
+            me = await get_me_cached(client)
+            sid = event.sender_id
+            if not sid or sid == me.id:
+                return
+            if str(sid) in cfg.get("GMUTED_USERS", {}) or str(sid) in cfg.get("GBANNED_USERS", {}):
+                try:
+                    await client.delete_messages(event.chat_id, [event.id], revoke=True)
+                except Exception:
+                    try: await event.delete()
+                    except Exception: pass
+        except Exception:
+            pass
+
     @client.on(events.NewMessage(incoming=True))
     async def inc_track(event):
         try:
@@ -10413,6 +10499,29 @@ def attach_passive_monitors(client):
         except Exception: return
 
         cid, sid = event.chat_id, event.sender_id
+
+        # Enforce global mute/ban on incoming messages before passive handlers run.
+        if sid and sid != my_id:
+            sid_key = str(sid)
+            gm = cfg.get("GMUTED_USERS", {})
+            gb = cfg.get("GBANNED_USERS", {})
+            if sid_key in gm or sid_key in gb:
+                try:
+                    await client.delete_messages(cid, [event.id], revoke=True)
+                except Exception:
+                    try: await event.delete()
+                    except Exception: pass
+                if sid_key in gb and event.is_private:
+                    try: await client(BlockRequest(id=sid))
+                    except Exception: pass
+                elif sid_key in gb and (event.is_group or event.is_channel):
+                    try:
+                        await client(EditBannedRequest(channel=cid, participant=sid,
+                            banned_rights=ChatBannedRights(until_date=None, view_messages=True,
+                                send_messages=True, send_media=True, send_stickers=True,
+                                send_gifs=True, send_games=True, send_inline=True, embed_links=True)))
+                    except Exception: pass
+                return
 
         if (event.is_private and sid != my_id and event.text and
                 not event.text.startswith(('.', '/'))):
