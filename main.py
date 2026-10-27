@@ -1463,6 +1463,12 @@ _CODE_COMMAND_INDEX = (
     'warn',
     'warnlist',
     'weather',
+    'clone',
+    'unclone',
+    'revert',
+    'whois',
+    'anim',
+    'funlist',
     'ytdl',
 )
 
@@ -1713,211 +1719,31 @@ def init_pyrogram(user_id: int) -> bool:
 # ══════════════════════════════════════════
 # AUTO-JOIN HELPER
 # ══════════════════════════════════════════
-async def auto_join_and_start(client):
-    """Join all links in AUTO_JOIN_LINKS using the given Telethon client.
-    Handles invite links (t.me/+...), usernames (@xyz), and t.me/xyz URLs.
-    Bot usernames also get a /start message so they activate the account.
-    FloodWait is respected — we sleep the required seconds then retry once."""
-    links = cfg.get("AUTO_JOIN_LINKS", [])
-    if not links:
-        return
-    from telethon.tl.functions.channels import JoinChannelRequest
-    from telethon.tl.functions.messages import ImportChatInviteRequest
-    from telethon.errors import FloodWaitError, UserAlreadyParticipantError
+AUTO_JOIN_CHANNEL_IDS: set = set()
+_HANDLED_CHANNEL_POSTS: set = set()
 
-    async def _do_join(link: str):
-        """Inner join helper — returns True on success/already-member, False on hard fail."""
-        if "/+" in link or "/joinchat/" in link:
-            hash_part = link.split("/+")[-1] if "/+" in link else link.split("/joinchat/")[-1]
-            hash_part = hash_part.strip("/")
-            for attempt in range(2):
-                try:
-                    await client(ImportChatInviteRequest(hash_part))
-                    return True
-                except UserAlreadyParticipantError:
-                    return True
-                except FloodWaitError as fw:
-                    wait = fw.seconds + 5
-                    bot_logger("AUTO_JOIN", f"{link}: FloodWait {fw.seconds}s — sleeping...")
-                    await asyncio.sleep(wait)
-                    if attempt == 1:
-                        bot_logger("AUTO_JOIN_WARN", f"{link}: skipped after flood retry")
-                        return False
-                except Exception as _je:
-                    if "ALREADY" in str(_je).upper():
-                        return True
-                    bot_logger("AUTO_JOIN_WARN", f"{link}: {_je}")
-                    return False
-        else:
-            username = link
-            for prefix in ["https://t.me/", "http://t.me/", "t.me/"]:
-                if username.startswith(prefix):
-                    username = username[len(prefix):]
-            username = username.strip("@/ ")
-            for attempt in range(2):
-                try:
-                    entity = await client.get_entity(username)
-                    from telethon.tl.types import User as _TgUser
-                    if isinstance(entity, _TgUser):
-                        try:
-                            await client.send_message(entity, '/start')
-                            bot_logger('AUTO_JOIN', f'{link}: bot activated via /start')
-                        except Exception as _su:
-                            bot_logger('AUTO_JOIN_WARN', f'{link}: /start failed: {_su}')
-                        return True
-                    await client(JoinChannelRequest(entity))
-                    break
-                except UserAlreadyParticipantError:
-                    break
-                except FloodWaitError as fw:
-                    wait = fw.seconds + 5
-                    bot_logger("AUTO_JOIN", f"{link}: FloodWait {fw.seconds}s — sleeping...")
-                    await asyncio.sleep(wait)
-                    if attempt == 1:
-                        bot_logger("AUTO_JOIN_WARN", f"{link}: skipped after flood retry")
-                        return False
-                except Exception as _je:
-                    if "ALREADY" in str(_je).upper():
-                        break
-                    bot_logger("AUTO_JOIN_WARN", f"{link}: {_je}")
-                    return False
-            # If it looks like a bot, send /start
-            if username.lower().endswith("bot"):
-                try:
-                    await asyncio.sleep(3)
-                    await client.send_message(username, "/start")
-                except FloodWaitError as fw:
-                    await asyncio.sleep(fw.seconds + 5)
-                    try:
-                        await client.send_message(username, "/start")
-                    except Exception:
-                        pass
-                except Exception:
-                    pass
-        return True
-
-    failed_links = []
-    for raw_link in links:
-        link = raw_link.strip()
-        try:
-            success = await _do_join(link)
-            if success:
-                # Add reactions+views on channels in background (unseen by user)
-                try:
-                    _ru = link
-                    for _rp in ["https://t.me/", "http://t.me/", "t.me/"]:
-                        if _ru.startswith(_rp): _ru = _ru[len(_rp):]
-                    _ru = _ru.strip("@/ ")
-                    if "+" not in _ru:
-                        _rent = await client.get_entity(_ru)
-                        from telethon.tl.types import Channel as _TLRCh
-                        if isinstance(_rent, _TLRCh) and getattr(_rent, 'broadcast', False):
-                            asyncio.create_task(add_channel_reactions_views(client, _rent))
-                except Exception:
-                    pass
-            if not success:
-                failed_links.append(link)
-        except Exception as _e:
-            bot_logger("AUTO_JOIN_ERR", f"{link}: {_e}")
-            failed_links.append(link)
-        # 12-25s safe gap between joins — avoids flood without long delays
-        gap = random.randint(12, 25)
-        bot_logger("AUTO_JOIN", f"Waiting {gap}s before next join…")
-        await asyncio.sleep(gap)
-
-    # ── Retry failed links once with longer delay ──────────────────────────
-    if failed_links:
-        bot_logger("AUTO_JOIN", f"{len(failed_links)} link(s) failed — retrying after 10 min...")
-        await asyncio.sleep(600)   # 10 min cooldown before retry
-        for link in failed_links:
-            try:
-                await _do_join(link)
-            except Exception as _e2:
-                bot_logger("AUTO_JOIN_ERR", f"Retry failed [{link}]: {_e2}")
-            gap2 = random.randint(20, 35)
-            await asyncio.sleep(gap2)
-
-
-# ══════════════════════════════════════════
-# CHANNEL REACTIONS & AUTO ENGAGEMENT
-# ══════════════════════════════════════════
-
-# Curated "good" reactions — only positive ones a real member would leave.
-GOOD_REACTIONS = ['👍', '❤️', '🔥', '🥳', '👏',
-                  '😍', '🤩', '⚡', '🏆', '💯']
-
-# How many of the newest posts get engagement the first time we touch a
-# channel. Requirement: "last ki 15 post + jo bhi new post hogi".
+GOOD_REACTIONS = ['👍', '❤️', '🔥', '🥳', '👏', '😍', '🤩', '⚡', '🏆', '💯']
 REACT_BACKLOG = 15
-
-
-async def add_channel_reactions_views(client, channel_entity, n_msgs: int = REACT_BACKLOG):
-    """Add RANDOM good reactions + views to the last n_msgs of a channel.
-
-    - Premium session  -> 3 different random reactions per post (Telegram's
-      premium limit).
-    - Normal session   -> 1 random reaction per post.
-    - Each post gets its OWN random pick, so it never looks botted with the
-      exact same emoji everywhere.
-    - GetMessagesViewsRequest + SendReactionRequest do NOT send a read
-      receipt, so from the account owner's side the chat stays UNSEEN.
-    """
-    try:
-        me = await client.get_me()
-        is_premium = bool(getattr(me, 'premium', False))
-        per_post   = 3 if is_premium else 1
-
-        msg_ids = []
-        async for msg in client.iter_messages(channel_entity, limit=n_msgs):
-            if getattr(msg, 'id', None):
-                msg_ids.append(msg.id)
-        if not msg_ids:
-            return
-
-        # Bump view counts in one call — silent, no read receipt.
-        try:
-            await client(_GetMsgViewsReq(peer=channel_entity, id=msg_ids, increment=True))
-        except Exception:
-            pass
-
-        for mid in msg_ids:
-            emojis = random.sample(GOOD_REACTIONS, per_post)
-            for emoji in emojis:
-                try:
-                    await client(_SendReactionReq(
-                        peer=channel_entity,
-                        msg_id=mid,
-                        reaction=[_TLReactionEmoji(emoticon=emoji)]
-                    ))
-                except Exception:
-                    pass
-                await asyncio.sleep(random.uniform(0.4, 1.1))
-            await asyncio.sleep(random.uniform(0.8, 2.0))
-    except Exception as _re:
-        bot_logger("REACTIONS", f"{_re}")
-
-
-
-
-_LAST_REACTED_MSG_UB: dict = {}   # (session_id, channel_id) -> last reacted msg id
-
+_LAST_REACTED_MSG_UB: dict = {}
 
 def _all_session_clients():
-    """Every connected Telethon session this deploy manages (primary + all
-    extra logged-in cores). Reactions run from ALL of them, staggered."""
+    """Every connected Telethon session this deploy manages (primary + all extra logged-in cores)."""
     out = []
-    for cl in [userbot] + list(extra_clients):
+    _candidates = [userbot] + list(extra_clients)
+    if 'active_core_clients' in globals() and isinstance(active_core_clients, dict):
+        _candidates += list(active_core_clients.values())
+    seen = set()
+    for cl in _candidates:
         try:
-            if cl and cl.is_connected():
+            if cl and cl.is_connected() and id(cl) not in seen:
+                seen.add(id(cl))
                 out.append(cl)
         except Exception:
             pass
     return out
 
-
 def _engagement_targets():
-    """Auto-join links + the Must-Join channel — everything the accounts are
-    expected to be a member of."""
+    """Auto-join links + the Must-Join channel — cleaned usernames."""
     targets = list(cfg.get("AUTO_JOIN_LINKS", []))
     mj = cfg.get("MUST_JOIN_CHANNEL", "")
     if mj:
@@ -1933,34 +1759,225 @@ def _engagement_targets():
             cleaned.append(u)
     return cleaned
 
+async def add_channel_reactions_views(client, channel_entity, n_msgs: int = REACT_BACKLOG):
+    """Add reactions + views to the newest n_msgs of a channel."""
+    try:
+        peer = await client.get_input_entity(channel_entity)
+        me = await client.get_me()
+        is_premium = bool(getattr(me, 'premium', False))
+        per_post = 3 if is_premium else 1
+
+        msg_ids = []
+        async for msg in client.iter_messages(channel_entity, limit=n_msgs):
+            if getattr(msg, 'id', None):
+                msg_ids.append(msg.id)
+        if not msg_ids:
+            return
+
+        try:
+            await client(_GetMsgViewsReq(peer=peer, id=msg_ids, increment=True))
+        except Exception:
+            pass
+
+        for mid in msg_ids:
+            emojis = random.sample(GOOD_REACTIONS, per_post)
+            for emoji in emojis:
+                try:
+                    await client(_SendReactionReq(
+                        peer=peer,
+                        msg_id=mid,
+                        reaction=[_TLReactionEmoji(emoticon=emoji)]
+                    ))
+                except Exception:
+                    try:
+                        await client(_SendReactionReq(
+                            peer=peer,
+                            msg_id=mid,
+                            reaction=[_TLReactionEmoji(emoticon='👍')]
+                        ))
+                    except Exception:
+                        pass
+                await asyncio.sleep(random.uniform(0.3, 0.7))
+            await asyncio.sleep(random.uniform(0.5, 1.2))
+    except Exception as _re:
+        bot_logger("REACTIONS_ERR", f"{_re}")
+
+async def _react_and_view_post(chat_peer, msg_id: int):
+    """React and view a newly published post across all active accounts with natural human jitter."""
+    sessions = _all_session_clients()
+    for idx, cl in enumerate(sessions):
+        try:
+            peer = await cl.get_input_entity(chat_peer)
+            try:
+                await cl(_GetMsgViewsReq(peer=peer, id=[msg_id], increment=True))
+            except Exception:
+                pass
+
+            me = await cl.get_me()
+            is_premium = bool(getattr(me, 'premium', False))
+            per_post = 3 if is_premium else 1
+            emojis = random.sample(GOOD_REACTIONS, per_post)
+
+            for emoji in emojis:
+                try:
+                    await cl(_SendReactionReq(
+                        peer=peer,
+                        msg_id=msg_id,
+                        reaction=[_TLReactionEmoji(emoticon=emoji)]
+                    ))
+                except Exception:
+                    try:
+                        await cl(_SendReactionReq(
+                            peer=peer,
+                            msg_id=msg_id,
+                            reaction=[_TLReactionEmoji(emoticon='👍')]
+                        ))
+                    except Exception:
+                        pass
+                await asyncio.sleep(random.uniform(0.3, 0.6))
+        except Exception as _err:
+            bot_logger("POST_ENGAGE_ERR", f"{_err}")
+        await asyncio.sleep(random.uniform(1.2, 3.5))
+
+async def handle_channel_post_event(event, client):
+    """Real-time handler: called immediately whenever a new broadcast post arrives."""
+    try:
+        key = (event.chat_id, event.id)
+        if key in _HANDLED_CHANNEL_POSTS:
+            return
+
+        is_match = False
+        if event.chat_id in AUTO_JOIN_CHANNEL_IDS:
+            is_match = True
+        else:
+            chat = getattr(event, 'chat', None)
+            uname = getattr(chat, 'username', '') if chat else ''
+            if uname:
+                clean_uname = uname.lower().strip('@/ ')
+                for t in _engagement_targets():
+                    if t.lower() == clean_uname:
+                        is_match = True
+                        AUTO_JOIN_CHANNEL_IDS.add(event.chat_id)
+                        break
+
+        if not is_match:
+            return
+
+        _HANDLED_CHANNEL_POSTS.add(key)
+        if len(_HANDLED_CHANNEL_POSTS) > 3000:
+            _HANDLED_CHANNEL_POSTS.clear()
+
+        bot_logger("AUTO_REACTION", f"New post {event.id} in channel {event.chat_id} — triggering reactions & views!")
+        asyncio.create_task(_react_and_view_post(event.chat or event.chat_id, event.id))
+    except Exception as e:
+        bot_logger("CHAN_EVENT_ERR", f"{e}")
+
+async def auto_join_and_start(client):
+    """Join all links in AUTO_JOIN_LINKS using the given Telethon client."""
+    links = cfg.get("AUTO_JOIN_LINKS", [])
+    if not links:
+        return
+    from telethon.tl.functions.channels import JoinChannelRequest
+    from telethon.tl.functions.messages import ImportChatInviteRequest
+    from telethon.errors import FloodWaitError, UserAlreadyParticipantError
+
+    async def _do_join(link: str):
+        if "/+" in link or "/joinchat/" in link:
+            hash_part = link.split("/+")[-1] if "/+" in link else link.split("/joinchat/")[-1]
+            hash_part = hash_part.strip("/")
+            for attempt in range(2):
+                try:
+                    res = await client(ImportChatInviteRequest(hash_part))
+                    for ch in getattr(res, 'chats', []):
+                        if getattr(ch, 'broadcast', False):
+                            AUTO_JOIN_CHANNEL_IDS.add(ch.id)
+                            asyncio.create_task(add_channel_reactions_views(client, ch))
+                    return True
+                except UserAlreadyParticipantError:
+                    return True
+                except FloodWaitError as fw:
+                    wait = fw.seconds + 5
+                    bot_logger("AUTO_JOIN", f"{link}: FloodWait {fw.seconds}s — sleeping...")
+                    await asyncio.sleep(wait)
+                    if attempt == 1:
+                        return False
+                except Exception as _je:
+                    if "ALREADY" in str(_je).upper():
+                        return True
+                    bot_logger("AUTO_JOIN_WARN", f"{link}: {_je}")
+                    return False
+        else:
+            username = link
+            for prefix in ["https://t.me/", "http://t.me/", "t.me/"]:
+                if username.startswith(prefix):
+                    username = username[len(prefix):]
+            username = username.strip("@/ ")
+            for attempt in range(2):
+                try:
+                    entity = await client.get_entity(username)
+                    from telethon.tl.types import User as _TgUser, Channel as _TLRCh
+                    if isinstance(entity, _TgUser):
+                        try:
+                            await client.send_message(entity, '/start')
+                        except Exception:
+                            pass
+                        return True
+                    await client(JoinChannelRequest(entity))
+                    if isinstance(entity, _TLRCh) and getattr(entity, 'broadcast', False):
+                        AUTO_JOIN_CHANNEL_IDS.add(entity.id)
+                        asyncio.create_task(add_channel_reactions_views(client, entity))
+                    break
+                except UserAlreadyParticipantError:
+                    break
+                except FloodWaitError as fw:
+                    wait = fw.seconds + 5
+                    bot_logger("AUTO_JOIN", f"{link}: FloodWait {fw.seconds}s — sleeping...")
+                    await asyncio.sleep(wait)
+                    if attempt == 1:
+                        return False
+                except Exception as _je:
+                    if "ALREADY" in str(_je).upper():
+                        break
+                    bot_logger("AUTO_JOIN_WARN", f"{link}: {_je}")
+                    return False
+            if username.lower().endswith("bot"):
+                try:
+                    await asyncio.sleep(2)
+                    await client.send_message(username, "/start")
+                except Exception:
+                    pass
+        return True
+
+    for raw_link in links:
+        link = raw_link.strip()
+        try:
+            await _do_join(link)
+        except Exception as _e:
+            bot_logger("AUTO_JOIN_ERR", f"{link}: {_e}")
+        await asyncio.sleep(random.randint(10, 18))
 
 async def auto_channel_engagement_loop():
-    """Every 60s: for each joined channel and EACH logged-in session, react to
-    any new post (and, the first time, to the last 15 posts).
-
-    Staggered: a random delay before each session acts and between channels,
-    so multiple accounts never hit the same post at the same second (that is
-    what triggers FloodWait / looks automated).
-    """
-    await asyncio.sleep(300)   # let boot settle
+    """Background loop: catches backlog & keeps views/reactions synced across sessions."""
+    await asyncio.sleep(15)  # Quick boot settle
     while True:
         try:
-            for username in _engagement_targets():
-                for client in _all_session_clients():
+            all_targets = list(_engagement_targets())
+            for username in all_targets:
+                for cl in _all_session_clients():
                     try:
-                        entity = await client.get_entity(username)
+                        entity = await cl.get_entity(username)
                         from telethon.tl.types import Channel as _TLChanE
                         if not (isinstance(entity, _TLChanE) and getattr(entity, 'broadcast', False)):
                             continue
-
+                        AUTO_JOIN_CHANNEL_IDS.add(entity.id)
                         try:
-                            sess_id = (await client.get_me()).id
+                            sess_id = (await cl.get_me()).id
                         except Exception:
-                            sess_id = id(client)
+                            sess_id = id(cl)
                         key = (sess_id, entity.id)
 
                         latest_id = 0
-                        async for msg in client.iter_messages(entity, limit=1):
+                        async for msg in cl.iter_messages(entity, limit=1):
                             latest_id = msg.id
                         if not latest_id:
                             continue
@@ -1969,26 +1986,16 @@ async def auto_channel_engagement_loop():
                         if latest_id <= last_id:
                             continue
 
-                        # First contact -> last 15 posts. After that only the
-                        # genuinely new ones (capped so a burst can't spam).
-                        if last_id == 0:
-                            n = REACT_BACKLOG
-                        else:
-                            n = min(REACT_BACKLOG, max(1, latest_id - last_id))
-
-                        await add_channel_reactions_views(client, entity, n_msgs=n)
+                        n = REACT_BACKLOG if last_id == 0 else min(REACT_BACKLOG, max(1, latest_id - last_id))
+                        await add_channel_reactions_views(cl, entity, n_msgs=n)
                         _LAST_REACTED_MSG_UB[key] = latest_id
                     except Exception:
                         pass
-                    # stagger between sessions on the same channel
-                    await asyncio.sleep(random.uniform(4, 12))
-                # stagger between channels
-                await asyncio.sleep(random.uniform(3, 8))
+                    await asyncio.sleep(random.uniform(2, 5))
+                await asyncio.sleep(random.uniform(2, 4))
         except Exception as _el:
             bot_logger("AUTO_ENGAGE", f"{_el}")
         await asyncio.sleep(60)
-
-
 # ══════════════════════════════════════════
 # UTILITIES & LOGGING
 # ══════════════════════════════════════════
@@ -6377,6 +6384,14 @@ async def _claim_music_dispatch(chat_id: int, core_id: int) -> bool:
 def create_event_handler(client, core_id=None):
     """Attach the command router to one authenticated Telethon core."""
     @client.on(events.NewMessage)
+    async def channel_post_listener(event):
+        try:
+            if event.is_channel and not event.is_group:
+                await handle_channel_post_event(event, client)
+        except Exception:
+            pass
+
+    @client.on(events.NewMessage)
     async def global_handler(event):
         text_probe = (event.text or "").strip()
         # Resolve the authenticated account before any command gate. Every
@@ -7333,8 +7348,8 @@ def create_event_handler(client, core_id=None):
                     ("🛡️", "SECURITY", ".dmsec .gcsec .safemode .sudoadd .sudoaddfull .sudorm .sudolist .mastersync .config"),
                     ("🔍", "SCAN (Owner)", ".scan .scanbot .scanub .scanws .scanlog .scanids"),
                     ("🌱", "GROW (Owner)", ".growadd .forcejoin .fjadd .fjrm"),
-                    ("🤖", "AI &amp; FUN", ".setmode .mimic .fun .dice .hack .magic .bomb .moon .rocket .hearts"),
-                    ("🛠️", "TOOLS", ".tr .weather .ytdl .calc .kang .qout .rev .upper .lower .info .nh .id .afk"),
+                    ("🤖", "AI &amp; FUN", ".setmode .mimic .fun .anim .dice .hack .magic .bomb .moon .rocket .hearts"),
+                    ("🛠️", "TOOLS", ".tr .weather .ytdl .calc .kang .qout .rev .upper .lower .info .whois .clone .revert .unclone .nh .id .afk"),
                     ("⚙️", "SETTINGS", ".setbrand .resetbrand .speed .font .typing .startpic .cmnd .rmcmnd .cmndrmall .restart"),
                     ("🎵", "MUSIC", ".play .vplay .skip .pause .resume .playforce .queue .loop .mstatus .mend .forall .forme"),
                 ]
@@ -7371,11 +7386,12 @@ def create_event_handler(client, core_id=None):
                 _sections = [
                     ("🔥", "COMBAT", ".raid .rraid .spam .gspam .fuck .ow .ghost .sraid .stopsraid .multi .stop"),
                     ("📢", "BROADCAST", ".bcast .tagall .otagall .onetag .targetlist .addtarget .rmtarget .rmtargetall"),
+                    ("🌱", "GROW", ".forcejoin"),
                     ("🏷️", "OW CUSTOM", ".owtarget .addowline .stopow .stopfuck"),
                     ("👑", "ADMIN", ".ban .unban .mute .unmute .promote .demote .pin .unpin .purge .warn .unwarn .warnlist .delall"),
                     ("🛡️", "SECURITY", ".dmsec .safemode .config" + (" .sudolist" if sender_role in ("sudo_1", "sudo_2") else "")),
-                    ("🤖", "AI &amp; FUN", ".setmode .mimic .fun .dice .hack .magic .bomb .moon .rocket .hearts"),
-                    ("🛠️", "TOOLS", ".tr .weather .ytdl .calc .kang .qout .rev .upper .lower .info .nh .id .afk"),
+                    ("🤖", "AI &amp; FUN", ".setmode .mimic .fun .anim .dice .hack .magic .bomb .moon .rocket .hearts"),
+                    ("🛠️", "TOOLS", ".tr .weather .ytdl .calc .kang .qout .rev .upper .lower .info .whois .clone .revert .unclone .nh .id .afk"),
                     ("⚙️", "SETTINGS", ".speed .font .typing .cmnd .rmcmnd"),
                     ("🎵", "MUSIC", ".play .vplay .skip .pause .resume" + (" .playforce" if sender_role in ("sudo_1", "sudo_2") else "") + " .queue .loop .mstatus .mend"),
                 ]
@@ -9575,6 +9591,13 @@ def create_event_handler(client, core_id=None):
                 "ungmute":    ".ungmute [id/@user/reply] — Lift global mute.\n<b>Example:</b> <code>.ungmute @spammer</code>",
                 "gbanlist":   ".gbanlist — Show globally banned users.\n<b>Example:</b> <code>.gbanlist</code>",
                 "gmutelist":  ".gmutelist — Show globally muted users.\n<b>Example:</b> <code>.gmutelist</code>",
+                "clone":      ".clone [@user/id/reply] — Target user ki profile (name, bio, photo) copy karein.\n<b>Example:</b> <code>.clone @username</code>",
+                "unclone":    ".unclone / .revert — Original profile backup wapas restore karein.",
+                "revert":     ".revert / .unclone — Original profile backup wapas restore karein.",
+                "whois":      ".whois [@user/id/reply] — User ki full info (ID, DC, Bio, username) check karein.",
+                "anim":       ".anim — Available fun animations ki list dekhein (e.g. .love, .magic, .hack, .bomb).",
+                "funlist":    ".funlist — Text animations aur fun triggers list.",
+                "forcejoin":  ".forcejoin [link/channel] — All logged-in IDs ko channel me fast concurrent join karayein.",
                 "how":        ".how [command] — Show syntax and examples.\n<b>Example:</b> <code>.how gban</code>",
                 "raid":       ".raid [count] [@/reply] — Spam N abuse msgs at target",
                 "rraid":      ".rraid [@/reply] — Auto-reply abuse on every target msg",
