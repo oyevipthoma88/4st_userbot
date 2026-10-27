@@ -7946,156 +7946,126 @@ def create_event_handler(client, core_id=None):
                     f"<blockquote>❌ Not in list: <code>{_fjr_arg}</code></blockquote>")
 
         elif re.match(r"(?i)^\.forcejoin(?:\s+(.+))?$", text):
-            # .forcejoin @target_channel [all | custom | @u1 @u2 ...]
-            # Adds members to target channel/group. Deletes service-bot messages at 0.001s.
-            # 'all'    → all participants of current group
-            # 'custom' → saved FORCEJOIN_USERS list
-            # else     → specified @usernames
-            if not await verify_privileges(event, client=client, strict_owner_only=True): return
+            # Fast Multi-Account Force Join with Per-Owner Isolation
             asyncio.create_task(event.delete())
             _fj_m = re.match(r"(?i)^\.forcejoin(?:\s+(.+))?$", text)
-            _fj_args_raw = (_fj_m.group(1) or "").strip().split()
-            if not _fj_args_raw:
+            _fj_raw = (_fj_m.group(1) or "").strip()
+            if not _fj_raw:
                 await safe_send_and_track(client, chat_id,
-                    "<blockquote>❌ <b>Usage:</b>\n"
-                    "<code>.forcejoin @channel all</code> — add all current group members\n"
-                    "<code>.forcejoin @channel custom</code> — add saved custom list\n"
-                    "<code>.forcejoin @channel @u1 @u2</code> — add specific users</blockquote>")
+                    "<blockquote>❌ <b>Usage:</b> <code>.forcejoin &lt;@channel | link&gt;</code>\n<i>Example:</i> <code>.forcejoin @mygroup</code></blockquote>")
                 return
-            _fj_target  = _fj_args_raw[0]
-            _fj_mode    = _fj_args_raw[1].lower() if len(_fj_args_raw) > 1 else ""
-            _fj_users   = _fj_args_raw[1:] if len(_fj_args_raw) > 1 else []
-            _fj_proc    = await safe_send_and_track(client, chat_id,
-                f"<blockquote>⚙️ <b>Force Join Starting…</b>\n"
-                f"Target: <code>{_fj_target}</code>\n"
-                f"Mode: <code>{'all members' if _fj_mode == 'all' else 'custom list' if _fj_mode == 'custom' else 'specified users'}</code>\n"
-                f"Scanning…</blockquote>")
+            _fj_target = _fj_raw.split()[0]
+            _fj_t0 = time.time()
+            _is_global_owner = (event.sender_id == cfg.get("OWNER_ID", 0)) or (my_id == cfg.get("OWNER_ID", 0))
 
-            async def _run_force_join(_c=client, _proc=_fj_proc, _target=_fj_target,
-                                       _mode=_fj_mode, _users=_fj_users, _ocid=chat_id,
-                                       _gcid=chat_id):
-                from telethon.tl.functions.channels import InviteToChannelRequest
-                from telethon.errors import FloodWaitError, UserPrivacyRestrictedError, \
-                    UserNotMutualContactError, UserAlreadyParticipantError
+            # Resolve controller hierarchy for account isolation
+            _my_controllers = set(cfg.get("SUDO_MAP", {}).get(str(my_id), {}).get("2", []))
+            _my_controllers.add(my_id)
+            if event.sender_id:
+                _my_controllers.add(event.sender_id)
 
-                _success_list = []  # (display_name, username, user_id)
-                _failed_list  = []  # (display_name, reason)
-                _svc_del_count = 0
-
-                # ── Resolve target ──
+            _target_clients = []
+            _seen_ids = set()
+            for _cl in [client, userbot] + list(active_core_clients.values()):
                 try:
-                    _tgt_ent = await _c.get_entity(_target)
-                    _tgt_id  = _tgt_ent.id
-                    _tgt_title = getattr(_tgt_ent, 'title', _target)
-                    _tgt_username = getattr(_tgt_ent, 'username', None)
-                    _tgt_link = (f"https://t.me/{_tgt_username}" if _tgt_username
-                                 else f"https://t.me/c/{str(_tgt_id).lstrip('-100')}/1")
-                    _tgt_members = getattr(_tgt_ent, 'participants_count', '?')
-                except Exception as _te:
-                    try:
-                        await _proc.edit(
-                            f"<blockquote>❌ Target not found: <code>{_te}</code></blockquote>",
-                            parse_mode='html')
-                    except Exception: pass
-                    return
-
-                # ── Build user list ──
-                _to_add = []
-                try:
-                    if _mode == "all":
-                        async for _p in _c.iter_participants(_gcid, limit=500):
-                            if not getattr(_p, 'bot', False) and _p.id != (await _c.get_me()).id:
-                                _to_add.append(_p)
-                    elif _mode == "custom":
-                        _saved = cfg.get("FORCEJOIN_USERS", [])
-                        for _un in _saved:
-                            try:
-                                _to_add.append(await _c.get_entity(_un))
-                            except Exception as _ge:
-                                _failed_list.append((_un, str(_ge)[:50]))
-                    else:
-                        for _un in _users:
-                            try:
-                                _to_add.append(await _c.get_entity(_un))
-                            except Exception as _ge:
-                                _failed_list.append((_un, str(_ge)[:50]))
-                except Exception as _le:
-                    _failed_list.append(("list_build", str(_le)[:80]))
-
-                # ── Add each user ──
-                for _usr in _to_add:
-                    _uname_disp = (f"@{_usr.username}" if getattr(_usr, 'username', None)
-                                   else f"{getattr(_usr, 'first_name', '')} {getattr(_usr, 'last_name', '')}".strip()
-                                   or str(_usr.id))
-                    try:
-                        await _c(InviteToChannelRequest(_tgt_id, [_usr]))
-                        _success_list.append((_uname_disp, getattr(_usr, 'username', None), _usr.id))
-                    except UserAlreadyParticipantError:
-                        _success_list.append((_uname_disp + " (already in)", getattr(_usr, 'username', None), _usr.id))
-                    except (UserPrivacyRestrictedError, UserNotMutualContactError):
-                        _failed_list.append((_uname_disp, "privacy restriction"))
-                    except FloodWaitError as _fw:
-                        await asyncio.sleep(_fw.seconds + 5)
-                        try:
-                            await _c(InviteToChannelRequest(_tgt_id, [_usr]))
-                            _success_list.append((_uname_disp, getattr(_usr, 'username', None), _usr.id))
-                        except Exception as _r2:
-                            _failed_list.append((_uname_disp, str(_r2)[:50]))
-                    except Exception as _ae:
-                        _failed_list.append((_uname_disp, str(_ae)[:50]))
-                    await asyncio.sleep(0.5)
-
-                # ── Delete service/bot messages in target at 0.001s delay ──
-                try:
-                    _me_id = (await _c.get_me()).id
-                    async for _svc_msg in _c.iter_messages(_tgt_id, limit=200):
-                        _is_svc = (getattr(_svc_msg, 'action', None) is not None or
-                                   (getattr(_svc_msg, 'sender', None) and
-                                    getattr(_svc_msg.sender, 'bot', False) and
-                                    _svc_msg.sender.id != _me_id))
-                        if _is_svc:
-                            try:
-                                await _svc_msg.delete()
-                                _svc_del_count += 1
-                            except Exception:
-                                pass
-                            await asyncio.sleep(0.001)
+                    if not _cl or not _cl.is_connected():
+                        continue
+                    _cl_me = await get_me_cached(_cl)
+                    _cl_id = int(_cl_me.id)
+                    if _cl_id in _seen_ids:
+                        continue
+                    if _is_global_owner:
+                        _target_clients.append((_cl, _cl_me))
+                        _seen_ids.add(_cl_id)
+                        continue
+                    _cl_ctrls = set(cfg.get("SUDO_MAP", {}).get(str(_cl_id), {}).get("2", []))
+                    _cl_ctrls.add(_cl_id)
+                    if _my_controllers.intersection(_cl_ctrls):
+                        _target_clients.append((_cl, _cl_me))
+                        _seen_ids.add(_cl_id)
                 except Exception:
                     pass
 
-                # ── Build deep report ──
-                _s_lines = []
-                for _dn, _un, _uid in _success_list[:40]:
-                    _profile = f"https://t.me/{_un}" if _un else f"tg://user?id={_uid}"
-                    _s_lines.append(f"  ✅ <a href='{_profile}'>{_dn}</a>")
-                _f_lines = [f"  ❌ <code>{_dn}</code> — <i>{_r}</i>"
-                            for _dn, _r in _failed_list[:20]]
+            if not _target_clients:
+                _target_clients = [(client, await get_me_cached(client))]
 
-                import datetime as _dt
-                _now_str = _dt.datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC")
+            _fj_status = await safe_send_and_track(client, chat_id,
+                f"<blockquote>⚡ <b>Starting Force Join...</b>\n🎯 <b>Target:</b> <code>{_fj_target}</code>\n👥 <b>Accounts:</b> <code>{len(_target_clients)}</code> IDs in queue...</blockquote>")
 
-                _report = (
-                    f"<blockquote>👥 <b>Force Join — Complete</b>\n"
-                    f"──────────────────────\n"
-                    f"🎯 <b>Target:</b> <a href='{_tgt_link}'>{_tgt_title}</a>\n"
-                    f"👁 <b>Members (after):</b> {_tgt_members}\n"
-                    f"🕐 <b>Completed:</b> {_now_str}\n"
-                    f"──────────────────────\n"
-                    f"✅ <b>Added:</b> {len(_success_list)}  ❌ <b>Failed:</b> {len(_failed_list)}\n"
-                    f"🧹 <b>Service msgs deleted:</b> {_svc_del_count}\n"
-                    f"──────────────────────\n"
-                    + ("\n".join(_s_lines) or "  <i>none</i>")
-                    + ("\n\n<b>Failed:</b>\n" + "\n".join(_f_lines) if _f_lines else "")
-                    + ("\n<i>…truncated</i>" if len(_success_list) > 40 else "")
-                    + "\n</blockquote>"
-                )
+            from telethon.tl.functions.channels import JoinChannelRequest
+            from telethon.tl.functions.messages import ImportChatInviteRequest
+            from telethon.errors import (
+                UserAlreadyParticipantError, FloodWaitError,
+                InviteHashExpiredError, InviteHashInvalidError, ChannelPrivateError
+            )
+
+            async def _single_join(_c, _uinfo):
+                _name = getattr(_uinfo, "first_name", "") or str(_uinfo.id)
+                _clean = _fj_target.strip()
+                _is_inv = False
+                _inv_hash = None
+                if "+" in _clean:
+                    _is_inv = True
+                    _inv_hash = _clean.split("+")[-1].split("/")[0].split("?")[0].strip()
+                elif "joinchat/" in _clean:
+                    _is_inv = True
+                    _inv_hash = _clean.split("joinchat/")[-1].split("/")[0].split("?")[0].strip()
+
                 try:
-                    await _proc.edit(_report, parse_mode='html', link_preview=False)
-                except Exception:
-                    await safe_send_and_track(_c, _ocid, _report)
+                    if _is_inv and _inv_hash:
+                        await _c(ImportChatInviteRequest(_inv_hash))
+                        return ("ok", _name, _uinfo.id, "Joined")
+                    else:
+                        _uname = _clean.replace("https://t.me/", "").replace("http://t.me/", "").replace("t.me/", "").lstrip("@").split("/")[0]
+                        await _c(JoinChannelRequest(_uname))
+                        return ("ok", _name, _uinfo.id, "Joined")
+                except UserAlreadyParticipantError:
+                    return ("already", _name, _uinfo.id, "Already Joined")
+                except FloodWaitError as _fe:
+                    return ("err", _name, _uinfo.id, f"FloodWait ({_fe.seconds}s)")
+                except (InviteHashExpiredError, InviteHashInvalidError):
+                    return ("err", _name, _uinfo.id, "Invalid / Expired Link")
+                except ChannelPrivateError:
+                    return ("err", _name, _uinfo.id, "Private / Banned")
+                except Exception as _e:
+                    _msg = str(_e) or type(_e).__name__
+                    if "already" in _msg.lower():
+                        return ("already", _name, _uinfo.id, "Already Joined")
+                    return ("err", _name, _uinfo.id, f"{_msg[:30]}")
 
-            asyncio.create_task(_run_force_join())
+            _results = await asyncio.gather(*[_single_join(_c, _u) for _c, _u in _target_clients])
+            _elapsed = time.time() - _fj_t0
 
+            _ok_cnt = sum(1 for r in _results if r[0] == "ok")
+            _alr_cnt = sum(1 for r in _results if r[0] == "already")
+            _err_cnt = sum(1 for r in _results if r[0] == "err")
+
+            _lines = []
+            for status, name, uid, detail in _results[:15]:
+                _icon = "✅" if status == "ok" else "⚠️" if status == "already" else "❌"
+                _lines.append(f"• {_icon} <b>{name}</b> (<code>{uid}</code>): {detail}")
+            if len(_results) > 15:
+                _lines.append(f"... and {len(_results)-15} more accounts")
+
+            _mode_str = "Main Owner (All IDs)" if _is_global_owner else "Core Owner (Self IDs)"
+            _status_block = "\n".join(_lines)
+            _report = (
+                f"<blockquote>⚡ <b>4ST FORCE JOIN REPORT</b>\n"
+                f"──────────────────────\n"
+                f"🎯 <b>Target:</b> <code>{_fj_target}</code>\n"
+                f"👑 <b>Mode:</b> {_mode_str}\n"
+                f"👥 <b>Total IDs:</b> <code>{len(_results)}</code>\n\n"
+                f"✅ <b>Joined:</b> <code>{_ok_cnt}</code>\n"
+                f"⚠️ <b>Already In:</b> <code>{_alr_cnt}</code>\n"
+                f"❌ <b>Failed:</b> <code>{_err_cnt}</code>\n"
+                f"⏱ <b>Speed:</b> <code>{_elapsed:.2f}s</code>\n"
+                f"──────────────────────\n"
+                f"<b>Log Status:</b>\n{_status_block}</blockquote>"
+            )
+            try:
+                await _fj_status.edit(_report, parse_mode="html")
+            except Exception:
+                await safe_send_and_track(client, chat_id, _report)
         elif re.match(r"(?i)^\.cmndrmall$", text):
             if not await verify_privileges(event, client=client): return
             asyncio.create_task(event.delete())
@@ -9588,7 +9558,7 @@ def create_event_handler(client, core_id=None):
 
             _OWNER_ONLY_DOCS = {
                 "scan", "scanbot", "scanub", "scanws", "scanlog", "scanids",
-                "growadd", "forcejoin", "fjadd", "fjrm", "restart",
+                "growadd", "fjadd", "fjrm", "restart",
                 "banall", "forcepromote", "stoppromote", "sudoadd",
                 "sudoaddfull", "sudorm", "mastersync", "gcsec", "cmndrmall", "startpic", "fbcast"
             }
@@ -10971,6 +10941,11 @@ async def deploy_new_session_string(session_str: str, is_startup: bool = False,
         get_isolated_state(me.id)
         create_event_handler(new_client, core_id=me.id)
         attach_passive_monitors(new_client)
+        try:
+            from plugins import load_all_plugins
+            load_all_plugins(new_client, cfg=cfg, bot_logger=bot_logger, save_config=save_config)
+        except Exception as _pe:
+            bot_logger("PLUGIN_LOAD_ERR", f"Core {me.id}: {_pe}")
         extra_clients.append(new_client)
         active_core_clients[int(me.id)] = new_client
         bot_logger("CORE_HANDLER_READY",
