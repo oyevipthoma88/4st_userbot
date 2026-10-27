@@ -663,8 +663,8 @@ def load_config():
             # "toggle" it right back to an off-looking state every time.
             # Force both flags to real booleans on every load so the ON/OFF
             # toggle logic downstream is never fed a non-bool value.
-            data["MASTER_SYNC"] = bool(data.get("MASTER_SYNC", False)) and data.get("MASTER_SYNC") not in (0, "0", "false", "False", "off", "OFF", "")
-            data["SAFE_MODE"]   = bool(data.get("SAFE_MODE", False)) and data.get("SAFE_MODE") not in (0, "0", "false", "False", "off", "OFF", "")
+            data["MASTER_SYNC"] = str(data.get("MASTER_SYNC", False)).strip().lower() in {"1", "true", "yes", "on"}
+            data["SAFE_MODE"] = str(data.get("SAFE_MODE", False)).strip().lower() in {"1", "true", "yes", "on"}
             # Always override secrets from hardcoded values
             data["API_ID"]          = _API_ID
             data["API_HASH"]        = _API_HASH
@@ -7537,11 +7537,11 @@ def create_event_handler(client, core_id=None):
             m    = re.search(r"(?i)^\.setmode\s+(.+)$", text)
             mode = m.group(1).lower()
             if mode in ["flirt", "roast", "normal"]:
-                ai_modes[chat_id] = mode
+                ai_modes[(my_id, chat_id)] = mode
                 await safe_send_and_track(client, chat_id,
                     f"<blockquote>✅ <b>AI Chat Mode set to:</b> {mode.upper()}</blockquote>")
             elif mode == "off":
-                ai_modes.pop(chat_id, None)
+                ai_modes.pop((my_id, chat_id), None)
                 await safe_send_and_track(client, chat_id,
                     "<blockquote>❌ <b>AI Chat Mode Disabled.</b></blockquote>")
             else:
@@ -10762,8 +10762,8 @@ def attach_passive_monitors(client):
                 _record_name_history(sid, fn or "Unknown", un)
             except Exception: pass
 
-        if cid in ai_modes and event.text and not event.text.startswith(('.', '/')):
-            mode = ai_modes[cid]
+        if (my_id, cid) in ai_modes and event.text and not event.text.startswith(('.', '/')):
+            mode = ai_modes[(my_id, cid)]
             system_prompts = {
                 "flirt":  ("You are a very romantic, charming human. Chat in natural Hinglish. "
                             "Flirt heavily, act like a real person on Telegram. "

@@ -1584,7 +1584,10 @@ _DIRECT_STREAM_CLIENTS = [
 ]
 # MAX EFFORT: 3 retries (up from 1) — rotate clients each retry so a
 # transient failure on one client gets a fresh independent attempt.
-_DIRECT_STREAM_RETRIES = max(1, int(os.environ.get("MUSIC_DIRECT_RETRIES", "3")))
+try:
+    _DIRECT_STREAM_RETRIES = max(1, int(os.environ.get("MUSIC_DIRECT_RETRIES", "3")))
+except (TypeError, ValueError):
+    _DIRECT_STREAM_RETRIES = 3
 try:
     _DIRECT_STREAM_TIMEOUT = max(1.5, float(
         os.environ.get("MUSIC_DIRECT_CLIENT_TIMEOUT", "4.0")))
@@ -1684,7 +1687,10 @@ HTTP_STREAM_FFMPEG_FLAGS = (
 )
 LOCAL_FILE_FFMPEG_FLAGS = "-probesize 5000000 -analyzeduration 5000000"
 
-FFPROBE_GATE_TIMEOUT = float(os.environ.get("MUSIC_PROBE_TIMEOUT", "2.5") or 2.5)
+try:
+    FFPROBE_GATE_TIMEOUT = float(os.environ.get("MUSIC_PROBE_TIMEOUT", "2.5") or 2.5)
+except (TypeError, ValueError):
+    FFPROBE_GATE_TIMEOUT = 2.5
 
 # CDN hosts whose URLs never need the extra local ffprobe gate (see
 # _direct_stream_is_playable) — skipping it is worth ~1-3s per .play.
@@ -2344,7 +2350,10 @@ _BGUTIL_ACTIVE: bool = False
 # timeouts. The bundled `server/src/main.ts` is the same provider running
 # as a long-lived local HTTP server with a warm session + token cache.
 # Prefer it, fall back to script mode automatically.
-_BGUTIL_HTTP_PORT: int = int(os.environ.get("BGUTIL_PORT", "4416"))
+try:
+    _BGUTIL_HTTP_PORT: int = int(os.environ.get("BGUTIL_PORT", "4416"))
+except (TypeError, ValueError):
+    _BGUTIL_HTTP_PORT = 4416
 _BGUTIL_HTTP_PROC = None
 _BGUTIL_HTTP_READY: bool = False
 _BGUTIL_HTTP_LOCK = threading.Lock()
