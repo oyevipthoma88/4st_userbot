@@ -9487,16 +9487,134 @@ def create_event_handler(client, core_id=None):
             if not _target:
                 await safe_send_and_track(client, chat_id, "<blockquote>❌ Reply mein user identify nahi hua.</blockquote>"); return
             _gb = cfg.get("GBANNED_USERS", {})
-            if str(_target) in _gb:
+            _was_in_list = str(_target) in _gb
+            if _was_in_list:
                 del _gb[str(_target)]; cfg["GBANNED_USERS"] = _gb
                 save_config(cfg)
+
+            _proc = await safe_send_and_track(client, chat_id,
+                f"<blockquote>⏳ <b>UNGBAN STARTED</b>\n"
+                f"👤 Target: <code>{_target}</code>\n"
+                f"{'📋 List se hata diya ✔' if _was_in_list else '📋 List me nahi tha — groups scan ho rahe hain'}\n"
+                f"🔍 Groups scan ho rahe hain...</blockquote>")
+
+            _unbanned = 0
+            _not_banned = 0
+            _failed = 0
+            _skipped = 0
+            _scanned = 0
+            _last_progress = time.monotonic()
+            _last_error = ""
+            _failed_chats = []
+
+            try:
+                _me_id = (await get_me_cached(client)).id
                 try:
-                    await client(UnblockRequest(id=_target))
+                    _target_peer = await client.get_input_entity(_target)
                 except Exception:
-                    pass
-                await safe_send_and_track(client, chat_id, f"<blockquote>✅ <code>{_target}</code> ungban</blockquote>")
+                    _target_peer = _target
+
+                async for _d in client.iter_dialogs():
+                    if not (_d.is_group or _d.is_channel):
+                        continue
+                    _scanned += 1
+                    if _proc and (time.monotonic() - _last_progress >= 8):
+                        try:
+                            await _premium_edit(_proc,
+                                f"<blockquote>⏳ <b>UNGBAN SCANNING</b>\n"
+                                f"User: <code>{_target}</code>\n"
+                                f"Chats scanned: <code>{_scanned}</code>\n"
+                                f"Unbanned: <b>{_unbanned}</b> | Not-banned: <b>{_not_banned}</b> | Failed: <b>{_failed}</b></blockquote>")
+                        except Exception:
+                            pass
+                        _last_progress = time.monotonic()
+
+                    try:
+                        _p = await client.get_permissions(_d.entity, _me_id)
+                    except Exception:
+                        _skipped += 1
+                        continue
+
+                    if not (getattr(_p, "is_creator", False) or
+                            (getattr(_p, "is_admin", False) and getattr(_p, "ban_users", False))):
+                        _skipped += 1
+                        continue
+
+                    if not isinstance(_d.entity, types.Channel):
+                        _skipped += 1
+                        continue
+
+                    try:
+                        _pp = await client(GetParticipantRequest(
+                            channel=_d.entity, participant=_target_peer))
+                        _part = getattr(_pp, "participant", None)
+                    except errors.FloodWaitError as _fw:
+                        await asyncio.sleep(_fw.seconds + 1)
+                        _failed += 1
+                        _failed_chats.append(f"{_d.title}: FloodWait {_fw.seconds}s")
+                        continue
+                    except Exception:
+                        _not_banned += 1
+                        continue
+
+                    if not isinstance(_part, types.ChannelParticipantBanned):
+                        _not_banned += 1
+                        continue
+
+                    try:
+                        await client(EditBannedRequest(
+                            channel=_d.entity, participant=_target_peer,
+                            banned_rights=ChatBannedRights(until_date=None)))
+                        _unbanned += 1
+                        await asyncio.sleep(0.3)
+                    except errors.FloodWaitError as _fw:
+                        await asyncio.sleep(_fw.seconds + 1)
+                        _failed += 1
+                        _failed_chats.append(f"{_d.title}: FloodWait")
+                    except Exception as _be:
+                        _failed += 1
+                        _last_error = str(_be)[:150]
+                        _failed_chats.append(f"{_d.title}: {_last_error}")
+
+            except Exception as _scan_error:
+                _last_error = str(_scan_error)[:180]
+                bot_logger("UNGBAN_ERR", _last_error)
+
+            try:
+                await client(UnblockRequest(id=_target))
+            except Exception:
+                pass
+
+            _detail_lines = []
+            for _d_txt in _failed_chats[-5:]:
+                _detail_lines.append("❌ " + _brand_html.escape(_d_txt))
+            _details = ("\n" + "\n".join(_detail_lines)) if _detail_lines else ""
+
+            _list_line = "📋 Removed from gban list ✔" if _was_in_list else "📋 Was not in gban list"
+            if _unbanned:
+                _result = (f"<blockquote>✅ <b>Ungban finished</b>\n"
+                           f"👤 <code>{_target}</code>\n"
+                           f"{_list_line}\n"
+                           f"🔓 Unbanned: <b>{_unbanned}</b> | 🚫 Not-banned: <b>{_not_banned}</b>\n"
+                           f"❌ Failed: <b>{_failed}</b> | ⏭️ Skipped: <b>{_skipped}</b>{_details}</blockquote>")
+            elif _scanned == 0:
+                _result = (f"<blockquote>⚠️ <b>No groups/channels found</b>\n"
+                           f"👤 <code>{_target}</code>\n{_list_line}</blockquote>")
             else:
-                await safe_send_and_track(client, chat_id, f"<blockquote>⚠️ <code>{_target}</code> list mein nahi</blockquote>")
+                _result = (f"<blockquote>⚠️ <b>Scan complete — not banned anywhere</b>\n"
+                           f"👤 <code>{_target}</code>\n{_list_line}\n"
+                           f"🔍 Scanned: <b>{_scanned}</b> | Skipped (no ban rights): <b>{_skipped}</b>\n"
+                           f"❌ Failed: <b>{_failed}</b>{_details}</blockquote>")
+            if _last_error and _failed:
+                _result += f"\n⚠️ Last error: <code>{_brand_html.escape(_last_error)}</code>"
+
+            if _proc:
+                try:
+                    await _premium_edit(_proc, _result)
+                except Exception:
+                    await safe_send_and_track(client, chat_id, _result)
+            else:
+                await safe_send_and_track(client, chat_id, _result)
             return
 
         # ─────── UNGMUTE ───────
