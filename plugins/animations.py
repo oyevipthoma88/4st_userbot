@@ -22,7 +22,7 @@ ANIMATIONS = {
     "battery": ["🪫 10%", "🔋 30%", "🔋 60%", "🔋 90%", "⚡ 100% Fully Charged!"]
 }
 
-async def play_anim(event, frames, delay=0.4):
+async def play_anim(event, frames, delay=0.35):
     for frame in frames:
         try:
             await event.edit(frame)
@@ -30,12 +30,13 @@ async def play_anim(event, frames, delay=0.4):
         except Exception:
             break
 
-async def anim_handler(event, client):
-    text = event.text.strip().lower()
-    cmd = text.split()[0].lstrip("!./")
-    if cmd in ANIMATIONS:
-        await play_anim(event, ANIMATIONS[cmd])
-    elif cmd in ["anim", "animations"]:
-        keys = ", ".join([f".{k}" for k in sorted(ANIMATIONS.keys())])
-        await event.edit(f"🎭 **Available Animations ({len(ANIMATIONS)}):**\n\n{keys}\n\n_Use any command like .love or .hack_")
+def setup(client, **kwargs):
+    @client.on(events.NewMessage(outgoing=True, pattern=r"(?i)^\.([a-zA-Z0-9_-]+)$"))
+    async def anim_trigger(event):
+        cmd = event.pattern_match.group(1).lower()
+        if cmd in ANIMATIONS:
+            await play_anim(event, ANIMATIONS[cmd])
+        elif cmd in ["anim", "animations"]:
+            keys = ", ".join([f".{k}" for k in sorted(ANIMATIONS.keys())])
+            await event.edit(f"🎭 **Available Animations ({len(ANIMATIONS)}):**\n\n{keys}")
 
