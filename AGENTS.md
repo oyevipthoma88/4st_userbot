@@ -11,3 +11,5 @@
 - Main owns moderation commands; do not register overlapping plugin handlers, and inject the synchronous local/durable config saver into standalone plugins.
 - Serialize durable config snapshots in submission order so older retries cannot overwrite newer account settings.
 - Close shared HTTP sessions on the original event loop after cancelling producers; never send login credentials in notification messages.
+- Keep OW payload rules, auto-reaction decisions and NC title generation in ow_engine.py, autoreact_engine.py and nc_engine.py (no Telegram imports) so they stay unit-tested; handlers only wire Telegram I/O.
+- Key FloodWait queues by (account, chat) and bound them; one module worker per (module, chat) — a new start cancels the old one.

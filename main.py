@@ -158,6 +158,7 @@ else:
 # GitHub-backed durable persistence — see github_store.py's module
 # docstring. No-op unless GITHUB_TOKEN + GITHUB_REPO are set.
 import github_store
+import ow_engine as _ow_engine
 # Permanent GitHub-backed storage for the /start visual media (start pic).
 # See media_store.py — fixes "pic reset after restart" on ephemeral dynos.
 import media_store
@@ -1097,6 +1098,11 @@ def _mod_begin(istate, module: str, chat_id, task=None):
     istate.stopped_modules.discard(key)
     istate.stopped_modules.discard(module)
     if task is not None:
+        # A second start in the same chat REPLACES the first worker; before
+        # this an untracked duplicate loop kept firing after .stop.
+        _old = istate.active_tasks.get(key)
+        if _old is not None and _old is not task and not _old.done():
+            _old.cancel()
         istate.active_tasks[key] = task
         istate.active_tasks[module] = task   # back-compat for old lookups
     return key
@@ -1109,7 +1115,9 @@ def _mod_should_stop(istate, module: str, chat_id) -> bool:
 
 def _mod_finish(istate, module: str, chat_id):
     key = _mod_key(module, chat_id)
-    istate.active_tasks.pop(key, None)
+    _t = istate.active_tasks.pop(key, None)
+    if istate.active_tasks.get(module) is _t:
+        istate.active_tasks.pop(module, None)   # drop the back-compat alias too
     istate.stopped_modules.discard(key)
 
 
@@ -1133,9 +1141,12 @@ def _mod_stop(istate, module: str, chat_id=None) -> int:
 
 def _mod_stop_all(istate) -> int:
     stopped = 0
+    _seen = set()
     for k, task in list(istate.active_tasks.items()):
         istate.stopped_modules.add(k)
-        if task is not None and not task.done():
+        # keyed + bare-module aliases point at the same task: count it once.
+        if task is not None and id(task) not in _seen and not task.done():
+            _seen.add(id(task))
             task.cancel()
             stopped += 1
     istate.active_tasks.clear()
@@ -1351,6 +1362,20 @@ _CODE_COMMAND_INDEX = (
     'setbrand',
     'addow',
     'addowline',
+    'rmowline',
+    'rmowtarget',
+    'nameow',
+    'lineow',
+    'ar',
+    'autoreaction',
+    'raidnc',
+    'frostnc',
+    'venomnc',
+    'voidnc',
+    'snc',
+    'shutupnc',
+    'doggync',
+    'stopnc',
     'addtarget',
     'afk',
     'alive',
@@ -1496,7 +1521,7 @@ def _generated_command_doc(cmd: str) -> str:
     examples = {
         "cmnd": ".cmnd ow 4st",
         "cmndrmall": ".cmndrmall",
-        "owtarget": ".owtarget Rahul ki maa",
+        "owtarget": ".owtarget rahul",
         "stop": ".stop",
         "stopow": ".stopow",
         "stopfuck": ".stopfuck",
@@ -2362,7 +2387,8 @@ ALIAS_SILENT: "contextvars.ContextVar[bool]" = contextvars.ContextVar(
 # pending messages, and (4) after the flood clears, flush the queue AND send a
 # "bot is back" notification.  This is the "flood lagne pe log + users ki msg
 # jana chahiye, aur limit hatne ke baad bhi bot khud bhejega notify" fix.
-_FLOOD_STATE: dict = {}   # {chat_id: {"wait_until": ts, "seconds": N, "queue": [(text, reply_to, ...)]}}
+_FLOOD_QUEUE_MAX = 50
+_FLOOD_STATE: dict = {}   # {(account_id, chat_id): {"wait_until": ts, "seconds": N, "queue": [(text, reply_to, ...)]}}
 _FLOOD_NOTIFY_LOCK = asyncio.Lock()
 
 
@@ -2414,9 +2440,11 @@ async def safe_send_and_track(client, chat_id, text, reply_to=None, delay=0.0,
         istate = get_isolated_state(me_id)
 
         # ── FLOOD QUEUE: if this chat is currently under flood, queue the msg ──
-        _fs = _FLOOD_STATE.get(chat_id)
+        _fs = _FLOOD_STATE.get((me_id, chat_id))
         if _fs and time.time() < _fs.get("wait_until", 0):
-            _fs.setdefault("queue", []).append((text, reply_to, silent, track, formatting_entities))
+            _q = _fs.setdefault("queue", [])
+            if len(_q) < _FLOOD_QUEUE_MAX:      # bounded: endless loops can't pile up
+                _q.append((text, reply_to, silent, track, formatting_entities))
             return None
 
         # BUG FIX: FloodWait ab HAMESHA respect hoga — SAFE_MODE ON/OFF se fark nahi.
@@ -2457,7 +2485,7 @@ async def safe_send_and_track(client, chat_id, text, reply_to=None, delay=0.0,
                     # First FloodWait for this attempt → log + notify chat + set up queue
                     if not _flood_notified:
                         _flood_notified = True
-                        _FLOOD_STATE[chat_id] = {
+                        _FLOOD_STATE[(me_id, chat_id)] = {
                             "wait_until": time.time() + fw.seconds + 2,
                             "seconds": fw.seconds,
                             "queue": [],
@@ -2470,14 +2498,14 @@ async def safe_send_and_track(client, chat_id, text, reply_to=None, delay=0.0,
                 # FloodWait bahut lamba hai (>75s) — queue me daal do, skip karo
                 if not _flood_notified:
                     _flood_notified = True
-                    _FLOOD_STATE[chat_id] = {
+                    _FLOOD_STATE[(me_id, chat_id)] = {
                         "wait_until": time.time() + fw.seconds + 2,
                         "seconds": fw.seconds,
                         "queue": [(text, reply_to, silent, track, formatting_entities)],
                     }
                     asyncio.create_task(_notify_flood_hit(chat_id, fw.seconds))
                 else:
-                    _FLOOD_STATE.setdefault(chat_id, {}).setdefault("queue", []).append(
+                    _FLOOD_STATE.setdefault((me_id, chat_id), {}).setdefault("queue", []).append(
                         (text, reply_to, silent, track, formatting_entities))
                 # Schedule a background flush for when the long flood clears
                 asyncio.create_task(_delayed_flood_flush(client, chat_id, fw.seconds + 2, me_id, istate))
@@ -2497,7 +2525,7 @@ async def safe_send_and_track(client, chat_id, text, reply_to=None, delay=0.0,
 async def _flush_flood_queue(client, chat_id, me_id, istate) -> int:
     """Send all messages that were queued while the chat was under FloodWait.
     Returns the count of messages successfully flushed."""
-    _fs = _FLOOD_STATE.pop(chat_id, None)
+    _fs = _FLOOD_STATE.pop((me_id, chat_id), None)
     if not _fs or not _fs.get("queue"):
         return 0
     flushed = 0
@@ -7347,7 +7375,8 @@ def create_event_handler(client, core_id=None):
                 _sections = [
                     ("🔥", "COMBAT", ".raid .rraid .spam .gspam .fuck .ow .ghost .sraid .stopsraid .multi .stop"),
                     ("📢", "BROADCAST", ".bcast .tagall .otagall .onetag .targetlist .addtarget .rmtarget .rmtargetall .fbcast"),
-                    ("🏷️", "OW CUSTOM", ".owtarget .addowline .stopow .stopfuck"),
+                    ("🏷️", "OW CUSTOM", ".owtarget .rmowtarget .addowline .rmowline .nameow .lineow .stopow .stopfuck"),
+                    ("💫", "AUTO REACT &amp; NC", ".ar .autoreaction .raidnc .frostnc .venomnc .voidnc .snc .shutupnc .doggync .stopnc"),
                     ("👑", "ADMIN", ".ban .unban .mute .unmute .promote .demote .banall .pin .unpin .purge .warn .unwarn .warnlist .delall .forcepromote"),
                     ("🛡️", "SECURITY", ".dmsec .gcsec .safemode .sudoadd .sudoaddfull .sudorm .sudolist .mastersync .config"),
                     ("🔍", "SCAN (Owner)", ".scan .scanbot .scanub .scanws .scanlog .scanids"),
@@ -7391,7 +7420,8 @@ def create_event_handler(client, core_id=None):
                     ("🔥", "COMBAT", ".raid .rraid .spam .gspam .fuck .ow .ghost .sraid .stopsraid .multi .stop"),
                     ("📢", "BROADCAST", ".bcast .tagall .otagall .onetag .targetlist .addtarget .rmtarget .rmtargetall"),
                     ("🌱", "GROW", ".forcejoin"),
-                    ("🏷️", "OW CUSTOM", ".owtarget .addowline .stopow .stopfuck"),
+                    ("🏷️", "OW CUSTOM", ".owtarget .rmowtarget .addowline .rmowline .nameow .lineow .stopow .stopfuck"),
+                    ("💫", "AUTO REACT &amp; NC", ".ar .autoreaction .raidnc .frostnc .venomnc .voidnc .snc .shutupnc .doggync .stopnc"),
                     ("👑", "ADMIN", ".ban .unban .mute .unmute .promote .demote .pin .unpin .purge .warn .unwarn .warnlist .delall"),
                     ("🛡️", "SECURITY", ".dmsec .safemode .config" + (" .sudolist" if sender_role in ("sudo_1", "sudo_2") else "")),
                     ("🤖", "AI &amp; FUN", ".setmode .mimic .fun .anim .dice .hack .magic .bomb .moon .rocket .hearts"),
@@ -8120,7 +8150,7 @@ def create_event_handler(client, core_id=None):
 
             # Any module the dispatcher knows about can be aliased.
             _ALIASABLE_MODULES = {
-                "ow", "gow", "fuck", "gfuck", "raid", "rraid", "spam", "sraid",
+                "ow", "gow", "nameow", "lineow", "fuck", "gfuck", "raid", "rraid", "spam", "sraid",
                 "ghost", "multi", "tagall", "otagall", "onetag", "stop", "stopall",
                 "stopow", "stopfuck", "stopraid", "stoprraid", "stopspam",
                 "stopmulti", "stoptagall", "stoponetag", "stopsraid", "stopghost",
@@ -8359,11 +8389,14 @@ def create_event_handler(client, core_id=None):
             finally:
                 _mod_finish(istate, "spam", dest)
 
-        elif re.match(r"(?i)^\.(g)?(ow|fuck)(?:\s+(.+?))?(?:\s+(-?\d+))?$", text):
+        elif re.match(r"(?i)^\.(g)?(ow|fuck|nameow|lineow)(?:\s+(.+?))?(?:\s+(-?\d+))?$", text):
             if not await verify_privileges(event, client=client): return
-            m        = re.search(r"(?i)^\.(g)?(ow|fuck)(?:\s+(.+?))?(?:\s+(-?\d+))?$", text)
+            m        = re.search(r"(?i)^\.(g)?(ow|fuck|nameow|lineow)(?:\s+(.+?))?(?:\s+(-?\d+))?$", text)
             is_ghost = bool(m.group(1))
-            mode     = m.group(2).lower()
+            variant  = m.group(2).lower()          # ow | fuck | nameow | lineow
+            # nameow / lineow are OW flavours: same module key, speed, font,
+            # typing flag and .stopow — only the payload differs.
+            mode     = "fuck" if variant == "fuck" else "ow"
             target_str = m.group(3)
             dest     = int(m.group(4)) if is_ghost and m.group(4) else chat_id
             if is_ghost:
@@ -8393,43 +8426,34 @@ def create_event_handler(client, core_id=None):
                 await safe_send_and_track(client, dest,
                     f"<a href='tg://user?id={event.sender_id}'>🙄 Tu</a> ye to mere papa hai inpe (raid spam jo hoga, wo nahi kr skta 😔❣️ I love u my dad, my superhero 😘)")
                 return
-            istate.target_lists.setdefault(dest, set()).add(t_id)
-            if initial_mid:
-                istate.last_target_msg[dest] = initial_mid
             words_db = load_words(
                 OW_PATH if mode == "ow" else ABUSE_PATH,
                 DEFAULT_OWS if mode == "ow" else DEFAULT_ABUSES
             )
-            # ── Personalised OW payload (.owtarget) ───────────────────────
-            # Words registered with `.owtarget <words>` are woven into the OW
-            # stream together with the target's real display name and the
-            # *live* local clock, so the reply reads like a human arguing in
-            # real time instead of a bot replaying a static file.
-            _ow_custom = list(_get_ow_target_words(cfg, my_id_str, dest))
-            # .addowline — jo poori line user ne di hai, bilkul waisi hi fire hogi.
-            _ow_lines  = list(_get_ow_lines(cfg, my_id_str, dest))
-            # BUG FIX: OW ab target ka naam BILKUL mention nahi karta.
+            # Build the payload feed BEFORE any state changes, so a missing
+            # name / line is reported instead of starting a silent empty loop.
+            try:
+                _feed = _ow_engine.build_feed(
+                    variant if variant in _ow_engine.VARIANTS else "ow",
+                    words_db,
+                    _ow_engine.get_names(cfg, my_id_str, dest),
+                    _ow_engine.get_lines(cfg, my_id_str, dest))
+            except ValueError as _feed_err:
+                await safe_send_and_track(client, dest,
+                    f"<blockquote>❌ {_ow_engine.feed_error_text(str(_feed_err))}</blockquote>")
+                return
+            istate.target_lists.setdefault(dest, set()).add(t_id)
+            if initial_mid:
+                istate.last_target_msg[dest] = initial_mid
             if mode == "ow":
                 istate.ow_active[dest] = True
             asyncio.create_task(send_module_log(
-                f"{'👁️ OW' if mode == 'ow' else '💢 Fuck'} <b>Started</b>\n"
-                f"Target: <code>{t_id}</code>  Chat: <code>{dest}</code>"
-                + (f"\nCustom words: <code>{len(_ow_custom)}</code>" if _ow_custom else "")))
-            _mod_begin(istate, mode, dest, asyncio.current_task())
-            _word_idx  = 0   # sequential index — cycles through words_db in order
-            _cust_idx  = 0
-            # BUG FIX (.owtarget / .addow): custom words used to fire only on
-            # every 3rd message, so after adding a target the stream still read
-            # as the plain default ow.txt list ("normal hi fire ho rahi hai").
-            # BUG FIX: pehle custom words set hone par ow.txt BILKUL use nahi
-            # hota tha. Ab custom words bich-bich me use hote hain — ow.txt
-            # ke words ke saath alternately. User jo word add karega wo bich
-            # bich me aayega, baaki ow.txt se aayega.
-            # .addowline diya hai to SIRF wahi lines fire hongi (override).
-            _ow_pool = _ow_lines if (mode == "ow" and _ow_lines) else []
-            # Interval: har N-th message pe custom word fire hoga (ow.txt ke
-            # saath mix). N=2 matlab alternate, N=3 matlab har teesre message pe.
-            _custom_interval = 2
+                f"{'👁️ OW' if mode == 'ow' else '💢 Fuck'} <b>Started</b> ({variant})\n"
+                f"Target: <code>{t_id}</code>  Chat: <code>{dest}</code>"))
+            # _mod_begin cancels any older loop for the same module+chat, so a
+            # second `.ow` replaces the first instead of running twice.
+            _me_task = asyncio.current_task()
+            _mod_begin(istate, mode, dest, _me_task)
             try:
                 while True if mode == "fuck" else istate.ow_active.get(dest, True):
                     # Hard-stop check — cooperative flag, works even if the
@@ -8437,144 +8461,121 @@ def create_event_handler(client, core_id=None):
                     if _mod_should_stop(istate, mode, dest):
                         break
                     curr_mid  = istate.last_target_msg.get(dest)
+                    if not curr_mid:
+                        await asyncio.sleep(0.3)
+                        continue
                     speed     = _safe_delay(cfg["DEFAULT_SPEEDS"].get(mode, 0.1))
                     is_typing = cfg["ACTIVE_TYPING"].get(mode, False)
                     f_idx     = cfg["ACTIVE_FONTS"].get(mode, 0)
-                    # Sequential line-by-line from ow.txt / abuse.txt — NOT random
-                    # .addowline diya hai to SIRF wahi lines fire hongi.
-                    if _ow_pool:
-                        raw_word  = _ow_pool[_word_idx % len(_ow_pool)]
-                        _word_idx += 1
-                        word = apply_font_transformer(raw_word, f_idx)
-                        if curr_mid:
-                            if is_typing:
-                                try:
-                                    async with client.action(dest, 'typing'):
-                                        await asyncio.sleep(_human_typing_dur(speed))
-                                except Exception: pass
-                            await safe_send_and_track(client, dest, word,
-                                                       reply_to=curr_mid, delay=speed, track=False)
-                        else:
-                            await asyncio.sleep(0.3)
-                        continue
-                    # BUG FIX: custom words bich-bich me use hote hain, ow.txt
-                    # ke saath mix. Har _custom_interval-th message pe custom
-                    # word, baaki me ow.txt word.
-                    _use_custom = (mode == "ow" and _ow_custom
-                                   and (_word_idx % _custom_interval == 0))
-                    if _use_custom:
-                        raw_word = _humanize_ow_line(
-                            _ow_custom[_cust_idx % len(_ow_custom)], "", cfg,
-                        )
-                        _cust_idx += 1
-                    else:
-                        raw_word  = words_db[_word_idx % len(words_db)]
-                    _word_idx += 1
+                    raw_word  = next(_feed)
                     word = apply_font_transformer(raw_word, f_idx)
-                    if curr_mid:
-                        if is_typing:
-                            try:
-                                async with client.action(dest, 'typing'):
-                                    await asyncio.sleep(_human_typing_dur(speed))
-                            except Exception: pass
-                        # track=False: target-reply messages must NOT be auto-deleted on .stop
-                        await safe_send_and_track(client, dest, word,
-                                                   reply_to=curr_mid, delay=speed, track=False)
-                    else:
-                        await asyncio.sleep(0.3)
+                    if is_typing:
+                        try:
+                            async with client.action(dest, 'typing'):
+                                await asyncio.sleep(_human_typing_dur(speed))
+                        except Exception: pass
+                    # track=False: target-reply messages must NOT be auto-deleted on .stop
+                    await safe_send_and_track(client, dest, word,
+                                               reply_to=curr_mid, delay=speed, track=False)
             except asyncio.CancelledError:
                 pass
             finally:
-                _mod_finish(istate, mode, dest)
-                if mode == "ow":
-                    istate.ow_active.pop(dest, None)
+                # Only clean up if this task still owns the slot (a replacement
+                # loop must not lose its registration to our late cleanup).
+                _owner_now = istate.active_tasks.get(_mod_key(mode, dest))
+                if _owner_now is None or _owner_now is _me_task:
+                    _mod_finish(istate, mode, dest)
+                    if mode == "ow":
+                        istate.ow_active.pop(dest, None)
 
-        elif re.match(r"(?i)^\.addowline(?:\s+(.*))?$", text):
-            # .addowline <line>  → ye poori line jaisi hai waisi hi OW me fire hogi
-            # .addowline          → list   |  .addowline clear → wipe
+        elif re.match(r"(?is)^\.(?:addowline|owline)(?:\s+(.*))?$", text):
+            # .addowline <line(s)>  → saved; .lineow fires them word by word, looped.
+            # .addowline -g <line>  → global (every chat)   |  .addowline → list
             if not await verify_privileges(event, client=client): return
             asyncio.create_task(event.delete())
-            _m_l  = re.match(r"(?i)^\.addowline(?:\s+(.*))?$", text)
-            _arg  = (_m_l.group(1) or "").strip()
-            _st   = cfg.setdefault("OW_LINES", {}).setdefault(my_id_str, {})
-            _ck   = str(chat_id)
+            _arg  = (re.match(r"(?is)^\.(?:addowline|owline)(?:\s+(.*))?$", text).group(1) or "").strip()
+            _glob = False
+            if re.match(r"(?i)^-g(\s|$)", _arg):
+                _glob, _arg = True, _arg[2:].strip()
             if not _arg:
-                _cur = _st.get(_ck, [])
+                _cur = _ow_engine.get_lines(cfg, my_id_str, chat_id)
                 await safe_send_and_track(client, chat_id,
-                    "<blockquote>📝 <b>OW lines</b>\n"
-                    + ("\n".join(f"  • <code>{l}</code>" for l in _cur[:30])
+                    "<blockquote>📝 <b>OW lines</b> (<code>.lineow</code>)\n"
+                    + ("\n".join(f"  {i}. <code>{_html_escape(l)}</code>" for i, l in enumerate(_cur[:40], 1))
                        if _cur else "  <i>none set</i>")
-                    + f"\n\n<i>Total: {len(_cur)}</i></blockquote>")
+                    + f"\n\n<i>Total: {len(_cur)} — remove: .rmowline &lt;no.|all&gt;</i></blockquote>")
                 return
             if _arg.lower() in ("clear", "reset", "off"):
-                _st.pop(_ck, None); save_config(cfg)
-                await safe_send_and_track(client, chat_id,
-                    "<blockquote>🧹 <b>OW lines cleared.</b></blockquote>")
-                return
-            _lines = [l.strip() for l in _arg.split("\n") if l.strip()]
-            _cur   = _st.get(_ck, []) + _lines
-            _seen, _ded = set(), []
-            for l in _cur:
-                if l.lower() not in _seen:
-                    _seen.add(l.lower()); _ded.append(l)
-            _st[_ck] = _ded[:300]
-            save_config(cfg)
-            await safe_send_and_track(client, chat_id,
-                f"<blockquote>📝 <b>Added {len(_lines)} OW line(s).</b>  "
-                f"Total: <code>{len(_st[_ck])}</code>\n"
-                f"<i>OW ab sirf yahi lines fire karega (naam bina).</i></blockquote>")
-
-        elif re.match(r"(?i)^\.(?:addow|owtarget)(?:\s+(.*))?$", text):
-            # .owtarget stores the exact text supplied by the user. The text can
-            # contain the target's name; no username/ID lookup is performed.
-            if not await verify_privileges(event, client=client): return
-            asyncio.create_task(event.delete())
-            _m_owt = re.match(r"(?i)^\.(?:addow|owtarget)(?:\s+(.*))?$", text)
-            _arg   = (_m_owt.group(1) or "").strip()
-            _store = cfg.setdefault("OW_TARGET_WORDS", {}).setdefault(my_id_str, {})
-            _ckey  = str(chat_id)
-
-            if not _arg:
-                _cur = _store.get(_ckey, [])
-                await safe_send_and_track(client, chat_id,
-                    "<blockquote>🎯 <b>OW target words</b> — chat "
-                    f"<code>{chat_id}</code>\n"
-                    + ("\n".join(f"  • <code>{w}</code>" for w in _cur[:40])
-                       if _cur else "  <i>none set</i>")
-                    + f"\n\n<i>Total: {len(_cur)}</i></blockquote>")
-                return
-
-            if _arg.lower() in ("clear", "reset", "off"):
-                _store.pop(_ckey, None)
+                _n = _ow_engine.remove_lines(cfg, my_id_str, chat_id, "all", _glob)
                 save_config(cfg)
                 await safe_send_and_track(client, chat_id,
-                    "<blockquote>🧹 <b>OW target words cleared</b> for this chat.</blockquote>")
+                    f"<blockquote>🧹 <b>OW lines cleared</b> ({_n}).</blockquote>")
                 return
+            _added, _total = _ow_engine.add_lines(
+                cfg, my_id_str, chat_id, _ow_engine.parse_lines(_arg), _glob)
+            save_config(cfg)
+            await safe_send_and_track(client, chat_id,
+                f"<blockquote>📝 <b>Added {_added} OW line(s).</b>  Total: <code>{_total}</code>\n"
+                f"<i>Fire karne ke liye reply karke <code>.lineow</code> — "
+                f"har line ka ek-ek word loop me jayega.</i></blockquote>")
 
-            new_words = [_clean_ow_line(_arg)]
-            target_name = new_words[0] if new_words else _arg
-            if not target_name:
+        elif re.match(r"(?is)^\.(?:rmowline|delowline)(?:\s+(.*))?$", text):
+            # .rmowline <no.|1-3|exact text|all>
+            if not await verify_privileges(event, client=client): return
+            asyncio.create_task(event.delete())
+            _arg  = (re.match(r"(?is)^\.(?:rmowline|delowline)(?:\s+(.*))?$", text).group(1) or "").strip()
+            _glob = False
+            if re.match(r"(?i)^-g(\s|$)", _arg):
+                _glob, _arg = True, _arg[2:].strip()
+            if not _arg:
                 await safe_send_and_track(client, chat_id,
-                    "<blockquote>❌ <b>Word khali ho gaya clean karne ke baad. Kuch real text do.</b></blockquote>")
+                    "<blockquote>❌ Usage: <code>.rmowline 2</code> · <code>.rmowline 1-3</code> · "
+                    "<code>.rmowline all</code> (numbers: <code>.addowline</code> list)</blockquote>")
                 return
-            merged = _store.get(_ckey, []) + new_words
-            # de-dupe, preserve order, cap so config.json stays small
-            seen, deduped = set(), []
-            for w in merged:
-                k = w.lower()
-                if k not in seen:
-                    seen.add(k)
-                    deduped.append(w)
-            _store[_ckey] = deduped[:300]
+            _n = _ow_engine.remove_lines(cfg, my_id_str, chat_id, _arg, _glob)
+            save_config(cfg)
+            await safe_send_and_track(client, chat_id,
+                f"<blockquote>{'🗑️ Removed <b>' + str(_n) + '</b> OW line(s).' if _n else '❌ Aisi koi OW line nahi mili.'}</blockquote>")
+
+        elif re.match(r"(?is)^\.(?:addow|owtarget|rmowtarget)(?:\s+(.*))?$", text):
+            # .owtarget <name>  → SET the target name (replaces, never piles up)
+            # .owtarget a | b   → rotating names   |  .owtarget -g <name> → global
+            # .owtarget → show  |  .owtarget clear / .rmowtarget → remove
+            if not await verify_privileges(event, client=client): return
+            asyncio.create_task(event.delete())
+            _m_owt = re.match(r"(?is)^\.(addow|owtarget|rmowtarget)(?:\s+(.*))?$", text)
+            _is_rm = _m_owt.group(1).lower() == "rmowtarget"
+            _arg   = (_m_owt.group(2) or "").strip()
+            _glob  = False
+            if re.match(r"(?i)^-g(\s|$)", _arg):
+                _glob, _arg = True, _arg[2:].strip()
+            if _is_rm or _arg.lower() in ("clear", "reset", "off", "remove", "rm"):
+                _ok = _ow_engine.clear_names(cfg, my_id_str, chat_id, _glob)
+                save_config(cfg)
+                await safe_send_and_track(client, chat_id,
+                    f"<blockquote>{'🧹 <b>OW target name removed.</b>' if _ok else 'ℹ️ Koi target name set nahi tha.'}</blockquote>")
+                return
+            if not _arg:
+                _cur = _ow_engine.get_names(cfg, my_id_str, chat_id)
+                await safe_send_and_track(client, chat_id,
+                    "<blockquote>🎯 <b>OW target name</b> (<code>.nameow</code>)\n"
+                    + ("\n".join(f"  • <code>{_html_escape(w)}</code>" for w in _cur)
+                       if _cur else "  <i>none set</i>")
+                    + "</blockquote>")
+                return
+            _names = _ow_engine.parse_names(_arg)
+            if not _names:
+                await safe_send_and_track(client, chat_id,
+                    "<blockquote>❌ <b>Naam khali hai.</b> Example: <code>.owtarget rahul</code></blockquote>")
+                return
+            _ow_engine.set_names(cfg, my_id_str, chat_id, _names, _glob)
             save_config(cfg)
             asyncio.create_task(send_module_log(
-                f"🎯 <b>OW Target Words</b>\nChat: <code>{chat_id}</code>  "
-                f"Added: <code>{len(new_words)}</code>  Total: <code>{len(_store[_ckey])}</code>"))
+                f"🎯 <b>OW Target Name</b>\nChat: <code>{chat_id}</code>  Names: <code>{len(_names)}</code>"))
             await safe_send_and_track(client, chat_id,
-                f"<blockquote>🎯 <b>Added target name:</b> <code>{target_name}</code>  "
-                f"Total: <code>{len(_store[_ckey])}</code>\n"
-                f"<i>Yahi text/name .ow firing me use hoga.</i></blockquote>")
-
+                f"<blockquote>🎯 <b>Target name set:</b> <code>{_html_escape(' | '.join(_names))}</code>\n"
+                f"<i>Reply karke <code>.nameow</code> → \"{_html_escape(_names[0])} &lt;word&gt;\" "
+                f"(naam alag unit, har message me ek word).</i></blockquote>")
 
         elif re.match(r"(?i)^\.mastersync(?:\s+(on|off))?$", text):
             # Bug fix: .mastersync was documented in /help but had no actual
@@ -9724,12 +9725,18 @@ def create_event_handler(client, core_id=None):
                 "raid":       ".raid [count] [@/reply] — Spam N abuse msgs at target",
                 "rraid":      ".rraid [@/reply] — Auto-reply abuse on every target msg",
                 "spam":       ".spam [count] [text] — Repeat custom text N times",
-                "ow":         ".ow [@/reply] — Continuous reply spam from ow.txt",
+                "ow":         ".ow [@/reply] — Normal OW: ow.txt words (no name). Variants: .nameow, .lineow",
                 "fuck":       ".fuck [@/reply] — Infinite abuse reply loop",
                 "tagall":     ".tagall [msg] — Tag all members in batches of 5",
                 "otagall":    ".otagall [msg] — Odisha tagall (odisha_tagall.txt lines)",
                 "addow":      ".addow word1, word2 — OW me bich bich me yahi words aayenge",
-                "addowline":  ".addowline <line> — OW sirf yahi exact line(s) fire karega",
+                "addowline":  ".addowline <line> — line save karo (multi-line ok). <code>.lineow</code> us line ka ek-ek word loop me fire karta hai. List: .addowline | -g = global",
+                "rmowline":   ".rmowline <no.|1-3|text|all> — saved OW line(s) hatao",
+                "rmowtarget": ".rmowtarget — saved OW target name hatao",
+                "nameow":     ".nameow (reply) — OW, har message me \"naam word\" (naam .owtarget se, ek alag unit)",
+                "lineow":     ".lineow (reply) — .addowline ki lines ka ek-ek word loop me fire",
+                "ar":         ".ar — Auto reaction panel. <code>.ar on|off|random|same 🔥|who all/me/others/users|user|pool|chance|delay|status</code>",
+                "raidnc":     ".raidnc <n> — group ka naam n baar badalta hai (raid theme). Baaki: .frostnc .venomnc .voidnc .snc .shutupnc .doggync. Stop: .stopall / .stopnc",
                 "multi":      ".multi @u1 @u2 (ya reply) — sirf in users ke naye msg pe tag + fire",
                 "onetag":     ".onetag [msg] — Tag each member one-by-one",
                 "sraid":      ".sraid (reply) — Smart reply raid using sraid.txt lines",
@@ -9829,9 +9836,10 @@ def create_event_handler(client, core_id=None):
                               "deleted, and the alias is never removed after firing.\n"
                               ".cmnd [name] [free text] instead creates a text-reply command.",
                 "cmndrmall":  ".cmndrmall — Reset every custom text command and module alias for this core.",
-                "owtarget":   ".owtarget [text/name] — Save exactly the text you provide and use it in .ow replies. "
-                              "Username/ID lookup is not used. .owtarget alone lists saved text; "
-                              ".owtarget clear wipes it. <b>Example:</b> <code>.owtarget Rahul ki maa</code>.",
+                "owtarget":   ".owtarget [name] — Target ka naam SET karta hai (replace, jama nahi hota). "
+                              "<code>.nameow</code> me naam ek alag unit ban ke aata hai: <i>rahul aaja</i>. "
+                              ".owtarget alone = show; .owtarget clear / .rmowtarget = remove; "
+                              "<code>a | b</code> = rotating names. <b>Example:</b> <code>.owtarget rahul</code>.",
                 "rmcmnd":     ".rmcmnd [name] — Remove a custom TEXT command. "
                               "Module aliases cannot be removed.",
                 "mastersync": ".mastersync [on/off] — Toggle master sync. When ON, owner commands "
@@ -10504,6 +10512,9 @@ def create_event_handler(client, core_id=None):
                 # (a single module handle used to be overwritten per chat).
                 _mod_stop(istate, tgt, chat_id)
                 _mod_stop(istate, tgt)
+                _fq = _FLOOD_STATE.get((my_id, chat_id))
+                if _fq:
+                    _fq["queue"] = []   # stopped loops must not flush stale replies later
                 await asyncio.sleep(0)   # yield so cancellation propagates immediately
                 istate.last_target_msg[chat_id] = None
                 asyncio.create_task(send_module_log(

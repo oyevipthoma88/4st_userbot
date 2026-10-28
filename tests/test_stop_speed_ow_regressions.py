@@ -25,11 +25,18 @@ def test_every_long_running_module_is_stop_flag_aware():
         assert probe in SOURCE, probe
 
 
-def test_ow_target_words_replace_the_default_stream():
-    # .owtarget words used to fire only on every third message.
+def test_ow_variants_share_one_engine():
     assert '_word_idx % 3 == 0' not in SOURCE
-    assert '_use_custom = (mode == "ow" and _ow_custom' in SOURCE
-    assert "_ow_pool = _ow_lines if (mode == \"ow\" and _ow_lines) else []" in SOURCE
+    assert "_ow_engine.build_feed(" in SOURCE
+    assert "(ow|fuck|nameow|lineow)" in SOURCE
+    # multi-line .addowline / .owtarget arguments must parse (DOTALL)
+    assert 'r"(?is)^\\.(?:addowline|owline)' in SOURCE
+
+
+def test_ow_start_replaces_older_loop_and_flood_is_per_account():
+    assert "_old.cancel()" in SOURCE
+    assert "_FLOOD_STATE.get((me_id, chat_id))" in SOURCE
+    assert "_FLOOD_QUEUE_MAX = 50" in SOURCE
 
 
 def test_speed_floor_and_clamp():

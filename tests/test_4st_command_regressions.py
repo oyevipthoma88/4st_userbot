@@ -20,16 +20,15 @@ def test_runtime_ow_cleaner_is_used_for_ow_path():
     assert "lines = [_clean_ow_line(line) for line in lines]" in source
 
 
-def test_owtarget_stores_exact_user_text_and_firing_uses_custom_word():
+def test_owtarget_sets_name_through_engine_and_has_remove_commands():
     source = (ROOT / "main.py").read_text(encoding="utf-8")
-    target_block = source.split("elif re.match(r\"(?i)^\\.(?:addow|owtarget)", 1)[1].split(
+    target_block = source.split('elif re.match(r"(?is)^\\.(?:addow|owtarget|rmowtarget)', 1)[1].split(
         'elif re.match(r"(?i)^\\.mastersync', 1
     )[0]
     assert "resolve_target" not in target_block
-    assert "new_words = [_clean_ow_line(_arg)]" in target_block
-    assert "target_name = new_words[0]" in target_block
-    assert "_humanize_ow_line(" in source
-    assert "_ow_custom[_cust_idx % len(_ow_custom)]" in source
+    assert "_ow_engine.set_names(" in target_block
+    assert "_ow_engine.clear_names(" in target_block
+    assert "_ow_engine.remove_lines(" in source
 
 
 def test_cmndrmall_resets_aliases_and_text_commands():
