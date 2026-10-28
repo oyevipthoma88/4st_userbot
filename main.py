@@ -1365,12 +1365,13 @@ _CODE_COMMAND_INDEX = (
     'rmowline',
     'rmowtarget',
     'nameow',
+    'naow',
     'lineow',
     'ar',
     'autoreaction',
     'raidnc',
     'frostnc',
-    'venomnc',
+    'apexnc',
     'voidnc',
     'snc',
     'shutupnc',
@@ -7375,8 +7376,8 @@ def create_event_handler(client, core_id=None):
                 _sections = [
                     ("🔥", "COMBAT", ".raid .rraid .spam .gspam .fuck .ow .ghost .sraid .stopsraid .multi .stop"),
                     ("📢", "BROADCAST", ".bcast .tagall .otagall .onetag .targetlist .addtarget .rmtarget .rmtargetall .fbcast"),
-                    ("🏷️", "OW CUSTOM", ".owtarget .rmowtarget .addowline .rmowline .nameow .lineow .stopow .stopfuck"),
-                    ("💫", "AUTO REACT &amp; NC", ".ar .autoreaction .raidnc .frostnc .venomnc .voidnc .snc .shutupnc .doggync .stopnc"),
+                    ("🏷️", "OW CUSTOM", ".owtarget .rmowtarget .addowline .rmowline .nameow .naow .lineow .stopow .stopfuck"),
+                    ("💫", "AUTO REACT &amp; NC", ".ar .autoreaction .raidnc .frostnc .apexnc .voidnc .snc .shutupnc .doggync .stopnc"),
                     ("👑", "ADMIN", ".ban .unban .mute .unmute .promote .demote .banall .pin .unpin .purge .warn .unwarn .warnlist .delall .forcepromote"),
                     ("🛡️", "SECURITY", ".dmsec .gcsec .safemode .sudoadd .sudoaddfull .sudorm .sudolist .mastersync .config"),
                     ("🔍", "SCAN (Owner)", ".scan .scanbot .scanub .scanws .scanlog .scanids"),
@@ -7420,8 +7421,8 @@ def create_event_handler(client, core_id=None):
                     ("🔥", "COMBAT", ".raid .rraid .spam .gspam .fuck .ow .ghost .sraid .stopsraid .multi .stop"),
                     ("📢", "BROADCAST", ".bcast .tagall .otagall .onetag .targetlist .addtarget .rmtarget .rmtargetall"),
                     ("🌱", "GROW", ".forcejoin"),
-                    ("🏷️", "OW CUSTOM", ".owtarget .rmowtarget .addowline .rmowline .nameow .lineow .stopow .stopfuck"),
-                    ("💫", "AUTO REACT &amp; NC", ".ar .autoreaction .raidnc .frostnc .venomnc .voidnc .snc .shutupnc .doggync .stopnc"),
+                    ("🏷️", "OW CUSTOM", ".owtarget .rmowtarget .addowline .rmowline .nameow .naow .lineow .stopow .stopfuck"),
+                    ("💫", "AUTO REACT &amp; NC", ".ar .autoreaction .raidnc .frostnc .apexnc .voidnc .snc .shutupnc .doggync .stopnc"),
                     ("👑", "ADMIN", ".ban .unban .mute .unmute .promote .demote .pin .unpin .purge .warn .unwarn .warnlist .delall"),
                     ("🛡️", "SECURITY", ".dmsec .safemode .config" + (" .sudolist" if sender_role in ("sudo_1", "sudo_2") else "")),
                     ("🤖", "AI &amp; FUN", ".setmode .mimic .fun .anim .dice .hack .magic .bomb .moon .rocket .hearts"),
@@ -8389,11 +8390,13 @@ def create_event_handler(client, core_id=None):
             finally:
                 _mod_finish(istate, "spam", dest)
 
-        elif re.match(r"(?i)^\.(g)?(ow|fuck|nameow|lineow)(?:\s+(.+?))?(?:\s+(-?\d+))?$", text):
+        elif re.match(r"(?i)^\.(g)?(ow|fuck|nameow|naow|lineow)(?:\s+(.+?))?(?:\s+(-?\d+))?$", text):
             if not await verify_privileges(event, client=client): return
-            m        = re.search(r"(?i)^\.(g)?(ow|fuck|nameow|lineow)(?:\s+(.+?))?(?:\s+(-?\d+))?$", text)
+            m        = re.search(r"(?i)^\.(g)?(ow|fuck|nameow|naow|lineow)(?:\s+(.+?))?(?:\s+(-?\d+))?$", text)
             is_ghost = bool(m.group(1))
             variant  = m.group(2).lower()          # ow | fuck | nameow | lineow
+            if variant == "naow":
+                variant = "nameow"
             # nameow / lineow are OW flavours: same module key, speed, font,
             # typing flag and .stopow — only the payload differs.
             mode     = "fuck" if variant == "fuck" else "ow"
@@ -9733,10 +9736,10 @@ def create_event_handler(client, core_id=None):
                 "addowline":  ".addowline <line> — line save karo (multi-line ok). <code>.lineow</code> us line ka ek-ek word loop me fire karta hai. List: .addowline | -g = global",
                 "rmowline":   ".rmowline <no.|1-3|text|all> — saved OW line(s) hatao",
                 "rmowtarget": ".rmowtarget — saved OW target name hatao",
-                "nameow":     ".nameow (reply) — OW, har message me \"naam word\" (naam .owtarget se, ek alag unit)",
+                "nameow":     ".nameow / .naow (reply) — normal OW chalta hai, beech-beech me sahi jagah target ka naam (.owtarget) ek alag unit ban ke aata hai: \"rahul TERI\"",
                 "lineow":     ".lineow (reply) — .addowline ki lines ka ek-ek word loop me fire",
                 "ar":         ".ar — Auto reaction panel. <code>.ar on|off|random|same 🔥|who all/me/others/users|user|pool|chance|delay|status</code>",
-                "raidnc":     ".raidnc <n> — group ka naam n baar badalta hai (raid theme). Baaki: .frostnc .venomnc .voidnc .snc .shutupnc .doggync. Stop: .stopall / .stopnc",
+                "raidnc":     ".raidnc <n> — group ka naam n baar badalta hai (raid theme). Baaki: .frostnc .apexnc .voidnc .snc .shutupnc .doggync. Stop: .stopall / .stopnc",
                 "multi":      ".multi @u1 @u2 (ya reply) — sirf in users ke naye msg pe tag + fire",
                 "onetag":     ".onetag [msg] — Tag each member one-by-one",
                 "sraid":      ".sraid (reply) — Smart reply raid using sraid.txt lines",

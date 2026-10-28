@@ -1,5 +1,5 @@
 # plugins/nc_suite.py — name-change loops
-#   .raidnc <n>  .frostnc <n>  .venomnc <n>  .voidnc <n>
+#   .raidnc <n>  .frostnc <n>  .apexnc <n>  .voidnc <n>
 #   .snc <n>     .shutupnc <n> .doggync <n>
 #   stop: .stopall / .stop / .stopnc / .stop<theme>nc
 # Logic lives in nc_engine.py.
@@ -13,7 +13,7 @@ import nc_engine as nc
 from plugins._common import is_authorized
 
 PLUGIN_NAME = "NC Suite"
-PLUGIN_CMDS = [".raidnc <n>", ".frostnc <n>", ".venomnc <n>", ".voidnc <n>",
+PLUGIN_CMDS = [".raidnc <n>", ".frostnc <n>", ".apexnc <n>", ".voidnc <n>",
                ".snc <n>", ".shutupnc <n>", ".doggync <n>", ".stopnc"]
 
 

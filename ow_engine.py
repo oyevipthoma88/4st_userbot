@@ -5,9 +5,9 @@ Kept free of Telegram imports so every rule has an executable test.
 Commands
 --------
 .ow        plain ow.txt words, one word per message (no personalisation).
-.nameow    ow.txt words, each message is "<name> <word>" — the saved target
-           name is ONE unit (never split, never merged with other words):
-           "rahul aaja", "rahul beta" ...
+.nameow    (alias .naow) the regular .ow stream, with the saved target name
+           dropped in between at phrase starts as ONE unit glued to that
+           word: "AJAA", "BETA", "rahul TERI", "MA", ... (see _name_weave)
 .lineow    every saved .addowline line is split into words and the words are
            fired one by one, forever, line after line:
            line "tu bhaag mat" -> "tu", "bhaag", "mat", next line ...
@@ -193,9 +193,47 @@ def build_feed(variant: str, base_words: List[str], names: List[str],
     if variant == "nameow":
         if not names:
             raise ValueError("no-name")
-        return (f"{names[i % len(names)]} {w}"
-                for i, w in enumerate(itertools.cycle(words)))
+        return _name_weave(words, names)
     return itertools.cycle(words)
+
+
+NAME_MIN_GAP = 3   # at least this many plain OW words between two names
+NAME_MAX_GAP = 6   # never more than this many plain words without the name
+_END_PUNCT = tuple(".!?,;:।|…")
+
+
+def _is_boundary(prev_word: str) -> bool:
+    """A phrase ended right before this spot ("BACCHE." / "chal!")."""
+    return bool(prev_word) and prev_word.rstrip().endswith(_END_PUNCT)
+
+
+def _name_weave(words: List[str], names: List[str]) -> Iterator[str]:
+    """Regular OW word stream with the target name dropped in at the right spot.
+
+    * every message is still the normal ow.txt word, in order;
+    * the name is ONE unit glued in front of the word that starts a phrase:
+      "rahul TERI", never "ra hul" or "TERI rahul MA";
+    * a phrase start = start of ow.txt, or right after a word ending in . ! ? , etc.;
+    * the name never comes twice within NAME_MIN_GAP words and never waits
+      more than NAME_MAX_GAP words (so it keeps appearing in the middle);
+    * several names rotate.
+    """
+    n = len(words)
+    gap = NAME_MAX_GAP  # so the very first message carries the name
+    ni = 0
+    i = 0
+    while True:
+        w = words[i % n]
+        prev = words[(i - 1) % n] if i else ""
+        boundary = (i % n == 0) or _is_boundary(prev)
+        if gap >= NAME_MAX_GAP or (boundary and gap >= NAME_MIN_GAP):
+            yield f"{names[ni % len(names)]} {w}"
+            ni += 1
+            gap = 0
+        else:
+            yield w
+            gap += 1
+        i += 1
 
 
 def feed_error_text(err: str) -> str:

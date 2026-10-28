@@ -28,7 +28,7 @@ def test_every_long_running_module_is_stop_flag_aware():
 def test_ow_variants_share_one_engine():
     assert '_word_idx % 3 == 0' not in SOURCE
     assert "_ow_engine.build_feed(" in SOURCE
-    assert "(ow|fuck|nameow|lineow)" in SOURCE
+    assert "(ow|fuck|nameow|naow|lineow)" in SOURCE
     # multi-line .addowline / .owtarget arguments must parse (DOTALL)
     assert 'r"(?is)^\\.(?:addowline|owline)' in SOURCE
 

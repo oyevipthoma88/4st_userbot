@@ -19,7 +19,7 @@ DEFAULT_DELAY = 2.0
 THEMES: Dict[str, str] = {
     "raid": "RAID",
     "frost": "FROST",
-    "venom": "VENOM",
+    "apex": "APEX",
     "void": "VOID",
     "s": "SNC",
     "shutup": "SHUTUP",
@@ -35,9 +35,9 @@ _FRAMES: Dict[str, List[str]] = {
         "❄️ FROST ❄️", "🧊 FROZEN 🧊", "☃️ FROST BITE ☃️", "🥶 ICE AGE 🥶",
         "❄️ WINTER ❄️", "🌨️ BLIZZARD 🌨️", "💎 FROST CORE 💎", "🧊 DEEP FREEZE 🧊",
     ],
-    "venom": [
-        "☠️ VENOM ☠️", "🐍 VENOM BITE 🐍", "🧪 TOXIC 🧪", "🕷️ VENOM WEB 🕷️",
-        "💀 VENOM ZONE 💀", "🟢 POISON 🟢", "🐍 SNAKE PIT 🐍", "☣️ BIOHAZARD ☣️",
+    "apex": [
+        "👑 APEX 👑", "🔱 APEX LORD 🔱", "⚡ APEX POWER ⚡", "🏔️ APEX PEAK 🏔️",
+        "🦅 APEX HUNTER 🦅", "💎 APEX CORE 💎", "🔥 APEX RISE 🔥", "🐺 APEX PREDATOR 🐺",
     ],
     "void": [
         "🌑 VOID 🌑", "🕳️ THE VOID 🕳️", "🌌 VOID WALK 🌌", "⚫ NOTHING ⚫",

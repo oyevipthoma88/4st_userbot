@@ -15,9 +15,27 @@ def test_plain_ow_fires_one_word_per_message():
     assert take(ow.build_feed("ow", ["AJAA", "BETA"], ["rahul"], ["x y"]), 3) == ["AJAA", "BETA", "AJAA"]
 
 
-def test_nameow_puts_name_as_one_separate_unit_with_one_word():
-    feed = ow.build_feed("nameow", ["aaja", "beta"], ["rahul ki maa"], [])
-    assert take(feed, 2) == ["rahul ki maa aaja", "rahul ki maa beta"]
+def test_nameow_keeps_regular_ow_and_drops_name_in_at_phrase_start():
+    words = ["AJAA", "BETA", "TERI", "MA", "KA", "BACCHE.", "TERI", "MA", "Ko", "CHODa"]
+    out = take(ow.build_feed("nameow", words, ["rahul ki maa"], []), 10)
+    # name is one unit, glued in front of the phrase-starting word
+    assert out[0] == "rahul ki maa AJAA"
+    assert out[6] == "rahul ki maa TERI"   # right after "BACCHE."
+    # every other message is the plain regular OW word, in order
+    plain = [w for k, w in enumerate(out) if k not in (0, 6)]
+    assert plain == [w for k, w in enumerate(words) if k not in (0, 6)]
+
+
+def test_nameow_name_never_waits_more_than_max_gap():
+    out = take(ow.build_feed("nameow", list("abcdefghijklmnop"), ["rahul"], []), 16)
+    hits = [k for k, w in enumerate(out) if w.startswith("rahul ")]
+    assert hits == [0, 7, 14]
+
+
+def test_naow_alias_registered():
+    import pathlib
+    src = pathlib.Path(__file__).resolve().parents[1].joinpath("main.py").read_text()
+    assert "nameow|naow|lineow" in src
 
 
 def test_lineow_fires_every_word_of_every_line_in_a_loop():
@@ -112,7 +130,7 @@ def test_ar_extracts_glued_emoji():
 
 # ── NC ──────────────────────────────────────────────────────────────────────
 def test_nc_parse_all_commands_and_count():
-    for cmd in ("raid", "frost", "venom", "void", "s", "shutup", "doggy"):
+    for cmd in ("raid", "frost", "apex", "void", "s", "shutup", "doggy"):
         assert nc.parse(f".{cmd}nc 7")[:2] == (cmd, 7)
     assert nc.parse(".raidnc") == ("raid", nc.DEFAULT_COUNT, None)
     assert nc.parse(".raidnc 99999")[1] == nc.MAX_COUNT
