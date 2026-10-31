@@ -13,3 +13,5 @@
 - Close shared HTTP sessions on the original event loop after cancelling producers; never send login credentials in notification messages.
 - Keep OW payload rules, auto-reaction decisions and NC title generation in ow_engine.py, autoreact_engine.py and nc_engine.py (no Telegram imports) so they stay unit-tested; handlers only wire Telegram I/O.
 - Key FloodWait queues by (account, chat) and bound them; one module worker per (module, chat) — a new start cancels the old one.
+- Port third-party Pyrogram animations via plugins/aaa_stranger_animations.py shim (vendored sources in plugins/_stranger_anims/); replace author branding with the running account's name at send time, and let other animation plugins skip commands it owns.
+- Active Grid visibility goes through runtime_safety.grid_core_visible using CORE_CONTROLLERS (core -> assistant user who logged it in); owner sees all.

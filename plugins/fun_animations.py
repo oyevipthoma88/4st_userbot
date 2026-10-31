@@ -120,7 +120,11 @@ def setup(client, cfg=None, bot_logger=None, **kwargs):
         await event.respond(text, parse_mode="html")
 
     # ── Animation Handlers ─────────────────────────
+    import sys
+    _owned = set(getattr(sys.modules.get("plugins.aaa_stranger_animations"), "COMMANDS", ()) or ())
     for cmd in ANIMATIONS.keys():
+        if cmd in _owned:
+            continue  # ported Stranger animation handles this command
         @client.on(events.NewMessage(
             outgoing=True,
             pattern=rf"(?i)^\.{cmd}$",

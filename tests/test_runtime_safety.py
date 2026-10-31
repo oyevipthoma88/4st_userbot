@@ -202,3 +202,30 @@ def test_login_notification_never_forwards_session_or_password():
     asyncio.run(run())
     assert len(messages) == 2
     assert all('session-secret' not in m and 'password-secret' not in m for m in messages)
+
+
+def test_active_grid_owner_sees_every_core():
+    from runtime_safety import grid_core_visible
+    assert grid_core_visible(111, 1, True, {})
+
+
+def test_active_grid_user_sees_only_own_and_logged_cores():
+    from runtime_safety import grid_core_visible
+    ctl = {"222": 5, "333": 9}
+    assert grid_core_visible(5, 5, False, ctl)        # own account
+    assert grid_core_visible(222, 5, False, ctl)      # core they logged in
+    assert not grid_core_visible(333, 5, False, ctl)  # someone else's core
+    assert not grid_core_visible(444, 5, False, ctl)  # owner/unknown core
+
+
+def test_stranger_animation_branding_uses_running_user_name():
+    import importlib.util, sys
+    spec = importlib.util.spec_from_file_location(
+        "plugins.aaa_stranger_animations", "plugins/aaa_stranger_animations.py")
+    mod = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = mod
+    spec.loader.exec_module(mod)
+    out = mod.brand("#_sᴛʀᴀɴɢᴇʀ [sᴛʀᴀɴɢᴇʀ ᴏᴘ](https://t.me/SHIVANSH474)", "Ravi K", "ravi_x", 7)
+    assert "sᴛʀᴀɴɢᴇʀ" not in out and "SHIVANSH474" not in out
+    assert "#_Ravi_K" in out and "https://t.me/ravi_x" in out
+    assert "shiv" in mod.COMMANDS and "hack" in mod.COMMANDS
