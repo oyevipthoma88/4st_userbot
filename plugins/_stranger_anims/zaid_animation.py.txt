@@ -173,7 +173,7 @@ async def hello_world(client: Client, message: Message):
 
 
 @Client.on_message(
-    filters.me & (filters.command(["shiv"], ".") | filters.regex("^shiv"))
+    filters.me & (filters.command(["apex"], ".") | filters.regex("^apex"))
 )
 async def hello_world(client: Client, message: Message):
     mg = await edit_or_reply(message, "sᴛʀᴀɴɢᴇʀ")
