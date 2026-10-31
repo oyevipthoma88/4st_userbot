@@ -1495,6 +1495,7 @@ _CODE_COMMAND_INDEX = (
     'whois',
     'anim',
     'funlist',
+    'animlist',
     'ytdl',
 )
 
@@ -7401,7 +7402,7 @@ def create_event_handler(client, core_id=None):
                     ("🛡️", "SECURITY", ".dmsec .gcsec .safemode .sudoadd .sudoaddfull .sudorm .sudolist .mastersync .config"),
                     ("🔍", "SCAN (Owner)", ".scan .scanbot .scanub .scanws .scanlog .scanids"),
                     ("🌱", "GROW (Owner)", ".growadd .forcejoin .fjadd .fjrm"),
-                    ("🤖", "AI &amp; FUN", ".setmode .mimic .fun .anim .dice .hack .magic .bomb .moon .rocket .hearts"),
+                    ("🤖", "AI &amp; FUN", ".setmode .mimic .fun .anim .dice .hack .magic .bomb .moon .rocket .hearts .funlist .animlist"),
                     ("🛠️", "TOOLS", ".tr .weather .ytdl .calc .kang .qout .rev .upper .lower .info .whois .clone .revert .unclone .nh .id .afk"),
                     ("⚙️", "SETTINGS", ".setbrand .resetbrand .speed .font .typing .startpic .cmnd .rmcmnd .cmndrmall .restart"),
                     ("🎵", "MUSIC", ".play .vplay .skip .pause .resume .playforce .queue .loop .mstatus .mend .forall .forme"),
@@ -7444,7 +7445,7 @@ def create_event_handler(client, core_id=None):
                     ("💫", "AUTO REACT &amp; NC", ".ar .autoreaction .raidnc .frostnc .apexnc .voidnc .snc .shutupnc .doggync .stopnc"),
                     ("👑", "ADMIN", ".ban .unban .mute .unmute .promote .demote .pin .unpin .purge .warn .unwarn .warnlist .delall"),
                     ("🛡️", "SECURITY", ".dmsec .safemode .config" + (" .sudolist" if sender_role in ("sudo_1", "sudo_2") else "")),
-                    ("🤖", "AI &amp; FUN", ".setmode .mimic .fun .anim .dice .hack .magic .bomb .moon .rocket .hearts"),
+                    ("🤖", "AI &amp; FUN", ".setmode .mimic .fun .anim .dice .hack .magic .bomb .moon .rocket .hearts .funlist .animlist"),
                     ("🛠️", "TOOLS", ".tr .weather .ytdl .calc .kang .qout .rev .upper .lower .info .whois .clone .revert .unclone .nh .id .afk"),
                     ("⚙️", "SETTINGS", ".speed .font .typing .cmnd .rmcmnd"),
                     ("🎵", "MUSIC", ".play .vplay .skip .pause .resume" + (" .playforce" if sender_role in ("sudo_1", "sudo_2") else "") + " .queue .loop .mstatus .mend"),
@@ -9742,6 +9743,7 @@ def create_event_handler(client, core_id=None):
                 "whois":      ".whois [@user/id/reply] — User ki full info (ID, DC, Bio, username) check karein.",
                 "anim":       ".anim — Available fun animations ki list dekhein (e.g. .love, .magic, .hack, .bomb).",
                 "funlist":    ".funlist — Text animations aur fun triggers list.",
+                "animlist":   ".animlist — Stranger animations list.",
                 "forcejoin":  ".forcejoin [link/channel] — All logged-in IDs ko channel me fast concurrent join karayein.",
                 "how":        ".how [command] — Show syntax and examples.\n<b>Example:</b> <code>.how gban</code>",
                 "raid":       ".raid [count] [@/reply] — Spam N abuse msgs at target",
