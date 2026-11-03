@@ -302,6 +302,36 @@ def _codepoint_to_utf16_offsets(text):
     return offsets
 
 
+from premium_emoji import clean_pool, build_alt_map, pick_premium_id
+
+PREMIUM_EMOJI_IDS[:] = clean_pool(PREMIUM_EMOJI_IDS)
+TAG_PREMIUM_EMOJI_IDS[:] = clean_pool(TAG_PREMIUM_EMOJI_IDS)
+_PREMIUM_ALT_MAP = {}
+_PREMIUM_ALT_LEARNED = [False]
+
+
+async def _learn_premium_alts(client):
+    """Ask Telegram once which normal emoji each premium ID represents, so
+    every emoji is replaced by a premium version of the SAME emoji."""
+    if _PREMIUM_ALT_LEARNED[0]:
+        return
+    _PREMIUM_ALT_LEARNED[0] = True
+    try:
+        from telethon.tl.functions.messages import GetCustomEmojiDocumentsRequest
+        ids = list(dict.fromkeys(PREMIUM_EMOJI_IDS + TAG_PREMIUM_EMOJI_IDS))
+        pairs = []
+        for i in range(0, len(ids), 100):
+            docs = await client(GetCustomEmojiDocumentsRequest(document_id=ids[i:i + 100]))
+            for d in docs:
+                for a in getattr(d, "attributes", []) or []:
+                    alt = getattr(a, "alt", None)
+                    if alt and type(a).__name__ == "DocumentAttributeCustomEmoji":
+                        pairs.append((d.id, alt))
+        _PREMIUM_ALT_MAP.update(build_alt_map(pairs))
+    except Exception:
+        pass  # keep stable pool picks; don't retry on every message
+
+
 def inject_premium_emojis(text, entities, pool):
     """Overlay a MessageEntityCustomEmoji on top of every plain emoji found in `text`."""
     if not text or not pool:
@@ -318,7 +348,7 @@ def inject_premium_emojis(text, entities, pool):
             continue
         new_entities.append(types.MessageEntityCustomEmoji(
             offset=u16_start, length=u16_len,
-            document_id=random.choice(pool)
+            document_id=pick_premium_id(match.group(0), pool, _PREMIUM_ALT_MAP) or pool[0]
         ))
     return new_entities
 
@@ -329,6 +359,8 @@ async def _premiumize_outgoing(client, message, kwargs):
             return message, kwargs
         if not await is_self_premium(client):
             return message, kwargs
+        if not _PREMIUM_ALT_LEARNED[0]:
+            await _learn_premium_alts(client)
 
         entities = kwargs.get("formatting_entities")
         if entities:
@@ -4402,9 +4434,9 @@ def _render_start_menu(sender_id: int, sender=None, is_owner: bool = None):
 
     if is_owner:
         about_text = (
-            "<blockquote><b>\U0001f451 4ST PRIME \u2014 MASTER CONTROL</b>\n"
+            "<blockquote><b>\U0001f451 4ST PRIME \u2014 MASTER CONTROL \U0001f451</b>\n"
             "\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\n"
-            "  Welcome back, Emperor. Grid is online.\n\n"
+            "  \u2728 Welcome back, Emperor. Grid is online. \U0001f7e2\n\n"
             "  \u26a1 <b>Engine</b>  \u00b7 Ultra-Fast Telethon Core\n" +
             (f"  \U0001f3b5 <b>Music</b>   \u00b7 {music_st}\n" if MUSIC_ENABLED
              else "  \U0001f6e1 <b>Core</b>    \u00b7 Admin + AI modules\n") +
@@ -4428,7 +4460,7 @@ def _render_start_menu(sender_id: int, sender=None, is_owner: bool = None):
              Button.inline("\U0001f465 Force Join", b"forcejoin_panel")],
             [Button.inline("\U0001f512 Must Join Settings", b"must_join_panel")],
             [Button.inline("\U0001f4a5 Auto Reactions Info", b"react_info")],
-            [Button.inline("\U0001f331 Grow \u2014 Mass Add + Promote", b"grow_panel")],
+            [Button.inline("\U0001f331 Grow \u2014 Mass Add", b"grow_panel")],
             [Button.inline(
                 f"\U0001f504 Master Sync: {'ON' if cfg.get('MASTER_SYNC', False) else 'OFF'}",
                 b"toggle_sync")],
@@ -4439,7 +4471,7 @@ def _render_start_menu(sender_id: int, sender=None, is_owner: bool = None):
         ] + _extra_link_row()
     elif is_active:
         about_text = (
-            "<blockquote><b>\U0001f6e1 4ST PRIME \u2014 ELITE OPERATOR</b>\n"
+            "<blockquote><b>\U0001f6e1 4ST PRIME \u2014 ELITE OPERATOR \u26a1</b>\n"
             "\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\n"
             "  Your core is registered \u2713 \u2014 all modules unlocked.\n\n"
             f"  \U0001f3b5 <b>Music</b> \u00b7 {music_st}\n"
@@ -4460,7 +4492,7 @@ def _render_start_menu(sender_id: int, sender=None, is_owner: bool = None):
         ] + _extra_link_row()
     else:
         about_text = (
-            "<blockquote><b>\u26a1 4ST PRIME CORE</b>\n"
+            "<blockquote><b>\u26a1 4ST PRIME CORE \u26a1</b>\n"
             "\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\n"
             "  <i>The fastest all-in-one Telegram userbot.</i>\n\n"
             "  \u2694\ufe0f <b>Combat Suite</b> \u2014 raid, spam, ow, sraid,\n"
@@ -7414,8 +7446,9 @@ def create_event_handler(client, core_id=None):
                 )
                 help_msg = (
                     "<blockquote>"
-                    f"⚡ <b>{_brand} · MASTER CONTROL</b> ⚡\n"
-                    "<i>Elite Telegram Userbot · Owner Edition</i>"
+                    f"👑 <b>{_brand} · MASTER CONTROL</b> 👑\n"
+                    "<i>✨ Elite Telegram Userbot · Owner Edition ✨</i>\n"
+                    "━━━━━━━━━━━━━━━━"
                     "</blockquote>\n"
                     "<blockquote>"
                     "👑 <b>Access:</b> <code>Master / Owner</code>\n"
@@ -7459,7 +7492,8 @@ def create_event_handler(client, core_id=None):
                 help_msg = (
                     "<blockquote>"
                     f"✨ <b>{_brand} · HELP MENU</b> ✨\n"
-                    "<i>Userbot Features &amp; Commands</i>"
+                    "<i>⚡ Userbot Features &amp; Commands ⚡</i>\n"
+                    "━━━━━━━━━━━━━━━━"
                     "</blockquote>\n"
                     "<blockquote>"
                     f"👤 <b>Access:</b> <code>{_role_label}</code>\n"
@@ -7517,6 +7551,12 @@ def create_event_handler(client, core_id=None):
                 _q = "🔴 <b>Timeout</b>"
                 _ms_str = "Timeout"
 
+            if isinstance(real_ms, (int, float)):
+                _bars = 5 if real_ms < 100 else 4 if real_ms < 250 else 3 if real_ms < 500 else 2 if real_ms < 1000 else 1
+            else:
+                _bars = 0
+            _ping_bar = "▰" * _bars + "▱" * (5 - _bars)
+
             _is_odia = cfg.get("BOT_LANG", "en").lower() in ("od", "odia", "or")
             _music_str = ("🟢 ସକ୍ରିୟ (VC)" if _music_ok else "⚪ ଷ୍ଟାଣ୍ଡବାଏ") if _is_odia else ("🟢 <code>Active (Pyro VC)</code>" if _music_ok else "⚪ <code>Standby</code>")
             _safemode_on = bool(cfg.get("SAFE_MODE_ENABLED", False))
@@ -7557,19 +7597,22 @@ def create_event_handler(client, core_id=None):
             else:
                 ping_payload = (
                     "<blockquote>"
-                    f"⚡ <b>{_brand} · SYSTEM ONLINE</b> ⚡\n"
-                    "<i>High-Performance Prime Engine</i>"
+                    f"⚡ <b>{_brand}</b> · <b>SYSTEM ONLINE</b> ⚡\n"
+                    "<i>✨ High-Performance Prime Engine ✨</i>"
                     "</blockquote>\n"
                     "<blockquote>"
-                    f"📡 <b>Latency:</b> <code>{_ms_str}</code> · {_q}\n"
-                    f"⏱️ <b>Uptime:</b> <code>{_uptime_str}</code>\n"
-                    f"🎵 <b>VC Music:</b> {_music_str}\n"
-                    f"🛡️ <b>Safe Mode:</b> {_safe_str}\n"
-                    f"⚙️ <b>Engine:</b> <code>Python {sys.version_info.major}.{sys.version_info.minor} · Telethon</code>\n"
-                    f"👤 <b>Master:</b> <a href='tg://user?id={my_id}'>{_brand}</a>{_caller_info}"
+                    f"🏓 <b>Pong!</b> <code>{_ms_str}</code> · {_q}\n"
+                    f"📶 <b>Signal:</b> <code>{_ping_bar}</code>\n"
+                    "━━━━━━━━━━━━━━━━\n"
+                    f"⏱️ <b>Uptime</b> ➜ <code>{_uptime_str}</code>\n"
+                    f"🎵 <b>VC Music</b> ➜ {_music_str}\n"
+                    f"🛡️ <b>Safe Mode</b> ➜ {_safe_str}\n"
+                    f"⚙️ <b>Engine</b> ➜ <code>Py {sys.version_info.major}.{sys.version_info.minor} · Telethon</code>\n"
+                    "━━━━━━━━━━━━━━━━\n"
+                    f"👑 <b>Master:</b> <a href='tg://user?id={my_id}'>{_brand}</a>{_caller_info}"
                     "</blockquote>\n"
                     "<blockquote>"
-                    "💡 <i>Type <code>.help</code> to view available commands</i>"
+                    "💡 <i>Type <code>.help</code> for all commands · <code>.how &lt;cmd&gt;</code> for usage</i>"
                     "</blockquote>"
                 )
             await safe_send_and_track(client, chat_id, ping_payload)
