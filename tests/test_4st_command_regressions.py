@@ -61,8 +61,6 @@ def test_animation_commands_are_unique_across_plugins():
     assert not ({"hack", "magic", "bomb", "moon", "ghost"} & (s | f | a))
 
 
-def test_slash_promote_only_targets_current_group():
+def test_bulk_slash_promote_commands_are_removed():
     src = open("main.py", encoding="utf-8").read()
-    i = src.index('elif re.match(r"(?i)^/promote(?:\\s+(.+))?$", text):')
-    block = src[i:src.index("elif re.match", i + 10)]
-    assert "_run_bulk_promotion" not in block and "promote_in_chat" in block
+    assert '^/promote' not in src and 'forcepromote' not in src and 'stoppromote' not in src
