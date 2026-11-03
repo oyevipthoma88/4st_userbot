@@ -229,4 +229,4 @@ def test_stranger_animation_branding_uses_running_user_name():
     assert "sᴛʀᴀɴɢᴇʀ" not in out and "SHIVANSH474" not in out
     assert "#_Ravi_K" in out and "https://t.me/ravi_x" in out
     assert "apex" in mod.COMMANDS and "shiv" not in mod.COMMANDS
-    assert "hack" in mod.COMMANDS
+    assert "strhack" in mod.COMMANDS and "hack" not in mod.COMMANDS
