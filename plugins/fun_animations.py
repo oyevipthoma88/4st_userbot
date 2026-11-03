@@ -7,11 +7,14 @@ import asyncio
 PLUGIN_NAME = "Fun Animations"
 PLUGIN_VERSION = "1.0.0"
 PLUGIN_CMDS = [
-    ".wtf", ".think", ".heart", ".clock", ".bigoof",
-    ".hack", ".fire", ".boom", ".clap", ".love",
-    ".magic", ".dance", ".laugh", ".cry", ".sleep",
+    ".wtfbro", ".think", ".funheart", ".clock", ".bigoof",
+    ".funhack", ".fire", ".boom", ".clap", ".iloveyou",
+    ".sparkle", ".dance", ".laugh", ".cry", ".sleep",
     ".funlist",
 ]
+
+# Unique names so no other plugin/main command double-fires.
+RENAMES = {'wtf': 'wtfbro', 'heart': 'funheart', 'hack': 'funhack', 'love': 'iloveyou', 'magic': 'sparkle'}
 
 ANIM_INTERVAL = 0.35
 
@@ -78,6 +81,10 @@ ANIMATIONS = {
     ],
 }
 
+for _o, _n in RENAMES.items():
+    ANIMATIONS[_n] = ANIMATIONS.pop(_o)
+
+
 async def run_animation(event, cmd):
     frames = ANIMATIONS.get(cmd)
     if not frames:
@@ -101,21 +108,21 @@ def setup(client, cfg=None, bot_logger=None, **kwargs):
         await event.delete()
         text = (
             "<b>🎉 Fun Animation Commands</b>\n\n"
-            "• <code>.wtf</code> — What The F... animation\n"
-            "• <code>.think</code> — THINKING glitch animation\n"
-            "• <code>.heart</code> — ❤️ Hearts rotation\n"
-            "• <code>.clock</code> — 🕐 Clock rotation\n"
-            "• <code>.bigoof</code> — ASCII art animation\n"
-            "• <code>.hack</code> — Fake hacking animation\n"
-            "• <code>.fire</code> — 🔥 Fire animation\n"
-            "• <code>.boom</code> — 💥 Explosion animation\n"
-            "• <code>.clap</code> — 👏 Clapping animation\n"
-            "• <code>.love</code> — I❤️L❤️O❤️V❤️E❤️Y❤️O❤️U❤️\n"
-            "• <code>.magic</code> — ✨ Magic sparkle animation\n"
-            "• <code>.dance</code> — 🕺💃 Dance animation\n"
-            "• <code>.laugh</code> — 😂🤣 Laughing animation\n"
-            "• <code>.cry</code> — 😢😭 Crying animation\n"
-            "• <code>.sleep</code> — 😴💤 Sleeping animation\n"
+            "✦ <code>.wtfbro</code> — What The F... animation\n"
+            "✦ <code>.think</code> — THINKING glitch animation\n"
+            "✦ <code>.funheart</code> — ❤️ Hearts rotation\n"
+            "✦ <code>.clock</code> — 🕐 Clock rotation\n"
+            "✦ <code>.bigoof</code> — ASCII art animation\n"
+            "✦ <code>.funhack</code> — Fake hacking animation\n"
+            "✦ <code>.fire</code> — 🔥 Fire animation\n"
+            "✦ <code>.boom</code> — 💥 Explosion animation\n"
+            "✦ <code>.clap</code> — 👏 Clapping animation\n"
+            "✦ <code>.iloveyou</code> — I❤️L❤️O❤️V❤️E❤️Y❤️O❤️U❤️\n"
+            "✦ <code>.sparkle</code> — ✨ Magic sparkle animation\n"
+            "✦ <code>.dance</code> — 🕺💃 Dance animation\n"
+            "✦ <code>.laugh</code> — 😂🤣 Laughing animation\n"
+            "✦ <code>.cry</code> — 😢😭 Crying animation\n"
+            "✦ <code>.sleep</code> — 😴💤 Sleeping animation\n"
         )
         await event.respond(text, parse_mode="html")
 
