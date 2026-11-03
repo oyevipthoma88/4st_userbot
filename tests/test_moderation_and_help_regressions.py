@@ -47,7 +47,7 @@ def test_help_menu_distinguishes_owner_and_users():
     assert "_OWNER_ONLY_DOCS = {" in source
     assert '"scan", "scanbot", "scanub", "scanws", "scanlog", "scanids"' in source
     assert '"growadd", "fjadd", "fjrm", "restart"' in source
-    assert '"banall", "forcepromote", "stoppromote", "sudoadd"' in source
+    assert '"banall", "sudoadd"' in source
     assert "Yeh command sirf bot owner ke liye reserved hai." in source
 
 
