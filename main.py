@@ -1400,7 +1400,6 @@ _CODE_COMMAND_INDEX = (
     'font',
     'forall',
     'forcejoin',
-    'forcepromote',
     'forme',
     'fun',
     'gcsec',
@@ -7398,18 +7397,19 @@ def create_event_handler(client, core_id=None):
                     ("📢", "BROADCAST", ".bcast .tagall .otagall .onetag .targetlist .addtarget .rmtarget .rmtargetall .fbcast"),
                     ("🏷️", "OW CUSTOM", ".owtarget .rmowtarget .addowline .rmowline .nameow .naow .lineow .stopow .stopfuck"),
                     ("💫", "AUTO REACT &amp; NC", ".ar .autoreaction .raidnc .frostnc .apexnc .voidnc .snc .shutupnc .doggync .stopnc"),
-                    ("👑", "ADMIN", ".ban .unban .mute .unmute .promote .demote .banall .pin .unpin .purge .warn .unwarn .warnlist .delall .forcepromote"),
+                    ("👑", "ADMIN", ".ban .unban .mute .unmute .promote .demote .banall .pin .unpin .purge .warn .unwarn .warnlist .delall"),
                     ("🛡️", "SECURITY", ".dmsec .gcsec .safemode .sudoadd .sudoaddfull .sudorm .sudolist .mastersync .config"),
                     ("🔍", "SCAN (Owner)", ".scan .scanbot .scanub .scanws .scanlog .scanids"),
                     ("🌱", "GROW (Owner)", ".growadd .forcejoin .fjadd .fjrm"),
                     ("🤖", "AI &amp; FUN", ".setmode .mimic .fun .anim .dice .hack .magic .bomb .moon .rocket .hearts .funlist .animlist"),
+                    ("🎭", "ANIMATIONS", ".funlist .animlist .anim .wtfbro .funheart .funhack .iloveyou .sparkle .strhack .strbomb .hackpro .lovewave .groove .boo"),
                     ("🛠️", "TOOLS", ".tr .weather .ytdl .calc .kang .qout .rev .upper .lower .info .whois .clone .revert .unclone .nh .id .afk"),
                     ("⚙️", "SETTINGS", ".setbrand .resetbrand .speed .font .typing .startpic .cmnd .rmcmnd .cmndrmall .restart"),
                     ("🎵", "MUSIC", ".play .vplay .skip .pause .resume .playforce .queue .loop .mstatus .mend .forall .forme"),
                 ]
                 _total_cmds = sum(len(cmds.split()) for _, _, cmds in _sections)
                 _body = "\n\n".join(
-                    f"{ic} <b>{title}</b>\n" + " ".join(f"<code>{c}</code>" for c in cmds.split())
+                    f"{ic} <b>{title}</b> <i>({len(cmds.split())})</i>\n" + " · ".join(f"<code>{c}</code>" for c in cmds.split())
                     for ic, title, cmds in _sections
                 )
                 help_msg = (
@@ -7446,13 +7446,14 @@ def create_event_handler(client, core_id=None):
                     ("👑", "ADMIN", ".ban .unban .mute .unmute .promote .demote .pin .unpin .purge .warn .unwarn .warnlist .delall"),
                     ("🛡️", "SECURITY", ".dmsec .safemode .config" + (" .sudolist" if sender_role in ("sudo_1", "sudo_2") else "")),
                     ("🤖", "AI &amp; FUN", ".setmode .mimic .fun .anim .dice .hack .magic .bomb .moon .rocket .hearts .funlist .animlist"),
+                    ("🎭", "ANIMATIONS", ".funlist .animlist .anim .wtfbro .funheart .funhack .iloveyou .sparkle .strhack .strbomb .hackpro .lovewave .groove .boo"),
                     ("🛠️", "TOOLS", ".tr .weather .ytdl .calc .kang .qout .rev .upper .lower .info .whois .clone .revert .unclone .nh .id .afk"),
                     ("⚙️", "SETTINGS", ".speed .font .typing .cmnd .rmcmnd"),
                     ("🎵", "MUSIC", ".play .vplay .skip .pause .resume" + (" .playforce" if sender_role in ("sudo_1", "sudo_2") else "") + " .queue .loop .mstatus .mend"),
                 ]
                 _total_cmds = sum(len(cmds.split()) for _, _, cmds in _sections)
                 _body = "\n\n".join(
-                    f"{ic} <b>{title}</b>\n" + " ".join(f"<code>{c}</code>" for c in cmds.split())
+                    f"{ic} <b>{title}</b> <i>({len(cmds.split())})</i>\n" + " · ".join(f"<code>{c}</code>" for c in cmds.split())
                     for ic, title, cmds in _sections
                 )
                 help_msg = (
@@ -7950,63 +7951,6 @@ def create_event_handler(client, core_id=None):
             istate.target_lists.pop(chat_id, None)
             await safe_send_and_track(client, chat_id,
                 f"<blockquote>🗑️ <b>All {_cnt} target(s) cleared.</b></blockquote>")
-
-        elif re.match(r"(?i)^[./]stoppromote$", text):
-            if not await verify_privileges(event, client=client, strict_owner_only=True):
-                return
-            job = _PROMOTION_JOBS.get(id(client))
-            if job and not job.done():
-                job.cancel()
-                await safe_send_and_track(client, chat_id, "Promotion cancellation requested.")
-            else:
-                await safe_send_and_track(client, chat_id, "No manual promotion is running.")
-
-        elif re.match(r"(?i)^/promote(?:\s+(.+))?$", text):
-            # /promote now promotes ONLY in the current group — it no longer
-            # adds/promotes the user across every group the account is in.
-            if not await verify_privileges(event, client=client, strict_owner_only=True):
-                return
-            _pm = re.match(r"(?i)^/promote(?:\s+(.+))?$", text)
-            _parg = (_pm.group(1) or "").strip()
-            if not _parg:
-                _rep = await event.get_reply_message()
-                _parg = _rep.sender_id if _rep else None
-            if not _parg or not event.is_group:
-                await safe_send_and_track(client, chat_id,
-                    "<blockquote>👑 Use <code>/promote @username</code> (or reply) inside a group.</blockquote>")
-                return
-            try:
-                _pt = await client.get_entity(_parg)
-                _pent = await event.get_chat()
-                _ok, _note = await promote_in_chat(client, _pent, _pt,
-                    ChatAdminRights(invite_users=True, pin_messages=True))
-            except Exception as _pe:
-                _ok, _note = False, str(_pe)[:150]
-            await safe_send_and_track(client, chat_id,
-                f"<blockquote>{'✅' if _ok else '❌'} <b>Promote:</b> {_html_escape(str(_note))}</blockquote>")
-
-        elif re.match(r"(?i)^[./]forcepromote(?:\s+(.+))?$", text):
-            if not await verify_privileges(event, client=client, strict_owner_only=True):
-                return
-            match = re.match(r"(?i)^[./]forcepromote(?:\s+(.+))?$", text)
-            target_arg = (match.group(1) or "").strip()
-            if not target_arg:
-                replied = await event.get_reply_message()
-                target_arg = replied.sender_id if replied else None
-            if not target_arg:
-                await safe_send_and_track(client, chat_id,
-                    "<blockquote>Use <code>/Promote @username</code> or reply to the target user.</blockquote>")
-                return
-            previous_job = _PROMOTION_JOBS.get(id(client))
-            if previous_job and not previous_job.done():
-                await safe_send_and_track(client, chat_id, "Promotion already running; use /stoppromote to cancel.")
-                return
-            proc = await safe_send_and_track(client, chat_id,
-                "<blockquote>👑 Adding + promoting in your eligible groups…</blockquote>")
-            task = asyncio.create_task(_run_bulk_promotion(client, target_arg, proc, chat_id))
-            _PROMOTION_JOBS[id(client)] = task
-            background_tasks.add(task)
-            task.add_done_callback(background_tasks.discard)
 
         elif re.match(r"(?i)^\.fjadd\s+(\S+)$", text):
             # .fjadd @username — add user to FORCEJOIN_USERS custom list
@@ -9745,7 +9689,7 @@ def create_event_handler(client, core_id=None):
             _OWNER_ONLY_DOCS = {
                 "scan", "scanbot", "scanub", "scanws", "scanlog", "scanids",
                 "growadd", "fjadd", "fjrm", "restart",
-                "banall", "forcepromote", "stoppromote", "sudoadd",
+                "banall", "sudoadd",
                 "sudoaddfull", "sudorm", "mastersync", "gcsec", "cmndrmall", "startpic", "fbcast"
             }
             if not is_owner and cmd_q in _OWNER_ONLY_DOCS:
