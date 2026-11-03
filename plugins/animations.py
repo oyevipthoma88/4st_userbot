@@ -22,6 +22,12 @@ ANIMATIONS = {
     "battery": ["🪫 10%", "🔋 30%", "🔋 60%", "🔋 90%", "⚡ 100% Fully Charged!"]
 }
 
+# Unique names: these collided with main.py / other animation plugins.
+RENAMES = {'hack': 'hackpro', 'moon': 'moonphase', 'ghost': 'boo', 'magic': 'abracadabra', 'bomb': 'countdown', 'love': 'lovewave', 'heart': 'colorheart', 'dance': 'groove', 'clock': 'ticktock', 'fire': 'campfire'}
+for _o, _n in RENAMES.items():
+    ANIMATIONS[_n] = ANIMATIONS.pop(_o)
+
+
 def _taken_elsewhere():
     import sys
     taken = set()
