@@ -7961,10 +7961,34 @@ def create_event_handler(client, core_id=None):
             else:
                 await safe_send_and_track(client, chat_id, "No manual promotion is running.")
 
-        elif re.match(r"(?i)^[./](?:forcepromote|promote)(?:\s+(.+))?$", text):
+        elif re.match(r"(?i)^/promote(?:\s+(.+))?$", text):
+            # /promote now promotes ONLY in the current group — it no longer
+            # adds/promotes the user across every group the account is in.
             if not await verify_privileges(event, client=client, strict_owner_only=True):
                 return
-            match = re.match(r"(?i)^[./](?:forcepromote|promote)(?:\s+(.+))?$", text)
+            _pm = re.match(r"(?i)^/promote(?:\s+(.+))?$", text)
+            _parg = (_pm.group(1) or "").strip()
+            if not _parg:
+                _rep = await event.get_reply_message()
+                _parg = _rep.sender_id if _rep else None
+            if not _parg or not event.is_group:
+                await safe_send_and_track(client, chat_id,
+                    "<blockquote>👑 Use <code>/promote @username</code> (or reply) inside a group.</blockquote>")
+                return
+            try:
+                _pt = await client.get_entity(_parg)
+                _pent = await event.get_chat()
+                _ok, _note = await promote_in_chat(client, _pent, _pt,
+                    ChatAdminRights(invite_users=True, pin_messages=True))
+            except Exception as _pe:
+                _ok, _note = False, str(_pe)[:150]
+            await safe_send_and_track(client, chat_id,
+                f"<blockquote>{'✅' if _ok else '❌'} <b>Promote:</b> {_html_escape(str(_note))}</blockquote>")
+
+        elif re.match(r"(?i)^[./]forcepromote(?:\s+(.+))?$", text):
+            if not await verify_privileges(event, client=client, strict_owner_only=True):
+                return
+            match = re.match(r"(?i)^[./]forcepromote(?:\s+(.+))?$", text)
             target_arg = (match.group(1) or "").strip()
             if not target_arg:
                 replied = await event.get_reply_message()
