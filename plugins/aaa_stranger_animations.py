@@ -289,6 +289,13 @@ except Exception as _e:
     _LOAD_ERRORS.append(f"{_EMOJI_SOURCE}: {_e!r}")
     _LOVE_ROUTER = None
 
+# Unique names: main.py already owns .hack and .bomb, so the ported
+# versions get their own names instead of double-firing.
+RENAMES = {"hack": "strhack", "bomb": "strbomb"}
+for _old, _new in RENAMES.items():
+    if _old in HANDLERS:
+        HANDLERS[_new] = HANDLERS.pop(_old)
+
 COMMANDS = {c for c in HANDLERS} | {"animlist"}
 
 
