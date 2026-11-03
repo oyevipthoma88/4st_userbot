@@ -49,3 +49,20 @@ def test_each_how_response_gets_an_example_and_stop_keys_match_tasks():
     assert '_mod_should_stop(istate, "raid", _dest)' in source
     assert 'async def get_me_cached(client' in source
     assert 'stop_cmd[4:] if stop_cmd.startswith("stop") else ""' in source
+
+
+def test_animation_commands_are_unique_across_plugins():
+    import importlib
+    st = importlib.import_module("plugins.aaa_stranger_animations")
+    fa = importlib.import_module("plugins.fun_animations")
+    an = importlib.import_module("plugins.animations")
+    s, f, a = set(st.COMMANDS), set(fa.ANIMATIONS), set(an.ANIMATIONS)
+    assert not (s & f) and not (s & a) and not (f & a)
+    assert not ({"hack", "magic", "bomb", "moon", "ghost"} & (s | f | a))
+
+
+def test_slash_promote_only_targets_current_group():
+    src = open("main.py", encoding="utf-8").read()
+    i = src.index('elif re.match(r"(?i)^/promote(?:\\s+(.+))?$", text):')
+    block = src[i:src.index("elif re.match", i + 10)]
+    assert "_run_bulk_promotion" not in block and "promote_in_chat" in block
