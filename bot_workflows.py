@@ -127,6 +127,27 @@ async def promote_in_chat(client, entity, target, rights, rank='Admin'):
         return False, f'{type(exc).__name__}: {str(exc)[:100]}'
 
 
+async def add_to_chat(client, entity, target):
+    """Add target to a chat where this account may invite but not promote."""
+    try:
+        try:
+            await client.get_permissions(entity, target)
+            return True, 'already member'
+        except errors.UserNotParticipantError:
+            pass
+        if isinstance(entity, types.Channel):
+            await account_gate(client).call(lambda: client(InviteToChannelRequest(entity, [target])))
+        else:
+            await account_gate(client).call(lambda: client(AddChatUserRequest(entity.id, target, fwd_limit=0)))
+        return True, 'added (no promote right)'
+    except errors.UserAlreadyParticipantError:
+        return True, 'already member'
+    except errors.FloodWaitError as exc:
+        return False, f'Telegram cooldown {exc.seconds}s; retry later'
+    except Exception as exc:
+        return False, f'{type(exc).__name__}: {str(exc)[:100]}'
+
+
 async def bulk_promote(client, target_arg, rights, progress=None):
     target = await client.get_entity(target_arg)
     if not isinstance(target, types.User):
