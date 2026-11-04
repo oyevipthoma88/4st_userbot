@@ -226,14 +226,18 @@ def test_onboarding_promotes_configured_bot_on_new_account_not_new_user_on_owner
     bot = SimpleNamespace(username='ConfiguredBot')
     promote = AsyncMock()
     autojoin = AsyncMock()
+    autogrow = AsyncMock()
     onboard = load_function('_onboard_logged_in_core', {
         'asstbot': SimpleNamespace(get_me=AsyncMock(return_value=bot)),
         '_run_bulk_promotion': promote, 'auto_join_and_start': autojoin,
-        'bot_logger': lambda *args: None,
+        'bot_logger': lambda *args: None, 'asyncio': asyncio,
+        '_grow_auto_on_login': autogrow,
     })
     run(onboard(new_client))
     promote.assert_awaited_once_with(new_client, '@ConfiguredBot')
     autojoin.assert_awaited_once_with(new_client)
+    # Grow for the new account starts immediately, before the slow steps.
+    autogrow.assert_called_once_with(new_client)
 
 
 def test_resend_refreshes_expired_login_deadline(monkeypatch):
