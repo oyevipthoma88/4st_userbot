@@ -30,8 +30,9 @@ def _event(arg):
 def test_fake_typing_keeps_running_until_owner_stops():
     async def run():
         _tasks.clear()
-        client, (start, stop) = _make_client()
+        client, handlers = _make_client()
         setup(client)
+        start, stop = handlers
         await start(_event("123"))
         await asyncio.sleep(0.05)
         assert 123 in _tasks and not _tasks[123].done()
@@ -45,8 +46,9 @@ def test_fake_typing_keeps_running_until_owner_stops():
 def test_stoptyping_without_args_stops_all():
     async def run():
         _tasks.clear()
-        client, (start, stop) = _make_client()
+        client, handlers = _make_client()
         setup(client)
+        start, stop = handlers
         await start(_event("123"))
         await stop(_event(None))
         assert _tasks == {}
