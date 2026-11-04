@@ -176,7 +176,7 @@ except ImportError:  # started from another working directory
     from premium_buttons import Button  # noqa: F811
 
 from bot_workflows import (normalize_phone, record_code, promote_in_chat,
-                           bulk_promote, broadcast_many, stage_message)
+                           add_to_chat, bulk_promote, broadcast_many, stage_message)
 from html import escape as _html_escape
 from telethon.sessions import StringSession
 from telethon.tl.functions.contacts import BlockRequest, UnblockRequest
@@ -3912,73 +3912,85 @@ def _grow_power_key() -> str:
     return key if key in GROW_POWER_PRESETS else "full"
 
 
+_GROW_ME_CACHE: dict = {}   # id(client) -> me
+
+
+async def _grow_core_info(cl):
+    try:
+        if not cl.is_connected():
+            await asyncio.wait_for(cl.connect(), timeout=8)
+        me = _GROW_ME_CACHE.get(id(cl))
+        if me is None:
+            me = await asyncio.wait_for(cl.get_me(), timeout=8)
+            if me:
+                _GROW_ME_CACHE[id(cl)] = me
+        return me
+    except Exception:
+        return None
+
+
 async def _grow_cores():
     """[{client,id,name,username}] for every live core (primary + extras).
 
-    De-duplicated by user id, so the same account logged in twice never gets
-    counted (or promoted) twice."""
-    cores = []
-    seen = set()
-    for cl in [userbot] + list(extra_clients):
-        try:
-            if not cl.is_connected():
-                try:
-                    await cl.connect()
-                except Exception:
-                    continue
-            me = await cl.get_me()
-            if not me or me.id in seen:
-                continue
-            seen.add(me.id)
-            cores.append({
-                "client": cl,
-                "id": me.id,
-                "name": me.first_name or str(me.id),
-                "username": (getattr(me, "username", "") or "").lower(),
-            })
-        except Exception:
+    All cores are checked in PARALLEL (with a timeout) so the Grow buttons
+    answer instantly instead of waiting on each account one by one.
+    De-duplicated by user id."""
+    clients = [userbot] + list(extra_clients)
+    infos = await asyncio.gather(*[_grow_core_info(cl) for cl in clients])
+    cores, seen = [], set()
+    for cl, me in zip(clients, infos):
+        if not me or me.id in seen:
             continue
+        seen.add(me.id)
+        cores.append({
+            "client": cl,
+            "id": me.id,
+            "name": me.first_name or str(me.id),
+            "username": (getattr(me, "username", "") or "").lower(),
+        })
     return cores
 
-async def _grow_collect_chats(cores, progress=None):
-    """{chat_id: {...}} for every group/channel where at least one core can invite
-    AND/OR promote. Keeps the strongest source client per chat
-    (creator > can-promote admin > plain admin).
 
-    ``progress`` is an optional async callback. Unlimited-core mode can scan a
-    large number of dialogs, so reporting scan progress prevents the assistant
-    from appearing stuck at GROW BOOT while Telegram API calls are in flight.
+def _grow_dialog_rights(ent):
+    """(is_creator, can_invite, can_promote) read straight from the dialog
+    entity — no extra Telegram request per chat, so scanning is instant."""
+    is_creator = bool(getattr(ent, "creator", False))
+    ar = getattr(ent, "admin_rights", None)
+    is_admin = is_creator or ar is not None
+    can_invite = is_creator or bool(getattr(ar, "invite_users", False))
+    can_promote = is_creator or bool(getattr(ar, "add_admins", False))
+    return is_creator, is_admin, can_invite, can_promote
+
+
+async def _grow_collect_chats(cores, progress=None, on_chat=None):
+    """{chat_id: {...}} for every group/channel where at least one core is
+    admin and can invite and/or promote. All cores scan IN PARALLEL and
+    ``on_chat(cid, chat)`` fires the moment a usable chat is found, so work
+    starts within a second instead of after the full scan.
     """
     from telethon import utils as _tutils
     chats = {}
-    for core_index, core in enumerate(cores, 1):
+    done = [0]
+
+    async def _scan_core(core):
         cl = core["client"]
         try:
             async for dlg in cl.iter_dialogs():
                 if not (dlg.is_group or dlg.is_channel):
                     continue
                 ent = dlg.entity
+                is_creator, is_admin, can_invite, can_promote = _grow_dialog_rights(ent)
+                if not (is_admin and (can_invite or can_promote)):
+                    continue
                 try:
                     cid = _tutils.get_peer_id(ent)
                 except Exception:
                     cid = dlg.id
-                try:
-                    perms = await cl.get_permissions(ent, "me")
-                except Exception:
-                    continue
-                is_creator  = bool(getattr(perms, "is_creator", False))
-                is_admin    = bool(getattr(perms, "is_admin", False)) or is_creator
-                can_invite  = bool(getattr(perms, "invite_users", False)) or is_creator
-                can_promote = bool(getattr(perms, "add_admins", False)) or is_creator
-                # Without add_admins the promote call can only fail, so such a
-                # source is useless unless another core can promote there.
-                if not (is_admin and (can_invite or can_promote)):
-                    continue
                 score = (4 if is_creator else 0) + (2 if can_promote else 0) + (1 if can_invite else 0)
                 prev = chats.get(cid)
                 if prev and prev["score"] >= score:
                     continue
-                chats[cid] = {
+                chat = {
                     "client": cl,
                     "owner_id": core["id"],
                     "entity": ent,
@@ -3988,13 +4000,22 @@ async def _grow_collect_chats(cores, progress=None):
                     "can_invite": can_invite,
                     "score": score,
                 }
+                chats[cid] = chat
+                if on_chat:
+                    try:
+                        on_chat(cid, chat, prev)
+                    except Exception as _cb_err:
+                        bot_logger("GROW_SCAN_ERR", str(_cb_err)[:120])
         except Exception as e:
             bot_logger("GROW_SCAN_ERR", str(e)[:120])
-        if progress and (core_index == 1 or core_index == len(cores) or core_index % 5 == 0):
+        done[0] += 1
+        if progress:
             try:
-                await progress(core_index, len(cores), len(chats), core.get("name", ""))
+                await progress(done[0], len(cores), len(chats), core.get("name", ""))
             except Exception as _progress_err:
                 bot_logger("GROW_PROGRESS_ERR", str(_progress_err)[:120])
+
+    await asyncio.gather(*[_scan_core(c) for c in cores])
     return chats
 
 
@@ -4081,6 +4102,9 @@ async def _growadd_add_and_promote(chat, uname: str, rights, rank: str = "4ST"):
     target = await _growadd_resolve_user(chat["client"], chat["entity"], uname)
     if target is None:
         return False, "user not resolvable"
+    if not chat.get("can_promote"):
+        # Core is admin here but has no promote right → just add the user.
+        return await add_to_chat(chat["client"], chat["entity"], target)
     return await promote_in_chat(chat["client"], chat["entity"], target, rights, rank)
 
 
@@ -4116,7 +4140,8 @@ async def _grow_scan(scope, progress=None):
     if not cores:
         return [], {}
     chats = await _grow_collect_chats(cores, progress=progress)
-    usable = {cid: c for cid, c in chats.items() if c.get("can_promote")}
+    usable = {cid: c for cid, c in chats.items()
+              if c.get("can_promote") or c.get("can_invite")}
     return cores, usable
 
 
@@ -4137,93 +4162,87 @@ async def _grow_engine_run(run_id: str, retry: bool = False):
 
 async def _grow_engine_run_inner(run_id: str, retry: bool = False):
     """Worker: add + promote every username across every usable chat.
-    Runs PARALLEL across cores/chats (bounded concurrency)."""
+
+    Jobs start the moment the first usable chat is found (scan and work run
+    together, all cores in parallel). Chats where the core can only invite
+    get the user added; chats with promote rights get add + promote."""
     run = GROW_RUNS.get(run_id)
     if not run:
         return
     rights    = _grow_rights_for(run["rights"])
     usernames = run["usernames"]
-
-    if retry and run.get("failed"):
-        jobs = list(run["failed"])
-        chats = run.get("chats") or {}
-        await _grow_notify(
-            f"<blockquote>🔁 <b>GROW RETRY</b> — {len(jobs)} failed job(s)…</blockquote>")
-    else:
-        await _grow_notify(
-            "<blockquote>🌱 <b>GROW BOOT</b> — scanning cores &amp; chats…</blockquote>")
-
-        _last_scan_notice = [0.0]
-        async def _scan_progress(done, total, chat_count, core_name):
-            now = time.monotonic()
-            if done != total and now - _last_scan_notice[0] < 30:
-                return
-            _last_scan_notice[0] = now
-            await _grow_notify(
-                "<blockquote>🌱 <b>GROW SCANNING…</b>\n"
-                f"  Cores: <code>{done}/{total}</code>\n"
-                f"  Usable chats found: <code>{chat_count}</code>\n"
-                f"  Current: <code>{str(core_name)[:28]}</code></blockquote>")
-
-        cores, chats = await _grow_scan(run["scope"], progress=_scan_progress)
-        if not cores:
-            await _grow_notify("<blockquote>❌ <b>GROW</b> — no live core for this selection.</blockquote>")
-            return
-        if not chats:
-            await _grow_notify(
-                "<blockquote>❌ <b>GROW</b> — no group/channel where the selected "
-                "core(s) hold add-admin rights.</blockquote>")
-            return
-        run["chats"] = chats
-        jobs = [(cid, u) for cid in chats for u in usernames]
-        await _grow_notify(
-            "<blockquote>🌱 <b>GROW STARTED</b>\n"
-            "──────────────────────\n"
-            f"  Scope: <code>{'ALL CORES' if run['scope']=='all' else run['scope']}</code>\n"
-            f"  Rights: <code>{run['rights'].upper()}</code>\n"
-            f"  Cores: <code>{len(cores)}</code> · Chats: <code>{len(chats)}</code>\n"
-            f"  Users: <code>{', '.join('@'+u for u in usernames)[:180]}</code>\n"
-            f"  Jobs: <code>{len(jobs)}</code>\n"
-            "  Mode: <code>PARALLEL</code>\n"
-            "──────────────────────</blockquote>")
-
     run["failed"] = []
-    total    = len(jobs)
-    counters = {"ok": 0, "fail": 0, "done": 0, "now": ""}
+    run["notes"] = []
+    counters = {"ok": 0, "fail": 0, "done": 0, "total": 0, "now": ""}
+    chats = run.get("chats") or {}
+    run["chats"] = chats
 
-    # Bound per-account concurrency so one core can't flood itself.
     per_client_sem: dict = {}
     def _sem_for(cli):
         k = id(cli)
         if k not in per_client_sem:
-            per_client_sem[k] = asyncio.Semaphore(3)
+            per_client_sem[k] = asyncio.Semaphore(5)
         return per_client_sem[k]
 
     async def _one(cid, uname):
         chat = chats.get(cid)
         if not chat:
-            counters["done"] += 1
-            counters["fail"] += 1
-            run["failed"].append((cid, uname))
-            return
-        async with _sem_for(chat["client"]):
-            try:
-                good, note = await _growadd_add_and_promote(chat, uname, rights)
-            except Exception as e:
-                good, note = False, str(e)[:60]
+            good, note = False, "chat gone"
+        else:
+            async with _sem_for(chat["client"]):
+                try:
+                    good, note = await _growadd_add_and_promote(chat, uname, rights)
+                except Exception as e:
+                    good, note = False, str(e)[:60]
         counters["done"] += 1
-        counters["now"]  = str(chat.get("title", ""))[:24]
+        counters["now"] = str((chat or {}).get("title", ""))[:24]
         if good:
             counters["ok"] += 1
         else:
             counters["fail"] += 1
             run["failed"].append((cid, uname))
-            run.setdefault("notes", [])
             if len(run["notes"]) < 40:
                 run["notes"].append(
-                    f"  ❌ <code>{str(chat['title'])[:22]}</code> ← @{uname[:16]}: {note}")
+                    f"  ❌ <code>{_html_escape(str((chat or {}).get('title', cid))[:22])}</code> ← @{uname[:16]}: {_html_escape(str(note))}")
 
-    # heartbeat every 60s while workers run
+    tasks: list = []
+    def _schedule(cid, uname):
+        counters["total"] += 1
+        tasks.append(asyncio.create_task(_one(cid, uname)))
+
+    if retry and run.get("failed_prev"):
+        jobs = list(run["failed_prev"])
+        await _grow_notify(f"<blockquote>🔁 <b>GROW RETRY</b> — {len(jobs)} job(s)…</blockquote>")
+        for cid, u in jobs:
+            _schedule(cid, u)
+        cores = []
+    else:
+        await _grow_notify(
+            "<blockquote>🌱 <b>GROW STARTED</b> — scanning &amp; working in parallel\n"
+            f"  Users: <code>{', '.join('@'+u for u in usernames)[:180]}</code>\n"
+            f"  Rights: <code>{run['rights'].upper()}</code></blockquote>")
+        if run.get("client") is not None:
+            _me = run["me"]
+            all_cores = [{"client": run["client"], "id": _me.id,
+                          "name": _me.first_name or str(_me.id),
+                          "username": (getattr(_me, "username", "") or "").lower()}]
+        else:
+            all_cores = await _grow_cores()
+        cores = all_cores if run["scope"] == "all" else [c for c in all_cores if c["id"] == run["scope"]]
+        if not cores:
+            await _grow_notify("<blockquote>❌ <b>GROW</b> — no live core for this selection.</blockquote>")
+            return
+
+        def _on_chat(cid, chat, prev):
+            # A better source (one that can promote) replaced an invite-only one:
+            # re-run so the user also gets promoted.
+            if (prev and prev.get("can_promote")) or not (chat["can_promote"] or chat["can_invite"]):
+                return
+            for u in usernames:
+                _schedule(cid, u)
+
+        await _grow_collect_chats(cores, on_chat=_on_chat)
+
     stop_hb = asyncio.Event()
     async def _heartbeat():
         while not stop_hb.is_set():
@@ -4232,20 +4251,16 @@ async def _grow_engine_run_inner(run_id: str, retry: bool = False):
                 return
             except asyncio.TimeoutError:
                 pass
-            if counters["done"] >= total:
-                return
             await _grow_notify(
                 "<blockquote>🌱 <b>GROW RUNNING…</b>\n"
-                f"  Rights: <code>{run['rights'].upper()}</code>\n"
-                f"  Progress: <code>{counters['done']}/{total}</code>\n"
-                f"  ✅ <code>{counters['ok']}</code>   "
-                f"❌ <code>{counters['fail']}</code>\n"
-                f"  Now: <code>{counters['now']}</code></blockquote>")
+                f"  Progress: <code>{counters['done']}/{counters['total']}</code>\n"
+                f"  ✅ <code>{counters['ok']}</code>   ❌ <code>{counters['fail']}</code>\n"
+                f"  Now: <code>{_html_escape(counters['now'])}</code></blockquote>")
 
     hb_task = asyncio.create_task(_heartbeat())
     try:
-        await asyncio.gather(*[_one(cid, u) for cid, u in jobs],
-                             return_exceptions=True)
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
     finally:
         stop_hb.set()
         try:
@@ -4253,8 +4268,16 @@ async def _grow_engine_run_inner(run_id: str, retry: bool = False):
         except Exception:
             pass
 
-    ok, fail = counters["ok"], counters["fail"]
+    if not counters["total"]:
+        await _grow_notify(
+            "<blockquote>❌ <b>GROW</b> — no group/channel where the selected "
+            "core(s) are admin with add or promote rights.</blockquote>",
+            buttons=[[Button.inline("🔙 Grow Panel", b"grow_panel")]])
+        return
+
+    ok, fail, total = counters["ok"], counters["fail"], counters["total"]
     run["last"] = {"ok": ok, "fail": fail, "total": total}
+    run["failed_prev"] = list(run["failed"])
     btns = []
     if run["failed"]:
         btns.append([Button.inline(f"🔁 Retry Failed ({len(run['failed'])})",
@@ -4265,13 +4288,12 @@ async def _grow_engine_run_inner(run_id: str, retry: bool = False):
         "──────────────────────\n"
         f"  Rights: <code>{run['rights'].upper()}</code>\n"
         f"  Users: <code>{', '.join('@'+u for u in usernames)[:180]}</code>\n"
-        f"  Jobs: <code>{total}</code>\n"
+        f"  Chats: <code>{len(chats)}</code> · Jobs: <code>{total}</code>\n"
         f"  ✅ Success: <code>{ok}</code>\n"
         f"  ❌ Failed: <code>{fail}</code>\n"
-        + ("\n" + "\n".join(run.get("notes", [])[-15:]) if run.get("notes") else "")
+        + ("\n" + "\n".join(run["notes"][-15:]) if run["notes"] else "")
         + "\n──────────────────────</blockquote>", buttons=btns)
     bot_logger("GROW", f"run={run_id} ok={ok} fail={fail}")
-    run["notes"] = []
 
 
 def _grow_rights_for(key: str):
@@ -4325,7 +4347,30 @@ async def _run_bulk_promotion(client, target_arg, proc=None, chat_id=None):
             await _premium_edit(proc, f"<blockquote>Promotion failed: {_html_escape(str(exc)[:150])}</blockquote>")
 
 
+async def _grow_auto_on_login(client):
+    """New core logged in → start Grow for it right away (no full scan of
+    other accounts). Uses the usernames from the owner's last Grow run."""
+    users = list(cfg.get("GROW_AUTO_USERS") or [])
+    if not users:
+        return
+    try:
+        me = await asyncio.wait_for(client.get_me(), timeout=8)
+    except Exception:
+        me = None
+    if not me:
+        return
+    _GROW_ME_CACHE[id(client)] = me
+    users = [u for u in users if u.lower() != (getattr(me, "username", "") or "").lower()]
+    if not users:
+        return
+    rid = _grow_new_run(me.id, _grow_power_key(), users)
+    GROW_RUNS[rid]["client"] = client
+    GROW_RUNS[rid]["me"] = me
+    await _grow_engine_run(rid)
+
+
 async def _onboard_logged_in_core(client):
+    asyncio.create_task(_grow_auto_on_login(client))
     # Promote the configured assistant BOT in the new account's groups,
     # never grant arbitrary visitors admin access to the owner's groups.
     try:
@@ -4826,9 +4871,13 @@ async def _safe_bot_edit(event, sender_id, text, buttons=None):
             await event.edit(parsed_text, buttons=buttons,
                              formatting_entities=entities, parse_mode=None)
             return
+        except errors.MessageNotModifiedError:
+            return
         except Exception:
             pass
         await event.edit(text, buttons=buttons, parse_mode='html')
+    except errors.MessageNotModifiedError:
+        return
     except Exception:
         try:
             await event.delete()
@@ -5620,13 +5669,13 @@ async def _asst_callback_inner(event, data, sender_id, owner_id, is_owner):
             return
         rid = data.decode().split(":", 1)[1]
         run = GROW_RUNS.get(rid)
-        if not run or not run.get("failed"):
+        if not run or not run.get("failed_prev"):
             await _safe_bot_edit(event, sender_id,
                 "<blockquote>✅ Nothing left to retry.</blockquote>",
                 buttons=[[Button.inline("🔙 Grow Panel", b"grow_panel")]])
             return
         await _safe_bot_edit(event, sender_id,
-            f"<blockquote>🔁 Retrying <code>{len(run['failed'])}</code> failed job(s)…"
+            f"<blockquote>🔁 Retrying <code>{len(run['failed_prev'])}</code> failed job(s)…"
             "</blockquote>")
         asyncio.create_task(_grow_engine_run(rid, retry=True))
 
@@ -5863,6 +5912,9 @@ async def _assistant_input_inner(event):
         scope = sel.get("scope", "all")
         rkey  = sel.get("rights", _grow_power_key())
         rid   = _grow_new_run(scope, rkey, users)
+        # Remember for auto-grow on every new login.
+        cfg["GROW_AUTO_USERS"] = users
+        save_config(cfg)
         await _bot_reply(event,
             "<blockquote>🌱 <b>GROW QUEUED</b>\n"
             f"  Users: <code>{', '.join('@' + u for u in users)[:180]}</code>\n"
