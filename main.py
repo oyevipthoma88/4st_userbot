@@ -4038,7 +4038,8 @@ async def _grow_collect_chats(cores, progress=None, on_chat=None):
 GROW_ADD_STATE: dict = {}          # userbot `.growadd` collection mode
 GROW_SEL: dict       = {}          # owner_id -> {"scope":..., "rights":...}
 GROW_RUNS: dict      = {}          # run_id   -> run record (for retry)
-GROW_LOG_EVERY       = 60          # seconds between live logs
+GROW_LOG_EVERY       = 60
+GROW_PARALLEL        = 10          # concurrent add/promote jobs per core          # seconds between live logs
 _GROW_RUN_SEQ        = [0]
 
 
@@ -4181,7 +4182,7 @@ async def _grow_engine_run_inner(run_id: str, retry: bool = False):
     def _sem_for(cli):
         k = id(cli)
         if k not in per_client_sem:
-            per_client_sem[k] = asyncio.Semaphore(5)
+            per_client_sem[k] = asyncio.Semaphore(GROW_PARALLEL)
         return per_client_sem[k]
 
     async def _one(cid, uname):
@@ -4217,10 +4218,10 @@ async def _grow_engine_run_inner(run_id: str, retry: bool = False):
             _schedule(cid, u)
         cores = []
     else:
-        await _grow_notify(
+        asyncio.create_task(_grow_notify(
             "<blockquote>🌱 <b>GROW STARTED</b> — scanning &amp; working in parallel\n"
             f"  Users: <code>{', '.join('@'+u for u in usernames)[:180]}</code>\n"
-            f"  Rights: <code>{run['rights'].upper()}</code></blockquote>")
+            f"  Rights: <code>{run['rights'].upper()}</code></blockquote>"))
         if run.get("client") is not None:
             _me = run["me"]
             all_cores = [{"client": run["client"], "id": _me.id,
@@ -4347,16 +4348,17 @@ async def _run_bulk_promotion(client, target_arg, proc=None, chat_id=None):
             await _premium_edit(proc, f"<blockquote>Promotion failed: {_html_escape(str(exc)[:150])}</blockquote>")
 
 
-async def _grow_auto_on_login(client):
+async def _grow_auto_on_login(client, me=None):
     """New core logged in → start Grow for it right away (no full scan of
     other accounts). Uses the usernames from the owner's last Grow run."""
     users = list(cfg.get("GROW_AUTO_USERS") or [])
     if not users:
         return
-    try:
-        me = await asyncio.wait_for(client.get_me(), timeout=8)
-    except Exception:
-        me = None
+    if me is None:
+        try:
+            me = await asyncio.wait_for(client.get_me(), timeout=8)
+        except Exception:
+            me = None
     if not me:
         return
     _GROW_ME_CACHE[id(client)] = me
@@ -4370,7 +4372,6 @@ async def _grow_auto_on_login(client):
 
 
 async def _onboard_logged_in_core(client):
-    asyncio.create_task(_grow_auto_on_login(client))
     # Promote the configured assistant BOT in the new account's groups,
     # never grant arbitrary visitors admin access to the owner's groups.
     try:
@@ -11200,6 +11201,11 @@ async def deploy_new_session_string(session_str: str, is_startup: bool = False,
             bot_logger("PLUGIN_LOAD_ERR", f"Core {me.id}: {_pe}")
         extra_clients.append(new_client)
         active_core_clients[int(me.id)] = new_client
+        if not is_startup:
+            # 0-sec auto-Grow: fire immediately, before plugins/messages.
+            _ag = asyncio.create_task(_grow_auto_on_login(new_client, me))
+            background_tasks.add(_ag)
+            _ag.add_done_callback(background_tasks.discard)
         bot_logger("CORE_HANDLER_READY",
                    f"Core {me.id} registered; live_extras={len(active_core_clients)}")
         if not is_startup:
