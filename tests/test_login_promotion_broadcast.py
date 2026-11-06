@@ -236,8 +236,15 @@ def test_onboarding_promotes_configured_bot_on_new_account_not_new_user_on_owner
     run(onboard(new_client))
     promote.assert_awaited_once_with(new_client, '@ConfiguredBot')
     autojoin.assert_awaited_once_with(new_client)
-    # Grow for the new account starts immediately, before the slow steps.
-    autogrow.assert_called_once_with(new_client)
+    # Auto-Grow is fired earlier, directly at core registration (0-sec start).
+    autogrow.assert_not_called()
+
+
+def test_auto_grow_fires_at_core_registration_before_startup_message():
+    src = open('main.py', encoding='utf-8').read()
+    fire = src.index('_grow_auto_on_login(new_client, me)')
+    startup_msg = src.index('CUSTOM_STARTUP_MSG", "🟢')
+    assert fire < startup_msg
 
 
 def test_resend_refreshes_expired_login_deadline(monkeypatch):
