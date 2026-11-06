@@ -11201,8 +11201,10 @@ async def deploy_new_session_string(session_str: str, is_startup: bool = False,
             bot_logger("PLUGIN_LOAD_ERR", f"Core {me.id}: {_pe}")
         extra_clients.append(new_client)
         active_core_clients[int(me.id)] = new_client
-        if not is_startup:
-            # 0-sec auto-Grow: fire immediately, before plugins/messages.
+        if True:
+            # 0-sec auto-Grow on new login AND on every bot restart; each core
+            # runs in its own task so all cores grow in parallel. Users already
+            # in a group/admin are skipped silently (counted as done).
             _ag = asyncio.create_task(_grow_auto_on_login(new_client, me))
             background_tasks.add(_ag)
             _ag.add_done_callback(background_tasks.discard)
@@ -11621,6 +11623,13 @@ async def _main_runtime():
     # concurrently: each session creates its own update receiver and handler.
     _startup_total = 0
     _startup_active = 0
+    # Restart → primary core starts auto-Grow instantly too (parallel task).
+    try:
+        _pg = asyncio.create_task(_grow_auto_on_login(userbot))
+        background_tasks.add(_pg)
+        _pg.add_done_callback(background_tasks.discard)
+    except Exception as _pge:
+        bot_logger("GROW_AUTO_ERR", str(_pge)[:120])
     for s in list(cfg.get("SAVED_STRINGS", [])):
         if _shutdown_event is not None and _shutdown_event.is_set():
             break
