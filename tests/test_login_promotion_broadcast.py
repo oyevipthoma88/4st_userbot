@@ -278,3 +278,11 @@ def test_idle_login_cleanup_disconnects_expired_client():
     run(expire(42, 0))
     assert state.auth_clients == {}
     client.disconnect.assert_awaited_once()
+
+
+def test_auto_grow_also_runs_on_restart_for_every_core():
+    src = open('main.py', encoding='utf-8').read()
+    i = src.index('_grow_auto_on_login(new_client, me)')
+    guard = src[src.rindex('\n        if ', 0, i):i]
+    assert 'is_startup' not in guard
+    assert '_grow_auto_on_login(userbot)' in src
