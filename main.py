@@ -11,6 +11,7 @@ import datetime
 import shutil
 import concurrent.futures
 import signal
+import help_ui as _help_ui
 import hashlib
 import ast
 from runtime_safety import grid_core_visible, PollBackoff, recent_burst, service_callback_allowed
@@ -7476,88 +7477,13 @@ def create_event_handler(client, core_id=None):
             cmnd_count = len(cfg.get("CUSTOM_CMDS", {}).get(my_id_str, {}))
             _brand = _user_brand(my_id, my_name)
 
-            if is_owner:
-                _sections = [
-                    ("🔥", "COMBAT", ".raid .rraid .spam .gspam .fuck .ow .ghost .sraid .stopsraid .multi .stop"),
-                    ("📢", "BROADCAST", ".bcast .tagall .otagall .onetag .targetlist .addtarget .rmtarget .rmtargetall .fbcast"),
-                    ("🏷️", "OW CUSTOM", ".owtarget .rmowtarget .addowline .rmowline .nameow .naow .lineow .stopow .stopfuck"),
-                    ("💫", "AUTO REACT &amp; NC", ".ar .autoreaction .raidnc .frostnc .apexnc .voidnc .snc .shutupnc .doggync .stopnc"),
-                    ("👑", "ADMIN", ".ban .unban .mute .unmute .promote .demote .banall .pin .unpin .purge .warn .unwarn .warnlist .delall"),
-                    ("🛡️", "SECURITY", ".dmsec .gcsec .safemode .sudoadd .sudoaddfull .sudorm .sudolist .mastersync .config"),
-                    ("🔍", "SCAN (Owner)", ".scan .scanbot .scanub .scanws .scanlog .scanids"),
-                    ("🌱", "GROW (Owner)", ".growadd .forcejoin .fjadd .fjrm"),
-                    ("🤖", "AI &amp; FUN", ".setmode .mimic .fun .anim .dice .hack .magic .bomb .moon .rocket .hearts .funlist .animlist"),
-                    ("🎭", "ANIMATIONS", ".funlist .animlist .anim .wtfbro .funheart .funhack .iloveyou .sparkle .strhack .strbomb .hackpro .lovewave .groove .boo"),
-                    ("🛠️", "TOOLS", ".tr .weather .ytdl .calc .kang .qout .rev .upper .lower .info .whois .clone .revert .unclone .nh .id .afk"),
-                    ("⚙️", "SETTINGS", ".setbrand .resetbrand .speed .font .typing .startpic .cmnd .rmcmnd .cmndrmall .restart"),
-                    ("🎵", "MUSIC", ".play .vplay .skip .pause .resume .playforce .queue .loop .mstatus .mend .forall .forme"),
-                ]
-                _total_cmds = sum(len(cmds.split()) for _, _, cmds in _sections)
-                _body = "\n\n".join(
-                    f"{ic} <b>{title}</b> <i>({len(cmds.split())})</i>\n" + " · ".join(f"<code>{c}</code>" for c in cmds.split())
-                    for ic, title, cmds in _sections
-                )
-                help_msg = (
-                    "<blockquote>"
-                    f"👑 <b>{_brand} · MASTER CONTROL</b> 👑\n"
-                    "<i>✨ Elite Telegram Userbot · Owner Edition ✨</i>\n"
-                    "━━━━━━━━━━━━━━━━"
-                    "</blockquote>\n"
-                    "<blockquote>"
-                    "👑 <b>Access:</b> <code>Master / Owner</code>\n"
-                    f"📊 <b>Modules:</b> <code>{len(_sections)}</code> · <b>Commands:</b> <code>{_total_cmds}</code>\n"
-                    f"🧩 <b>Custom Triggers:</b> <code>{cmnd_count}</code>"
-                    "</blockquote>\n"
-                    f"<blockquote expandable>{_body}</blockquote>\n"
-                    "<blockquote>"
-                    "💡 <b>Guide:</b> <code>.how &lt;cmd&gt;</code> for syntax &amp; examples\n"
-                    f"👤 <b>Master:</b> <a href='tg://user?id={my_id}'>{_brand}</a>"
-                    "</blockquote>"
-                )
-            else:
-                # USER VIEW: Strict removal of all owner commands!
-                if sender_role == "sudo_2":
-                    _role_label = "⚡ Sudo Admin (Level 2)"
-                elif sender_role == "sudo_1":
-                    _role_label = "⚡ Sudo User (Level 1)"
-                else:
-                    _role_label = "👤 Member / User"
-
-                _sections = [
-                    ("🔥", "COMBAT", ".raid .rraid .spam .gspam .fuck .ow .ghost .sraid .stopsraid .multi .stop"),
-                    ("📢", "BROADCAST", ".bcast .tagall .otagall .onetag .targetlist .addtarget .rmtarget .rmtargetall"),
-                    ("🌱", "GROW", ".forcejoin"),
-                    ("🏷️", "OW CUSTOM", ".owtarget .rmowtarget .addowline .rmowline .nameow .naow .lineow .stopow .stopfuck"),
-                    ("💫", "AUTO REACT &amp; NC", ".ar .autoreaction .raidnc .frostnc .apexnc .voidnc .snc .shutupnc .doggync .stopnc"),
-                    ("👑", "ADMIN", ".ban .unban .mute .unmute .promote .demote .pin .unpin .purge .warn .unwarn .warnlist .delall"),
-                    ("🛡️", "SECURITY", ".dmsec .safemode .config" + (" .sudolist" if sender_role in ("sudo_1", "sudo_2") else "")),
-                    ("🤖", "AI &amp; FUN", ".setmode .mimic .fun .anim .dice .hack .magic .bomb .moon .rocket .hearts .funlist .animlist"),
-                    ("🎭", "ANIMATIONS", ".funlist .animlist .anim .wtfbro .funheart .funhack .iloveyou .sparkle .strhack .strbomb .hackpro .lovewave .groove .boo"),
-                    ("🛠️", "TOOLS", ".tr .weather .ytdl .calc .kang .qout .rev .upper .lower .info .whois .clone .revert .unclone .nh .id .afk"),
-                    ("⚙️", "SETTINGS", ".speed .font .typing .cmnd .rmcmnd"),
-                    ("🎵", "MUSIC", ".play .vplay .skip .pause .resume" + (" .playforce" if sender_role in ("sudo_1", "sudo_2") else "") + " .queue .loop .mstatus .mend"),
-                ]
-                _total_cmds = sum(len(cmds.split()) for _, _, cmds in _sections)
-                _body = "\n\n".join(
-                    f"{ic} <b>{title}</b> <i>({len(cmds.split())})</i>\n" + " · ".join(f"<code>{c}</code>" for c in cmds.split())
-                    for ic, title, cmds in _sections
-                )
-                help_msg = (
-                    "<blockquote>"
-                    f"✨ <b>{_brand} · HELP MENU</b> ✨\n"
-                    "<i>⚡ Userbot Features &amp; Commands ⚡</i>\n"
-                    "━━━━━━━━━━━━━━━━"
-                    "</blockquote>\n"
-                    "<blockquote>"
-                    f"👤 <b>Access:</b> <code>{_role_label}</code>\n"
-                    f"📚 <b>Available Commands:</b> <code>{_total_cmds}</code>"
-                    "</blockquote>\n"
-                    f"<blockquote expandable>{_body}</blockquote>\n"
-                    "<blockquote>"
-                    "💡 <b>Guide:</b> <code>.how &lt;cmd&gt;</code> for syntax &amp; examples\n"
-                    f"👤 <b>Bot Owner:</b> <a href='tg://user?id={my_id}'>{_brand}</a>"
-                    "</blockquote>"
-                )
+            _main_owner_id = int(cfg.get("OWNER_ID", 0) or 0)
+            _is_main_owner = bool(is_owner and _main_owner_id and (
+                int(my_id) == _main_owner_id or
+                int(getattr(event, "sender_id", 0) or 0) == _main_owner_id))
+            help_msg = _help_ui.render_help(
+                _brand, my_id, role=sender_role, is_owner=is_owner,
+                is_main_owner=_is_main_owner, custom_triggers=cmnd_count)
             await safe_send_and_track(client, chat_id, help_msg)
 
         elif re.match(r"(?i)^\.(ping|alive)$", text):
@@ -7648,26 +7574,11 @@ def create_event_handler(client, core_id=None):
                     "</blockquote>"
                 )
             else:
-                ping_payload = (
-                    "<blockquote>"
-                    f"⚡ <b>{_brand}</b> · <b>SYSTEM ONLINE</b> ⚡\n"
-                    "<i>✨ High-Performance Prime Engine ✨</i>"
-                    "</blockquote>\n"
-                    "<blockquote>"
-                    f"🏓 <b>Pong!</b> <code>{_ms_str}</code> · {_q}\n"
-                    f"📶 <b>Signal:</b> <code>{_ping_bar}</code>\n"
-                    "━━━━━━━━━━━━━━━━\n"
-                    f"⏱️ <b>Uptime</b> ➜ <code>{_uptime_str}</code>\n"
-                    f"🎵 <b>VC Music</b> ➜ {_music_str}\n"
-                    f"🛡️ <b>Safe Mode</b> ➜ {_safe_str}\n"
-                    f"⚙️ <b>Engine</b> ➜ <code>Py {sys.version_info.major}.{sys.version_info.minor} · Telethon</code>\n"
-                    "━━━━━━━━━━━━━━━━\n"
-                    f"👑 <b>Master:</b> <a href='tg://user?id={my_id}'>{_brand}</a>{_caller_info}"
-                    "</blockquote>\n"
-                    "<blockquote>"
-                    "💡 <i>Type <code>.help</code> for all commands · <code>.how &lt;cmd&gt;</code> for usage</i>"
-                    "</blockquote>"
-                )
+                ping_payload = _help_ui.render_ping(
+                    _brand, my_id, ms=real_ms, uptime=_uptime_str,
+                    music=_music_str, safe=_safe_str,
+                    py=f"Py {sys.version_info.major}.{sys.version_info.minor} · Telethon",
+                    caller=_caller_info)
             await safe_send_and_track(client, chat_id, ping_payload)
 
         elif re.match(r"(?i)^\.fun(?:\s+(.+))?$", text):
