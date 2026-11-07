@@ -40,10 +40,11 @@ def test_help_menu_distinguishes_owner_and_users():
     source = (ROOT / "main.py").read_text(encoding="utf-8")
     assert "def is_sender_owner(event, my_id=None, cfg_obj=None)" in source
     assert "def get_sender_role(event, my_id=None, cfg_obj=None)" in source
-    assert "if is_owner:" in source
-    assert '("🔍", "SCAN (Owner)",' in source
-    assert '("🌱", "GROW (Owner)",' in source
-    assert "# USER VIEW: Strict removal of all owner commands!" in source
+    help_src = (ROOT / "help_ui.py").read_text(encoding="utf-8")
+    assert "_help_ui.render_help(" in source
+    assert '("🔍", "SCAN",' in help_src
+    assert '("🌱", "GROW",' in help_src
+    assert "MAIN_OWNER_ONLY" in help_src
     assert "_OWNER_ONLY_DOCS = {" in source
     assert '"scan", "scanbot", "scanub", "scanws", "scanlog", "scanids"' in source
     assert '"growadd", "fjadd", "fjrm", "restart"' in source
